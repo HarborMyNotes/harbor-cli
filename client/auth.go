@@ -27,24 +27,20 @@ func (c *Client) postJSONNoRefresh(path string, body any) ([]byte, error) {
 	return c.request(http.MethodPost, full, raw, "application/json", false)
 }
 
-// PasswordGrant exchanges email + password for an access + refresh token (the
-// primary login). scope, deviceID, and deviceName are optional. It returns the
-// raw response bytes (for --json display) alongside the parsed token.
-func (c *Client) PasswordGrant(clientID, username, password, scope, deviceID, deviceName string) ([]byte, *TokenResponse, error) {
+// AuthorizationCodeGrant exchanges a PKCE authorization code for an access +
+// refresh token pair — the token step of the browser login flow. redirectURI
+// must be byte-identical to the loopback URI the code was minted against, and
+// codeVerifier is the PKCE secret whose S256 challenge was sent to
+// /oauth/authorize. Public (no bearer) and uses the no-refresh path, since this
+// call is itself the token acquisition. The code is single-use and expires ~60s
+// after issuance, so exchange it immediately on receipt.
+func (c *Client) AuthorizationCodeGrant(clientID, code, redirectURI, codeVerifier string) ([]byte, *TokenResponse, error) {
 	body := map[string]string{
-		"grant_type": "password",
-		"client_id":  clientID,
-		"username":   username,
-		"password":   password,
-	}
-	if scope != "" {
-		body["scope"] = scope
-	}
-	if deviceID != "" {
-		body["device_id"] = deviceID
-	}
-	if deviceName != "" {
-		body["device_name"] = deviceName
+		"grant_type":    "authorization_code",
+		"client_id":     clientID,
+		"code":          code,
+		"redirect_uri":  redirectURI,
+		"code_verifier": codeVerifier,
 	}
 	data, err := c.postJSONNoRefresh("/oauth/token", body)
 	if err != nil {
@@ -52,6 +48,43 @@ func (c *Client) PasswordGrant(clientID, username, password, scope, deviceID, de
 	}
 	tok, err := DecodeToken(data)
 	return data, tok, err
+}
+
+// PersonalAccessToken is the response from minting a PAT (POST /tokens). Token
+// holds the raw hbp_… secret, which the server reveals exactly once at creation.
+// ExpiresAt is nil for a never-expiring token.
+type PersonalAccessToken struct {
+	ID        string   `json:"id"`
+	Token     string   `json:"token"`
+	Name      string   `json:"name"`
+	Scopes    []string `json:"scopes"`
+	TokenKind string   `json:"token_kind"`
+	ExpiresAt *int64   `json:"expires_at"`
+	CreatedAt int64    `json:"created_at"`
+}
+
+// CreatePAT mints a Personal Access Token for the signed-in user. It requires a
+// bearer whose grant includes the profile scope. expiresIn is the lifetime in
+// seconds; pass 0 to omit it and mint a token that NEVER expires — this is how
+// the CLI obtains a long-lived credential after the browser login. The returned
+// raw token is shown only once, so callers must persist it immediately.
+func (c *Client) CreatePAT(name string, scopes []string, expiresIn int64) ([]byte, *PersonalAccessToken, error) {
+	body := map[string]any{
+		"name":   name,
+		"scopes": scopes,
+	}
+	if expiresIn > 0 {
+		body["expires_in"] = expiresIn
+	}
+	data, err := c.doPost("/tokens", body)
+	if err != nil {
+		return nil, nil, err
+	}
+	var pat PersonalAccessToken
+	if err := json.Unmarshal(UnwrapData(data), &pat); err != nil {
+		return nil, nil, err
+	}
+	return data, &pat, nil
 }
 
 // RefreshGrant rotates a single-use refresh token into a new access + refresh

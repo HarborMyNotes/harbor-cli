@@ -8,6 +8,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/cloudmanic/harbor-cli/client"
 	"github.com/cloudmanic/harbor-cli/config"
@@ -55,14 +56,15 @@ table by default and clean JSON with --json, so it is equally pleasant for
 humans and for scripts or AI agents.
 
 Get started:
-  harbor login                       Log in with your email and password
+  harbor login                       Sign in through your browser
   harbor notebooks list              See your notebooks
   harbor notes create --stdin        Pipe Markdown straight into a new note
   harbor search "tag:receipts pdf"   Full-text search
   harbor notes list --json | jq .    Machine-readable output for agents
 
-Credentials are stored in ~/.config/harbor/credentials.json (0600) and refreshed
-transparently. Every command honors --json.`,
+Credentials are stored in ~/.config/harbor/credentials.json (0600) as a
+non-expiring token, so you stay signed in. Set HARBOR_TOKEN to use a token for a
+single command without logging in. Every command honors --json.`,
 	Version:       version,
 	SilenceErrors: true, // we render errors ourselves in Execute
 	SilenceUsage:  true,
@@ -129,6 +131,17 @@ func newAnonymousClient() *client.Client {
 // expiry, and reactive on a 401 invalid_token) and returns a friendly
 // "run harbor login" error when no session exists.
 func loadClientFromConfig() (*client.Client, *config.Credentials, error) {
+	// An explicit HARBOR_TOKEN bypasses the saved session entirely — handy for
+	// CI and one-off shells. It's used as a bearer (typically a Personal Access
+	// Token) for this process only: never persisted and never refreshed.
+	if envTok := strings.TrimSpace(os.Getenv("HARBOR_TOKEN")); envTok != "" {
+		base := resolveBaseURL(nil)
+		creds := &config.Credentials{AccessToken: envTok, ClientID: cliClientID, APIURL: base}
+		c := client.NewClient(base, envTok)
+		c.Verbose = verboseFlag
+		return c, creds, nil
+	}
+
 	creds, err := config.Load()
 	if err != nil {
 		return nil, nil, err
@@ -137,16 +150,20 @@ func loadClientFromConfig() (*client.Client, *config.Credentials, error) {
 	c := client.NewClient(resolveBaseURL(creds), creds.AccessToken)
 	c.Verbose = verboseFlag
 
-	// Reactive refresh: invoked by the client on a 401 invalid_token.
-	c.OnUnauthorized = func() (string, bool) {
-		return refreshAndPersist(c, creds)
-	}
-
-	// Proactive refresh: if the token is expired (or within the skew window),
-	// refresh before issuing the first request so we avoid a guaranteed 401.
-	if creds.RefreshToken != "" && creds.IsExpired(tokenRefreshSkew) {
-		if newTok, ok := refreshAndPersist(c, creds); ok {
-			c.AccessToken = newTok
+	// A refresh token means this is a rotating session: wire proactive +
+	// reactive refresh. A non-expiring PAT has none, so we skip it — a 401 then
+	// surfaces cleanly (the token was revoked; the user re-runs 'harbor login').
+	if creds.RefreshToken != "" {
+		// Reactive refresh: invoked by the client on a 401 invalid_token.
+		c.OnUnauthorized = func() (string, bool) {
+			return refreshAndPersist(c, creds)
+		}
+		// Proactive refresh: if the token is expired (or within the skew
+		// window), refresh before the first request to avoid a guaranteed 401.
+		if creds.IsExpired(tokenRefreshSkew) {
+			if newTok, ok := refreshAndPersist(c, creds); ok {
+				c.AccessToken = newTok
+			}
 		}
 	}
 
