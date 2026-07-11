@@ -8,15 +8,15 @@ import (
 	"testing"
 )
 
-func TestPasswordGrant(t *testing.T) {
+func TestAuthorizationCodeGrant(t *testing.T) {
 	var rec recordedRequest
 	srv := newTestServer(t, &rec, 200, `{"access_token":"at_1","refresh_token":"rt_1","token_type":"Bearer","expires_in":3600,"scope":"notes"}`)
 	defer srv.Close()
 
 	c := NewClient(srv.URL, "")
-	_, tok, err := c.PasswordGrant("harbor-app", "you@example.com", "pw", "notes", "dev-1", "Dev")
+	_, tok, err := c.AuthorizationCodeGrant("harbor-cli", "ac_code", "http://127.0.0.1:5555/callback", "verifier_secret")
 	if err != nil {
-		t.Fatalf("PasswordGrant error: %v", err)
+		t.Fatalf("AuthorizationCodeGrant error: %v", err)
 	}
 	if tok.AccessToken != "at_1" {
 		t.Errorf("token = %+v", tok)
@@ -28,11 +28,68 @@ func TestPasswordGrant(t *testing.T) {
 	if err := json.Unmarshal(rec.Body, &body); err != nil {
 		t.Fatalf("body not JSON: %v", err)
 	}
-	if body["grant_type"] != "password" || body["username"] != "you@example.com" {
+	if body["grant_type"] != "authorization_code" || body["client_id"] != "harbor-cli" {
 		t.Errorf("body = %v", body)
 	}
-	if body["device_id"] != "dev-1" {
-		t.Errorf("device_id not sent: %v", body)
+	if body["code"] != "ac_code" || body["code_verifier"] != "verifier_secret" {
+		t.Errorf("code/verifier not sent: %v", body)
+	}
+	if body["redirect_uri"] != "http://127.0.0.1:5555/callback" {
+		t.Errorf("redirect_uri not sent: %v", body)
+	}
+}
+
+func TestCreatePAT(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 201, `{"data":{"id":"pat_1","token":"hbp_secret","name":"harbor-cli on host","scopes":["notes","sync"],"token_kind":"pat","expires_at":null,"created_at":1750000000000}}`)
+	defer srv.Close()
+
+	c := testClient(srv.URL)
+	_, pat, err := c.CreatePAT("harbor-cli on host", []string{"notes", "sync"}, 0)
+	if err != nil {
+		t.Fatalf("CreatePAT error: %v", err)
+	}
+	if pat.Token != "hbp_secret" || pat.ID != "pat_1" {
+		t.Errorf("pat = %+v", pat)
+	}
+	if pat.ExpiresAt != nil {
+		t.Errorf("expected never-expiring PAT (nil expires_at), got %v", *pat.ExpiresAt)
+	}
+	if rec.Method != "POST" || rec.Path != "/tokens" {
+		t.Errorf("request = %s %s", rec.Method, rec.Path)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body, &body); err != nil {
+		t.Fatalf("body not JSON: %v", err)
+	}
+	if body["name"] != "harbor-cli on host" {
+		t.Errorf("name = %v", body["name"])
+	}
+	// expires_in must be OMITTED for a never-expiring token.
+	if _, ok := body["expires_in"]; ok {
+		t.Errorf("expires_in must be omitted for a never-expiring PAT; body = %v", body)
+	}
+	scopes, _ := body["scopes"].([]any)
+	if len(scopes) != 2 || scopes[0] != "notes" {
+		t.Errorf("scopes = %v", body["scopes"])
+	}
+}
+
+// TestCreatePATWithExpiry verifies expires_in is sent when a finite lifetime is
+// requested.
+func TestCreatePATWithExpiry(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 201, `{"data":{"id":"pat_2","token":"hbp_x","name":"ci","scopes":["notes"],"token_kind":"pat","expires_at":1752592000000,"created_at":1750000000000}}`)
+	defer srv.Close()
+
+	c := testClient(srv.URL)
+	if _, _, err := c.CreatePAT("ci", []string{"notes"}, 2592000); err != nil {
+		t.Fatalf("CreatePAT error: %v", err)
+	}
+	var body map[string]any
+	_ = json.Unmarshal(rec.Body, &body)
+	if body["expires_in"] != float64(2592000) {
+		t.Errorf("expires_in = %v, want 2592000", body["expires_in"])
 	}
 }
 

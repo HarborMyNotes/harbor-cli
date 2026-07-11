@@ -23,8 +23,10 @@ const (
 	// environments — it is not a customer-facing feature.
 	DefaultBaseURL = "https://app.harbor.my/api/v1"
 
-	// DefaultClientID is the first-party OAuth client that permits the password
-	// grant. It is configurable but customers never need to change it.
+	// DefaultClientID is the fallback OAuth client id used only when a saved
+	// credential predates the browser-login change and has no client_id. New
+	// logins store "harbor-cli" explicitly; legacy sessions minted under
+	// "harbor-app" keep working because they carry their own client_id.
 	DefaultClientID = "harbor-app"
 
 	// configDir is the directory name under ~/.config for Harbor credentials.
