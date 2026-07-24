@@ -314,6 +314,14 @@ func displayNote(data []byte) {
 		{"USN", str(n, "usn")},
 		{"Updated", epochMS(num(n, "updated_at"))},
 	}
+	// Show the clip/import provenance when present, mirroring the web app's
+	// source-URL chip. Only-when-non-empty keeps unclipped notes clean.
+	if a := str(n, "author"); a != "" {
+		pairs = append(pairs, [2]string{"Author", a})
+	}
+	if u := str(n, "source_url"); u != "" {
+		pairs = append(pairs, [2]string{"Source", u})
+	}
 	if usn != "" {
 		pairs = append(pairs, [2]string{"New USN", bold(usn)})
 	}
