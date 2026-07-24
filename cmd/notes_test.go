@@ -36,6 +36,24 @@ func TestDisplayNoteRendersBodyAndUSN(t *testing.T) {
 	}
 }
 
+func TestDisplayNoteSourceAndAuthor(t *testing.T) {
+	// A clipped note carries source_url and author: both should print.
+	clipped := []byte(`{"id":"n1","title":"Clip","source_url":"https://example.com/clip","author":"Jane Doe","content":"body"}`)
+	out := captureStdout(t, func() { displayNote(clipped) })
+	if !strings.Contains(out, "Source") || !strings.Contains(out, "https://example.com/clip") {
+		t.Errorf("source line missing:\n%s", out)
+	}
+	if !strings.Contains(out, "Author") || !strings.Contains(out, "Jane Doe") {
+		t.Errorf("author line missing:\n%s", out)
+	}
+	// A plain note has neither field: nothing extra should appear.
+	plain := []byte(`{"id":"n2","title":"Plain","content":"body"}`)
+	out = captureStdout(t, func() { displayNote(plain) })
+	if strings.Contains(out, "Source") || strings.Contains(out, "Author") {
+		t.Errorf("unclipped note should not print Source/Author:\n%s", out)
+	}
+}
+
 func TestDisplayNoteEncrypted(t *testing.T) {
 	data := []byte(`{"id":"n1","title":"sealed","is_encrypted":true,"content":"AAAA"}`)
 	out := captureStdout(t, func() { displayNote(data) })
