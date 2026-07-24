@@ -54,6 +54,11 @@ type Client struct {
 	refreshMu sync.Mutex
 }
 
+// clientPlatform identifies this client to the API via the X-Harbor-Platform
+// header on every request. The backend uses it to attribute in-app Contact
+// Support requests (and analytics) to the platform they originated from.
+const clientPlatform = "cli"
+
 // NewClient creates a Harbor API client for the given base URL and access
 // token. The base URL is trimmed of any trailing slash.
 func NewClient(baseURL, accessToken string) *Client {
@@ -290,6 +295,7 @@ func (c *Client) setCommonHeaders(req *http.Request) {
 	if c.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.AccessToken)
 	}
+	req.Header.Set("X-Harbor-Platform", clientPlatform)
 	req.Header.Set("X-Request-Id", generateRequestID())
 }
 
