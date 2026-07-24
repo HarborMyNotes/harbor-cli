@@ -22,6 +22,7 @@ type recordedRequest struct {
 	Accept      string
 	ContentType string
 	RequestID   string
+	Platform    string
 }
 
 // newTestServer starts an httptest server whose handler records the incoming
@@ -40,6 +41,7 @@ func newTestServer(t *testing.T, rec *recordedRequest, status int, body string) 
 			rec.Accept = r.Header.Get("Accept")
 			rec.ContentType = r.Header.Get("Content-Type")
 			rec.RequestID = r.Header.Get("X-Request-Id")
+			rec.Platform = r.Header.Get("X-Harbor-Platform")
 		}
 		w.Header().Set("X-Request-Id", "req_server123")
 		w.WriteHeader(status)

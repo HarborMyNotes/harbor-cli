@@ -208,6 +208,7 @@ See `harbor search --help`.
 | `harbor profile get/update/change-password/…` | Manage your profile. |
 | `harbor sessions list/revoke/revoke-others/revoke-all` | Manage login sessions. |
 | `harbor settings get/set` | Account preferences. |
+| `harbor support` | Contact Harbor support (category, subject, message, attachments). |
 | `harbor account export/export-status/delete/cancel-delete` | GDPR export & deletion. |
 | `harbor import enex <file>` / `harbor export enex` | Evernote ENEX interchange. |
 | `harbor status` | Server health (liveness, readiness, version). |
