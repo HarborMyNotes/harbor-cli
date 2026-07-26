@@ -49,6 +49,42 @@ func TestChangePassword(t *testing.T) {
 	}
 }
 
+func TestSetInboundEmailEnabled(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		var rec recordedRequest
+		srv := newTestServer(t, &rec, 200, `{"data":{"id":"u1","inbound_email_address":"jane.k3f9qzab@m.example.test","inbound_email_enabled":true}}`)
+		if _, err := testClient(srv.URL).SetInboundEmailEnabled(enabled); err != nil {
+			t.Fatalf("SetInboundEmailEnabled(%v) error: %v", enabled, err)
+		}
+		srv.Close()
+		if rec.Method != "PUT" || rec.Path != "/profile" {
+			t.Errorf("%s %s, want PUT /profile", rec.Method, rec.Path)
+		}
+		var body map[string]any
+		_ = json.Unmarshal(rec.Body, &body)
+		// Only the switch is sent — a toggle must never restate other fields.
+		if len(body) != 1 || body["inbound_email_enabled"] != enabled {
+			t.Errorf("body = %v, want only inbound_email_enabled=%v", body, enabled)
+		}
+	}
+}
+
+func TestResetInboundEmail(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 200, `{"data":{"inbound_email_address":"jane.9xq2mvbr@m.example.test"}}`)
+	defer srv.Close()
+	if _, err := testClient(srv.URL).ResetInboundEmail(); err != nil {
+		t.Fatalf("ResetInboundEmail error: %v", err)
+	}
+	if rec.Method != "POST" || rec.Path != "/profile/inbound-email/reset" {
+		t.Errorf("%s %s, want POST /profile/inbound-email/reset", rec.Method, rec.Path)
+	}
+	// The endpoint takes no body at all.
+	if len(rec.Body) != 0 {
+		t.Errorf("body = %q, want empty", string(rec.Body))
+	}
+}
+
 func TestAvatarAndConfirmEmail(t *testing.T) {
 	var rec recordedRequest
 	srv := newTestServer(t, &rec, 200, `{"data":{}}`)

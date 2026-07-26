@@ -328,6 +328,22 @@ func boolMark(b bool) string {
 	return dim("·")
 }
 
+// onOff renders a boolean switch as a colored On/Off word. Unlike boolMark's
+// glyph it stays legible with color off or piped through another tool, so a
+// state the user must not misread (e.g. whether the email-to-note address is
+// accepting mail) is never ambiguous.
+func onOff(b bool) string {
+	if b {
+		return colorize("On", text.FgGreen)
+	}
+	return colorize("Off", text.FgYellow)
+}
+
+// strike renders struck-through text — used for a value that still belongs to
+// the account but is currently inactive (a disabled email-to-note address),
+// mirroring how the web Settings card shows it.
+func strike(s string) string { return colorize(s, text.CrossedOut) }
+
 // shortID abbreviates a long opaque id/hash for table display, keeping the
 // leading characters. Full ids are always available via --json.
 func shortID(s string, n int) string {
