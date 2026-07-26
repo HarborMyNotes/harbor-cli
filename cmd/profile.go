@@ -184,6 +184,12 @@ var profileConfirmEmailCmd = &cobra.Command{
 // therefore means "not disclosed to you" and must never be read as "off".
 var errInboundEmailUndisclosed = errors.New("this client was not given an email-to-note address — sign in with 'harbor login' rather than a third-party token")
 
+// errInboundEmailResetUnreadable is returned when a rotation was accepted but the
+// new address could not be read back out of the response. The old address is
+// already dead at that point, so this must fail loudly: the user needs to know
+// they have an address they have not seen yet, not a success line.
+var errInboundEmailResetUnreadable = errors.New("the rotation may have gone through, but the new address could not be read from the response — run 'harbor profile inbound-email show' to see your current address, and assume the old one no longer works")
+
 // profileInboundEmailCmd is the parent for the account's email-to-note address.
 var profileInboundEmailCmd = &cobra.Command{
 	Use:   "inbound-email",
@@ -225,10 +231,11 @@ one. With --json this prints the whole profile response (the address lives at
 		if err != nil {
 			return mapProfileError(err)
 		}
-		if _, ok := inboundEmailAddress(parseJSON(client.UnwrapData(data))); !ok {
-			return errInboundEmailUndisclosed
+		p, err := inboundEmailProfile(data)
+		if err != nil {
+			return err
 		}
-		printResult(data, displayInboundEmail)
+		printResult(data, func([]byte) { renderInboundEmailCard(p) })
 		return nil
 	},
 }
@@ -263,7 +270,20 @@ disabled. You will be asked to confirm by typing "yes" unless you pass --yes; in
 		if err != nil {
 			return mapProfileError(err)
 		}
-		printResult(data, displayInboundEmailReset)
+		// A rotation cannot be undone: if the server accepted it, the old address
+		// is already dead. So a 2xx we cannot read the new address out of is a
+		// failure, never a success line — telling the user "rotated" while
+		// withholding the replacement would leave them with no working address
+		// and no idea what happened. In --json the raw response still goes to
+		// stdout so the caller keeps whatever came back.
+		addr, ok := inboundEmailAddress(parseJSON(client.UnwrapData(data)))
+		if !ok || addr == "" {
+			if jsonOutput {
+				printResult(data, func([]byte) {})
+			}
+			return errInboundEmailResetUnreadable
+		}
+		printResult(data, func([]byte) { renderInboundEmailReset(addr) })
 		return nil
 	},
 }
@@ -293,6 +313,11 @@ var profileInboundEmailDisableCmd = &cobra.Command{
 // setInboundEmailEnabled flips the per-user switch through PUT /profile and
 // renders the resulting card. The stored address is never touched by this call,
 // so toggling off and on again returns the same address.
+//
+// It runs the same entitlement gate as 'show': a response without the address is
+// an ERROR, not a card. Deciding that in a display function would only ever
+// print — the command would exit 0 and a script would read "the switch was
+// flipped" from a run that changed nothing.
 func setInboundEmailEnabled(enabled bool) error {
 	c, _, err := loadClientFromConfig()
 	if err != nil {
@@ -302,24 +327,56 @@ func setInboundEmailEnabled(enabled bool) error {
 	if err != nil {
 		return mapProfileError(err)
 	}
-	printResult(data, displayInboundEmail)
+	p, err := inboundEmailProfile(data)
+	if err != nil {
+		return err
+	}
+	printResult(data, func([]byte) { renderInboundEmailCard(p) })
 	return nil
 }
 
-// inboundEmailConfirmReset gates the destructive rotation. With --yes it returns
-// nil immediately. Otherwise, in --json mode or when stdin is not a terminal
-// (scripts, CI, AI agents), it refuses rather than prompting; on an interactive
-// terminal it requires the user to type exactly "yes" after being told that the
-// old address dies immediately.
+// inboundEmailProfile parses a profile response and enforces the entitlement
+// gate in one place, so every command that reads the card agrees on what the
+// same response shape means. Missing keys mean the API did not disclose the
+// address to this client, which is a failure to report — never a card to render
+// with a blank or "off" address.
+func inboundEmailProfile(data []byte) (map[string]any, error) {
+	p := parseJSON(client.UnwrapData(data))
+	if _, ok := inboundEmailAddress(p); !ok {
+		return nil, errInboundEmailUndisclosed
+	}
+	return p, nil
+}
+
+// inboundEmailConfirmReset gates the destructive rotation for the command,
+// resolving how the user should be asked (is this a terminal we can prompt on?)
+// and delegating the decision to inboundEmailResetGuard.
 func inboundEmailConfirmReset(yes bool) error {
+	return inboundEmailResetGuard(jsonOutput, term.IsTerminal(int(os.Stdin.Fd())), yes, promptLine)
+}
+
+// inboundEmailResetGuard decides whether a rotation may proceed. Interactivity
+// and the prompt are parameters rather than ambient state so every branch —
+// including the typed-wrong-answer one — is reachable in a test; a destructive,
+// non-undoable gate that only real hands can exercise is a gate that silently
+// rots.
+//
+// Rules:
+//   - --yes proceeds without asking (that is its whole job).
+//   - Otherwise, in --json mode or when stdin is not a terminal (scripts, CI, AI
+//     agents), refuse rather than prompt: nobody is there to answer, and the
+//     rotation cannot be undone.
+//   - On a terminal, require the word "yes" exactly, after saying plainly that
+//     the old address dies immediately.
+func inboundEmailResetGuard(jsonMode, interactive, yes bool, ask func(string) (string, error)) error {
 	if yes {
 		return nil
 	}
-	if jsonOutput || !term.IsTerminal(int(os.Stdin.Fd())) {
+	if jsonMode || !interactive {
 		return errors.New("refusing to rotate your email-to-note address without confirmation — pass --yes")
 	}
 	fmt.Println("This rotates your email-to-note address. The old address stops working IMMEDIATELY and mail sent to it will be dropped.")
-	answer, err := promptLine(`Type "yes" to confirm: `)
+	answer, err := ask(`Type "yes" to confirm: `)
 	if err != nil {
 		return err
 	}
@@ -356,16 +413,12 @@ func inboundAddressDisplay(addr string, enabled bool) string {
 	return strike(addr) + "  " + dim("(off)")
 }
 
-// displayInboundEmail renders the email-to-note card from a profile response —
-// either GET /profile or the PUT that just toggled the switch. The address is
-// always shown; the state is spelled out in words so it survives --no-color.
-func displayInboundEmail(data []byte) {
-	p := parseJSON(client.UnwrapData(data))
-	addr, ok := inboundEmailAddress(p)
-	if !ok {
-		fmt.Println(errInboundEmailUndisclosed.Error())
-		return
-	}
+// renderInboundEmailCard renders the email-to-note card from an already-parsed
+// and already-gated profile object (GET /profile, or the PUT that just toggled
+// the switch). The address is always shown; the state is spelled out in words so
+// it survives --no-color and pipes, where the strikethrough does not.
+func renderInboundEmailCard(p map[string]any) {
+	addr, _ := inboundEmailAddress(p)
 	enabled := boolean(p, "inbound_email_enabled")
 	printKV([][2]string{
 		{"Address", inboundAddressDisplay(addr, enabled)},
@@ -378,16 +431,11 @@ func displayInboundEmail(data []byte) {
 	fmt.Println(dim("Mail sent to this address is dropped while it is off. Run 'harbor profile inbound-email enable' to start accepting it again."))
 }
 
-// displayInboundEmailReset renders the rotation result. The response carries the
+// renderInboundEmailReset renders the rotation result. The response carries the
 // new address only — a reset deliberately leaves the on/off switch alone — so
 // this says the setting is unchanged rather than implying the address is live.
-func displayInboundEmailReset(data []byte) {
-	d := parseJSON(client.UnwrapData(data))
-	addr, ok := inboundEmailAddress(d)
-	if !ok || addr == "" {
-		fmt.Println("Address rotated. The old address stops working immediately.")
-		return
-	}
+// It is only reached with an address in hand: see errInboundEmailResetUnreadable.
+func renderInboundEmailReset(addr string) {
 	fmt.Println("Address rotated. The old address stops working immediately.")
 	printKV([][2]string{{"New address", bold(addr)}})
 	fmt.Println(dim("Your on/off setting is unchanged. Update anything that forwards mail to the old address."))

@@ -26,17 +26,23 @@ import (
 var colorReady bool
 
 // useColor reports whether ANSI color should be emitted, honoring --no-color,
-// the NO_COLOR convention, and whether stdout is a TTY. It also flips
-// go-pretty's global color switch the first time it runs.
+// the NO_COLOR convention, whether stdout is a TTY, and CLICOLOR_FORCE. It also
+// flips go-pretty's global color switch the first time it runs.
+//
+// CLICOLOR_FORCE (the https://bixense.com/clicolors convention) overrides only
+// the TTY check, so color survives a pipe into `less -R` or a CI log that
+// renders ANSI. An explicit opt-out — --no-color or NO_COLOR — always wins.
 func useColor() bool {
 	enabled := true
+	if force := os.Getenv("CLICOLOR_FORCE"); force != "" && force != "0" {
+		enabled = true
+	} else if !term.IsTerminal(int(os.Stdout.Fd())) {
+		enabled = false
+	}
 	if noColorFlag {
 		enabled = false
 	}
 	if _, ok := os.LookupEnv("NO_COLOR"); ok {
-		enabled = false
-	}
-	if !term.IsTerminal(int(os.Stdout.Fd())) {
 		enabled = false
 	}
 	if !colorReady {
