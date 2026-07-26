@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cloudmanic/harbor-cli/config"
-	"github.com/cloudmanic/harbor-cli/crypto"
+	"github.com/HarborMyNotes/harbor-cli/config"
+	"github.com/HarborMyNotes/harbor-cli/crypto"
 )
 
 // testParams is a cheap Argon2id profile so the wiring tests stay fast.

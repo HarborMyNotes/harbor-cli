@@ -9,9 +9,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/cloudmanic/harbor-cli/client"
-	"github.com/cloudmanic/harbor-cli/config"
-	"github.com/cloudmanic/harbor-cli/crypto"
+	"github.com/HarborMyNotes/harbor-cli/client"
+	"github.com/HarborMyNotes/harbor-cli/config"
+	"github.com/HarborMyNotes/harbor-cli/crypto"
 	"github.com/spf13/cobra"
 )
 

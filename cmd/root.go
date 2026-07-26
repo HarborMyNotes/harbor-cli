@@ -10,8 +10,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/cloudmanic/harbor-cli/client"
-	"github.com/cloudmanic/harbor-cli/config"
+	"github.com/HarborMyNotes/harbor-cli/client"
+	"github.com/HarborMyNotes/harbor-cli/config"
 	"github.com/spf13/cobra"
 )
 
@@ -30,7 +30,7 @@ var (
 )
 
 // version is the CLI version, injected at build time via
-// -ldflags "-X github.com/cloudmanic/harbor-cli/cmd.version=vX.Y.Z".
+// -ldflags "-X github.com/HarborMyNotes/harbor-cli/cmd.version=vX.Y.Z".
 // It defaults to "dev" for local builds.
 var version = "dev"
 

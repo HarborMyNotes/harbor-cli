@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cloudmanic/harbor-cli/client"
-	"github.com/cloudmanic/harbor-cli/crypto"
+	"github.com/HarborMyNotes/harbor-cli/client"
+	"github.com/HarborMyNotes/harbor-cli/crypto"
 	"github.com/spf13/cobra"
 )
 

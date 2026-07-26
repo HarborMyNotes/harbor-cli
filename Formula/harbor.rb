@@ -8,18 +8,18 @@
 # line is updated automatically by the release workflow.
 class Harbor < Formula
   desc "Command-line client for the Harbor notes API"
-  homepage "https://github.com/cloudmanic/harbor-cli"
+  homepage "https://github.com/HarborMyNotes/harbor-cli"
   license "MIT"
   version "0.1.7"
 
   if OS.mac? && Hardware::CPU.arm?
-    url "https://github.com/cloudmanic/harbor-cli/releases/latest/download/harbor-darwin-arm64"
+    url "https://github.com/HarborMyNotes/harbor-cli/releases/latest/download/harbor-darwin-arm64"
   elsif OS.mac? && Hardware::CPU.intel?
-    url "https://github.com/cloudmanic/harbor-cli/releases/latest/download/harbor-darwin-amd64"
+    url "https://github.com/HarborMyNotes/harbor-cli/releases/latest/download/harbor-darwin-amd64"
   elsif OS.linux? && Hardware::CPU.arm?
-    url "https://github.com/cloudmanic/harbor-cli/releases/latest/download/harbor-linux-arm64"
+    url "https://github.com/HarborMyNotes/harbor-cli/releases/latest/download/harbor-linux-arm64"
   elsif OS.linux? && Hardware::CPU.intel?
-    url "https://github.com/cloudmanic/harbor-cli/releases/latest/download/harbor-linux-amd64"
+    url "https://github.com/HarborMyNotes/harbor-cli/releases/latest/download/harbor-linux-amd64"
   end
 
   def install

@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cloudmanic/harbor-cli/client"
+	"github.com/HarborMyNotes/harbor-cli/client"
 )
 
 func TestRunSyncPullPagesAllChunks(t *testing.T) {

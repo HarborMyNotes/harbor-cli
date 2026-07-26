@@ -1,4 +1,4 @@
-module github.com/cloudmanic/harbor-cli
+module github.com/HarborMyNotes/harbor-cli
 
 go 1.26.2
 
