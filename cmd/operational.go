@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/cloudmanic/harbor-cli/client"
+	"github.com/HarborMyNotes/harbor-cli/client"
 	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/spf13/cobra"
 )

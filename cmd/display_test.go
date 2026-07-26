@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cloudmanic/harbor-cli/client"
+	"github.com/HarborMyNotes/harbor-cli/client"
 )
 
 // apiErr builds a *client.APIError with the given code, for error-mapping tests.

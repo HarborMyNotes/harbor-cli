@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cloudmanic/harbor-cli/client"
+	"github.com/HarborMyNotes/harbor-cli/client"
 )
 
 // TestOperationalStatusEquals checks the bare-status comparison used to read

@@ -11,8 +11,8 @@ import (
 	"os"
 	"sort"
 
-	"github.com/cloudmanic/harbor-cli/client"
-	"github.com/cloudmanic/harbor-cli/config"
+	"github.com/HarborMyNotes/harbor-cli/client"
+	"github.com/HarborMyNotes/harbor-cli/config"
 	"github.com/spf13/cobra"
 )
 

@@ -54,7 +54,7 @@ If the `harbor` command is not installed or the user is not logged in, see
 
 ```bash
 # Is the CLI installed?
-harbor --version            # if "command not found": brew install cloudmanic/tap/harbor
+harbor --version            # if "command not found": brew install HarborMyNotes/tap/harbor
 
 # Is there a logged-in session? (prints email, scopes, expiry — exit 0 if logged in)
 harbor whoami --json

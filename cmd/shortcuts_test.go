@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cloudmanic/harbor-cli/client"
+	"github.com/HarborMyNotes/harbor-cli/client"
 )
 
 // TestDisplayShortcuts checks the list table shows labels, the saved query for a

@@ -29,7 +29,7 @@ harbor notes list --json | jq '.data[] | {id, title}'
 ### Homebrew (macOS / Linux)
 
 ```sh
-brew tap cloudmanic/harbor https://github.com/cloudmanic/harbor-cli
+brew tap HarborMyNotes/harbor https://github.com/HarborMyNotes/harbor-cli
 brew install harbor
 brew upgrade harbor   # later, to update
 ```
@@ -37,21 +37,21 @@ brew upgrade harbor   # later, to update
 ### Prebuilt binaries
 
 Download the binary for your platform from the
-[latest release](https://github.com/cloudmanic/harbor-cli/releases/latest)
+[latest release](https://github.com/HarborMyNotes/harbor-cli/releases/latest)
 (`harbor-<os>-<arch>`), make it executable, and put it on your `PATH`:
 
 ```sh
-curl -L -o harbor https://github.com/cloudmanic/harbor-cli/releases/latest/download/harbor-darwin-arm64
+curl -L -o harbor https://github.com/HarborMyNotes/harbor-cli/releases/latest/download/harbor-darwin-arm64
 chmod +x harbor && sudo mv harbor /usr/local/bin/
 ```
 
 ### From source
 
 ```sh
-git clone https://github.com/cloudmanic/harbor-cli
+git clone https://github.com/HarborMyNotes/harbor-cli
 cd harbor-cli
 make build          # produces ./build/harbor
-# or: go install github.com/cloudmanic/harbor-cli@latest
+# or: go install github.com/HarborMyNotes/harbor-cli@latest
 ```
 
 ### Shell completion

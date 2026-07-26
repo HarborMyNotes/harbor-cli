@@ -3,7 +3,7 @@
 
 package main
 
-import "github.com/cloudmanic/harbor-cli/cmd"
+import "github.com/HarborMyNotes/harbor-cli/cmd"
 
 // main is the entry point for the harbor CLI tool. It delegates to the cobra
 // command tree defined in the cmd package.

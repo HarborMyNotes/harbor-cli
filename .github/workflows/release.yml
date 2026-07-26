@@ -60,7 +60,7 @@ jobs:
       - name: Build binaries
         run: |
           VERSION=${{ steps.version.outputs.version }}
-          LDFLAGS="-X github.com/cloudmanic/harbor-cli/cmd.version=${VERSION}"
+          LDFLAGS="-X github.com/HarborMyNotes/harbor-cli/cmd.version=${VERSION}"
           mkdir -p dist
           GOOS=darwin  GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/harbor-darwin-amd64 .
           GOOS=darwin  GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/harbor-darwin-arm64 .

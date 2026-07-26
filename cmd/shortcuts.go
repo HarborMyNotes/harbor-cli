@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/cloudmanic/harbor-cli/client"
+	"github.com/HarborMyNotes/harbor-cli/client"
 	"github.com/spf13/cobra"
 )
 
