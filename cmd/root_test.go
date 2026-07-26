@@ -1,0 +1,206 @@
+// Copyright 2026 Cloudmanic Labs, LLC. All rights reserved.
+// Date: 2026-07-25
+
+package cmd
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+)
+
+// ===========================================================================
+// RunE execution harness
+// ===========================================================================
+//
+// Display functions and helpers can be called directly, but that leaves the
+// WIRING untested — whether a command actually consults the guard it is supposed
+// to consult, and whether it reports failure as an error (exit 1, stderr) rather
+// than a printed line (exit 0, stdout). These helpers run the real cobra tree
+// against a mock API so the call sites are pinned too, not just their parts.
+
+// mockRequest is one request a command actually sent, as observed by the server.
+type mockRequest struct {
+	Method string
+	Path   string
+	Body   string
+}
+
+// mockReply is a canned response for a "METHOD /path" route.
+type mockReply struct {
+	Status int
+	Body   string
+}
+
+// apiMock is a stub Harbor API. It records every request a command made — which
+// is how a test proves a destructive call did NOT happen — and replies from a
+// route table. An unrouted request is a test failure, not a silent 404.
+type apiMock struct {
+	t        *testing.T
+	srv      *httptest.Server
+	routes   map[string]mockReply
+	requests []mockRequest
+}
+
+// newAPIMock starts a stub API. Routes are keyed "METHOD /path", e.g.
+// "GET /api/v1/profile" — the CLI's base URL includes the /api/v1 prefix.
+func newAPIMock(t *testing.T, routes map[string]mockReply) *apiMock {
+	t.Helper()
+	m := &apiMock{t: t, routes: routes}
+	m.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		m.requests = append(m.requests, mockRequest{Method: r.Method, Path: r.URL.Path, Body: string(body)})
+		reply, ok := m.routes[r.Method+" "+r.URL.Path]
+		if !ok {
+			m.t.Errorf("apiMock: unrouted request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(reply.Status)
+		_, _ = w.Write([]byte(reply.Body))
+	}))
+	t.Cleanup(m.srv.Close)
+	return m
+}
+
+// baseURL is the value HARBOR_API_URL is set to for a run: the /api/v1 prefix is
+// part of the base URL, exactly as in a real credentials file.
+func (m *apiMock) baseURL() string { return m.srv.URL + "/api/v1" }
+
+// calls renders the recorded traffic as "METHOD /path" strings, for asserting
+// both what was sent and — just as importantly — what was not.
+func (m *apiMock) calls() []string {
+	out := make([]string, 0, len(m.requests))
+	for _, r := range m.requests {
+		out = append(out, r.Method+" "+r.Path)
+	}
+	return out
+}
+
+// bodyOf returns the decoded JSON body of the first request matching
+// "METHOD /path", so a test can pin the exact wire payload.
+func (m *apiMock) bodyOf(t *testing.T, methodAndPath string) map[string]any {
+	t.Helper()
+	for _, r := range m.requests {
+		if r.Method+" "+r.Path == methodAndPath {
+			var body map[string]any
+			if r.Body == "" {
+				return nil
+			}
+			if err := json.Unmarshal([]byte(r.Body), &body); err != nil {
+				t.Fatalf("bodyOf(%s): %v (raw %q)", methodAndPath, err, r.Body)
+			}
+			return body
+		}
+	}
+	t.Fatalf("bodyOf(%s): no such request in %v", methodAndPath, m.calls())
+	return nil
+}
+
+// runCLI executes the real command tree — the same rootCmd main() runs — with
+// args, pointed at a mock API by a HARBOR_TOKEN/HARBOR_API_URL pair (the
+// documented way to run one command without a stored session). It returns
+// stdout plus the error Execute() would render to stderr and exit 1 on, so a
+// test can tell "printed a notice and exited 0" apart from "failed".
+//
+// HOME is a temp dir so a run can never read or write the real credentials file.
+func runCLI(t *testing.T, m *apiMock, args ...string) (string, error) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("HARBOR_API_URL", m.baseURL())
+	t.Setenv("HARBOR_TOKEN", "hbp_test-token-not-a-real-credential")
+	resetCommandState(t)
+
+	rootCmd.SetArgs(args)
+	var err error
+	out := captureStdout(t, func() { err = rootCmd.Execute() })
+	return out, err
+}
+
+// resetCommandState returns the shared command tree to its default state. The
+// commands and the global flag variables are package-level, so cobra carries
+// flag values and Changed markers from one Execute to the next; without this a
+// --json or --yes from an earlier test leaks into a later one.
+func resetCommandState(t *testing.T) {
+	t.Helper()
+	clear := func() {
+		jsonOutput = false
+		verboseFlag = false
+		utcFlag = false
+		apiURLFlag = ""
+		resetFlags(rootCmd)
+	}
+	clear()
+	t.Cleanup(clear)
+}
+
+// resetFlags restores every flag in a command tree to its declared default.
+// Slice/array flags are skipped: pflag appends to those on Set, so "resetting"
+// one would grow it instead.
+func resetFlags(c *cobra.Command) {
+	restore := func(f *pflag.Flag) {
+		if strings.Contains(f.Value.Type(), "Slice") || strings.Contains(f.Value.Type(), "Array") {
+			return
+		}
+		_ = f.Value.Set(f.DefValue)
+		f.Changed = false
+	}
+	c.Flags().VisitAll(restore)
+	c.PersistentFlags().VisitAll(restore)
+	for _, sub := range c.Commands() {
+		resetFlags(sub)
+	}
+}
+
+// apiErrorBody builds an error-envelope response body for a mock route.
+func apiErrorBody(code, message string) string {
+	return fmt.Sprintf(`{"error":{"code":%q,"message":%q,"request_id":"req_test"}}`, code, message)
+}
+
+// ===========================================================================
+// Harness self-checks
+// ===========================================================================
+
+// The harness is only worth trusting if a failing command really surfaces as an
+// error rather than as printed output, since that distinction is what several
+// tests below rest on.
+func TestRunCLISurfacesAPIErrorsAsErrors(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/profile": {Status: 500, Body: apiErrorBody("internal", "boom")},
+	})
+	out, err := runCLI(t, m, "profile", "get")
+	if err == nil {
+		t.Fatal("a 500 must be returned as an error (Execute exits 1), not printed")
+	}
+	if strings.Contains(out, "boom") {
+		t.Errorf("error text must not go to stdout:\n%s", out)
+	}
+}
+
+// Flag state must not leak between runs, or a later test could pass only because
+// an earlier one set --json.
+func TestResetCommandStateClearsJSONFlag(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/profile": {Status: 200, Body: `{"data":{"id":"u1","name":"Jane"}}`},
+	})
+	if _, err := runCLI(t, m, "profile", "get", "--json"); err != nil {
+		t.Fatalf("profile get --json: %v", err)
+	}
+	if !jsonOutput {
+		t.Fatal("--json did not take effect")
+	}
+	if _, err := runCLI(t, m, "profile", "get"); err != nil {
+		t.Fatalf("profile get: %v", err)
+	}
+	if jsonOutput {
+		t.Error("--json leaked into the next run")
+	}
+}

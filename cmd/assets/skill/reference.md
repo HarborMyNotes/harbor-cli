@@ -308,6 +308,19 @@ Account preferences (NOT synced; last-write-wins). `set` is a partial update.
 | `harbor profile confirm-email` | Confirm a staged email change | `--token` |
 | `harbor profile set-avatar` | Avatar from an uploaded image | `--hash` |
 | `harbor profile remove-avatar` | Remove avatar | |
+| `harbor profile inbound-email show` | Show the email-to-note address + on/off | |
+| `harbor profile inbound-email reset` | Rotate it (old address dies at once) | `--yes` (required in `--json`/non-interactive) |
+| `harbor profile inbound-email enable` | Start accepting mail | |
+| `harbor profile inbound-email disable` | Stop accepting mail (address kept) | |
+
+**Email to notes.** Every account has a private address (`harbor profile get` shows
+it as `Inbound email`). Mail forwarded there becomes a note: subject → title,
+body → note, attachments → attachments. `@Notebook` files it in that notebook
+(unknown name → default notebook); `#tag` applies existing tags (unknown tags are
+ignored, never created). Both tokens work anywhere in the subject or body. The
+address is a bearer secret — anyone holding it can create notes in the account,
+and revoking a token does not revoke it — so never echo it into logs or shared
+output; `reset` is the revocation path.
 
 ---
 
