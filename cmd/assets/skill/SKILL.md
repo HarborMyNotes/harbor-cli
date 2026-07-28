@@ -3,8 +3,8 @@ name: harbor
 description: >-
   Create, edit, format, organize, search, and sync Harbor notes from the command
   line with the `harbor` CLI. Use whenever the user wants to capture, read,
-  update, or manage notes, notebooks, tags, reminders, templates, attachments, or
-  shared links in Harbor — especially building richly formatted notes (Markdown /
+  update, or manage notes, notebooks, tags, tasks, reminders, templates,
+  attachments, or shared links in Harbor — especially building richly formatted notes (Markdown /
   HTML, checklists, tables, callouts, colors, note-to-note links, embedded files)
   and safely editing existing notes. Ideal for running Harbor as an AI notes
   assistant.
@@ -42,6 +42,7 @@ Use it whenever the user wants to do anything with their Harbor notes, e.g.:
 - "Make me a checklist / meeting template / formatted doc" → **rich formatting**
 - "Find my notes about …", "what did I write about …" → **search**
 - "Organize / tag / file / move …" → **notebooks & tags**
+- "Add a to-do", "what's due today", "mark that done" → **tasks**
 - "Remind me to …", "share this note", "what changed in this note" → reminders,
   sharing, history
 
@@ -241,6 +242,28 @@ harbor reminders complete "$NOTE_ID" --json
 harbor reminders clear "$NOTE_ID" --json
 ```
 
+### Tasks (standalone to-dos)
+
+A task is its own syncable record, not a field on a note. A bare `YYYY-MM-DD`
+due is stored date-only; a time-bearing value (`in 2h`, RFC3339, epoch-ms) is
+timed.
+
+```bash
+harbor tasks create --title "Pay the invoice" --due 2026-08-01 --priority high --json
+harbor tasks list --status today --json           # due today, still open
+harbor tasks list --due-before "in 24h" --json    # upcoming/overdue
+harbor tasks list --note "$NOTE_ID" --json        # a note's tasks (read-only)
+harbor tasks update "$TASK_ID" --clear-due --json
+harbor tasks done "$TASK_ID" --json               # recurring → advances instead
+harbor tasks undone "$TASK_ID" --json
+harbor tasks delete "$TASK_ID" --json
+```
+
+Recurrence is `daily|weekly|monthly|yearly`, `every:N:days|weeks|months|years`,
+or an RRULE. Completing a recurring task rolls it to its next occurrence rather
+than closing it. Tasks cannot be attached to a note from the CLI — a note's body
+owns its tasks.
+
 ### Templates (reusable starting points)
 
 ```bash
@@ -426,6 +449,7 @@ has copy-paste recipes and the full allowlist.
 | Notebooks | `harbor notebooks list \| create \| update \| delete` |
 | Tags | `harbor tags list \| create \| update \| delete` |
 | Reminders | `harbor reminders set \| list \| complete \| clear` |
+| Tasks | `harbor tasks create \| list \| update \| done \| undone \| delete` |
 | Templates | `harbor templates list \| apply \| create` |
 | Share | `harbor share publish \| unpublish <id>` |
 | Trash / restore | `harbor notes delete <id>` · `harbor trash restore <id>` |

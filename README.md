@@ -244,6 +244,7 @@ See `harbor search --help`.
 | `harbor templates list/get/create/update/delete/apply` | Note templates. |
 | `harbor shortcuts list/get/create/update/delete/reorder` | Sidebar shortcuts. |
 | `harbor reminders list/set/complete/clear` | Note reminders. |
+| `harbor tasks list/get/create/update/done/undone/delete` | Standalone tasks (due dates, recurrence, priority). |
 | `harbor share publish/unpublish/open` | Public read-only sharing. |
 
 ### Account & system

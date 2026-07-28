@@ -146,6 +146,42 @@ Times: epoch-ms, RFC3339, `YYYY-MM-DD`, or relative (`in 2h`, `in 3d`).
 
 ---
 
+## Tasks  (alias: `task`)
+
+A task is a standalone to-do that syncs like a note — a title plus an optional
+due date, reminder, recurrence rule, priority (`none|low|medium|high`) and flag.
+
+Times: epoch-ms, RFC3339, `YYYY-MM-DD`, or relative (`in 2h`). A bare
+`YYYY-MM-DD` due is stored **date-only** (no time shown); anything else is
+timed. Override with `--due-has-time=false|true`.
+
+Recurrence: `daily`, `weekly`, `monthly`, `yearly`, `every:N:days|weeks|months|
+years`, or an RRULE (`FREQ=WEEKLY;BYDAY=FR`).
+
+| Command | What it does | Key flags |
+|---|---|---|
+| `harbor tasks list` | List tasks | `--status active\|today\|done\|all`, `--due-before`, `--note <note-id>`, paging |
+| `harbor tasks get <id>` | One task | |
+| `harbor tasks create` | New task | `--title` (required), `--due`, `--due-has-time`, `--reminder`, `--recurrence`, `--priority`, `--flag`, `--position` |
+| `harbor tasks update <id>` | Change a task | same fields, plus `--clear-due`, `--clear-reminder`, `--clear-recurrence` |
+| `harbor tasks done <id>` | Complete it | `--time` (completion moment) |
+| `harbor tasks undone <id>` | Reopen it | |
+| `harbor tasks delete <id>` | Delete it | |
+
+`--order` sort keys: `due`, `priority`, `created`, `updated`, `position`, `usn`
+(prefix `-` for descending). Within `--note`: `position`, `created`, `updated`,
+`due`, `usn`. Anything else is rejected.
+
+**`done` on a recurring task does not close it** — the task rolls forward to its
+next occurrence and stays open. The CLI says which happened.
+
+**A task cannot be attached to a note from here.** `--note` on `list` is a
+read-only filter; there is no `--note` on `create`/`update`, because a note's
+body owns its tasks and a link without the matching in-note block is removed on
+the note's next save.
+
+---
+
 ## Templates  (aliases: `template`, `tpl`)
 
 Reusable note starting points. Built-in (system) templates are read-only.
