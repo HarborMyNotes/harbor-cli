@@ -13,6 +13,63 @@ renders results as styled tables (via [go-pretty](https://github.com/jedib0t/go-
 or raw JSON (`--json`). It is a thin, well-tested client: business logic lives
 in the API; the CLI's job is ergonomics, output, and auth.
 
+## 🚫 NEVER create an account on production
+
+**Do not sign up for a Harbor account on `app.harbor.my`. Ever.** Not through the web
+signup form, not through the API, not through the CLI, not through a native app, not
+through a browser-automation session, and not "just one to check something."
+
+This is not a style preference. Production is Spicer's live product with real paying
+customers in it. Agent-created signups have already piled up dozens of junk accounts
+there — `testuser_explore123@example.com`, `newuser_harbor_test@example.com`,
+`test_unique_12345@example.com`, a wall of "John Doe" and "Test User" rows — which pollute
+the admin account list, distort counts, sit in the billing and entitlement tables, and
+have to be cleaned up by hand. Every one of them came from an agent that needed somewhere
+to test and picked the easiest target.
+
+### Where to test instead — in this order
+
+1. **A PR-preview sprite. This is the default and it is what you should reach for
+   first.** Every PR against `HarborMyNotes/app.harbor.my` provisions its own throwaway
+   sandbox (`harbor-pr-<PR#>` on sprites.app) with its own database. **If you need an
+   environment to test against, open a DRAFT PR on `app.harbor.my` and use its sprite.**
+   The authoritative URL, a one-click login link, and the seeded accounts are in the
+   sticky **"🚢 Harbor preview"** comment on the PR — read it rather than hardcoding a
+   host. Seeded accounts (all password `foobar123`):
+   - `test@harbor.my` — starts empty → general verification
+   - `seeded@harbor.my` — the Contractors ENEX corpus → anything needing real data
+   - `empty@harbor.my` — deliberately empty → first-run / empty-state checks
+
+   Create, edit, break and delete whatever you like there. The sprite is disposable and
+   nothing in it is real.
+
+2. **A local instance**, when the change doesn't need the hosted stack.
+
+3. **`dev@harbor.my` — the ONE production account you may use.** It exists purely for QA.
+   Create, update and delete whatever you need in it. Its password is in 1Password (Autumn
+   vault, item "Harbor Dev Account"); fetch it with the service-account token, never
+   hardcode it:
+   ```bash
+   export OP_SERVICE_ACCOUNT_TOKEN=$(jq -r .service_account_token ~/.config/1password.json)
+   op read "op://Autumn/Harbor Dev Account/password"
+   ```
+   Reach production explicitly (e.g. `-HarborAPIBaseURL https://app.harbor.my`, or the
+   client's equivalent) rather than by accident.
+
+### Accounts you must never touch
+
+- **`me@spicer.cc`** — Spicer's real personal account. Never sign in, never read, query,
+  screenshot or export it, and never put its data in a commit, PR, issue or log.
+- **`harbormaster@harbor.my`** — the pristine demo/marketing-screenshot account. Read-only
+  as far as you are concerned: never create, edit or delete anything in it.
+- **Any other production account.** If it isn't `dev@harbor.my`, it isn't yours.
+
+### If you genuinely need a new production account
+
+**Stop and ask Spicer.** Explain what you're testing and why a sprite, a local instance
+and `dev@harbor.my` can't cover it. He may say yes — that's his call to make, and it takes
+one message. Creating one and mentioning it afterwards is not the same thing.
+
 ## Layout
 
 ```
