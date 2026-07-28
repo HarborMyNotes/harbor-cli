@@ -156,6 +156,10 @@ func TestCompleteTaskWithDoneTime(t *testing.T) {
 
 // TestCompleteTaskNilBody verifies a nil body still posts a valid JSON object
 // (the server then defaults done_time to now).
+//
+// The assertion is on the exact bytes, not a decoded map: `null` and `{}` both
+// unmarshal into an empty map, so a decoded check passes either way and cannot
+// see the guard in CompleteTask disappear.
 func TestCompleteTaskNilBody(t *testing.T) {
 	var rec recordedRequest
 	srv := newTestServer(t, &rec, 200, `{"task":{"id":"t1"},"usn":15}`)
@@ -163,12 +167,8 @@ func TestCompleteTaskNilBody(t *testing.T) {
 	if _, err := testClient(srv.URL).CompleteTask("t1", nil); err != nil {
 		t.Fatalf("CompleteTask error: %v", err)
 	}
-	var body map[string]any
-	if err := json.Unmarshal(rec.Body, &body); err != nil {
-		t.Fatalf("nil body should marshal to {}, got %q (%v)", rec.Body, err)
-	}
-	if len(body) != 0 {
-		t.Errorf("expected empty body, got %v", body)
+	if got := string(rec.Body); got != "{}" {
+		t.Errorf("body = %q, want %q", got, "{}")
 	}
 }
 

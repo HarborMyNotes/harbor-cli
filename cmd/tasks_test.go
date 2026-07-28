@@ -252,12 +252,17 @@ func TestMapTaskError(t *testing.T) {
 // TestDisplayTasksTable verifies the list table surfaces the completion marker,
 // title, due date, priority, flag, and note ownership.
 func TestDisplayTasksTable(t *testing.T) {
+	// Pinned behind UTC so the date-only column is asserted in the zone where
+	// dropping the UTC render would move it to the previous day.
+	withLocalZone(t, "America/Los_Angeles")
 	data := []byte(`{"data":[
 		{"id":"3f1a2b7c-1111","title":"Pay the invoice","due_at":1785542400000,"due_has_time":false,"priority":"high","flag":true,"note_id":"","usn":95},
-		{"id":"4a2b3c8d-2222","title":"Ship the release","due_at":1785576600000,"due_has_time":true,"priority":"none","flag":false,"note_id":"9c2e1111-3333","done_at":1753000000000,"usn":96}
+		{"id":"4a2b3c8d-2222","title":"Ship the release","due_at":1785922200000,"due_has_time":true,"priority":"none","flag":false,"note_id":"9c2e1111-3333","done_at":1753000000000,"usn":96}
 	],"paging":{"offset":0,"total":2}}`)
 	out := captureStdout(t, func() { displayTasks(data) })
-	for _, want := range []string{"Pay the invoice", "Ship the release", "2026-08-01", "high", "9c2e1111"} {
+	// 2026-08-01 can only come from the date-only row: the timed row is four
+	// days later on purpose, so it cannot satisfy that assertion on its behalf.
+	for _, want := range []string{"Pay the invoice", "Ship the release", "2026-08-01", "2026-08-05", "high", "9c2e1111"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q:\n%s", want, out)
 		}
@@ -347,12 +352,385 @@ func TestDisplayTaskUnexpectedShape(t *testing.T) {
 	}
 }
 
+// withLocalZone pins time.Local for the duration of a test. Setting the TZ env
+// var is not enough — Go resolves time.Local once, so a later TZ change is
+// invisible — and the zone is the whole point here: a date-only due only
+// misrenders in a zone behind UTC, and CI runs in UTC.
+func withLocalZone(t *testing.T, name string) {
+	t.Helper()
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		t.Skipf("zone %s unavailable: %v", name, err)
+	}
+	prev := time.Local
+	time.Local = loc
+	t.Cleanup(func() { time.Local = prev })
+}
+
 // TestTaskDateOnlyRendersInUTC verifies a date-only due keeps its calendar day.
 // It is stored as UTC midnight, so rendering it in a negative-offset local zone
-// would show the day before.
+// would show the day before — which is exactly the zone this test pins.
 func TestTaskDateOnlyRendersInUTC(t *testing.T) {
+	withLocalZone(t, "America/Los_Angeles")
 	ms := float64(time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC).UnixMilli())
 	if got := taskDateOnly(ms); got != "2026-08-01" {
 		t.Errorf("taskDateOnly = %q, want 2026-08-01", got)
+	}
+}
+
+// ===========================================================================
+// RunE wiring
+// ===========================================================================
+//
+// The tests above exercise the extracted helpers. These run the REAL command
+// tree against a mock API, because that is the only thing that pins the call
+// sites: a guard that is never consulted, or a field that reaches the wire from
+// somewhere other than a flag, is invisible to a helper test.
+//
+// The note_id pair is the load-bearing one. A task linked to a note without the
+// note's matching <harbor-task> block is tombstoned by that note's next save
+// (HarborMyNotes/app.harbor.my#1094), so "the CLI never sends note_id" is a
+// data-loss guarantee, and it has to be asserted against the bytes that leave
+// the process — not against the flag set, and not against a map a test built
+// itself.
+
+// taskReply is the {task, usn} body the mock API returns for a task mutation.
+const taskReply = `{"task":{"id":"3f1a2b7c-9d4e-4a1b-8c2d-5e6f7a8b9c0d","title":"X","priority":"none","usn":7},"usn":7}`
+
+// canonicalTaskID is a well-formed id used across the RunE tests; the mock's
+// route table is keyed on the path it produces.
+const canonicalTaskID = "3f1a2b7c-9d4e-4a1b-8c2d-5e6f7a8b9c0d"
+
+// TestTasksCreateNeverSendsNoteIDOnTheWire pins the #1094 guarantee for create
+// against the actual request body. Injecting note_id into the create RunE turns
+// this red.
+func TestTasksCreateNeverSendsNoteIDOnTheWire(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"POST /api/v1/tasks": {Status: 201, Body: taskReply},
+	})
+	if _, err := runCLI(t, m, "tasks", "create", "--title", "X"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	body := m.bodyOf(t, "POST /api/v1/tasks")
+	if v, ok := body["note_id"]; ok {
+		t.Errorf("note_id reached the wire (%v) — a link without the note's block is a delayed delete", v)
+	}
+}
+
+// TestTasksUpdateNeverSendsNoteIDOnTheWire is the same guarantee for update,
+// where the server now rejects note_id outright — so sending it would break the
+// command as well as risk the task.
+func TestTasksUpdateNeverSendsNoteIDOnTheWire(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"PATCH /api/v1/tasks/" + canonicalTaskID: {Status: 200, Body: taskReply},
+	})
+	if _, err := runCLI(t, m, "tasks", "update", canonicalTaskID, "--title", "Renamed"); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	body := m.bodyOf(t, "PATCH /api/v1/tasks/"+canonicalTaskID)
+	if v, ok := body["note_id"]; ok {
+		t.Errorf("note_id reached the wire (%v) — moving a task between notes is not supported", v)
+	}
+}
+
+// TestTasksCreateAndUpdateRejectNoteFlag pins the other half of the same rule at
+// the CLI surface: --note is not a thing you can pass to a write command, so it
+// fails before any request is made.
+func TestTasksCreateAndUpdateRejectNoteFlag(t *testing.T) {
+	for _, args := range [][]string{
+		{"tasks", "create", "--title", "X", "--note", canonicalTaskID},
+		{"tasks", "update", canonicalTaskID, "--note", canonicalTaskID},
+	} {
+		m := newAPIMock(t, map[string]mockReply{})
+		_, err := runCLI(t, m, args...)
+		if err == nil {
+			t.Errorf("%v: --note must not be accepted on a write command", args)
+		}
+		if len(m.calls()) != 0 {
+			t.Errorf("%v: no request should be made, got %v", args, m.calls())
+		}
+	}
+}
+
+// TestTasksListNoteRejectsFiltersBeforeCallingAPI pins the validateTaskNoteFilters
+// CALL SITE. Deleting the call leaves the helper's own test green while the
+// command silently returns a list that ignored the filter.
+func TestTasksListNoteRejectsFiltersBeforeCallingAPI(t *testing.T) {
+	for _, flag := range []string{"--status", "--due-before"} {
+		m := newAPIMock(t, map[string]mockReply{})
+		out, err := runCLI(t, m, "tasks", "list", "--note", canonicalTaskID, flag, "done")
+		if err == nil {
+			t.Errorf("%s alongside --note must fail", flag)
+		}
+		if len(m.calls()) != 0 {
+			t.Errorf("%s: nothing should be requested, got %v", flag, m.calls())
+		}
+		if strings.TrimSpace(out) != "" {
+			t.Errorf("%s: nothing should reach stdout:\n%s", flag, out)
+		}
+	}
+}
+
+// TestTasksUpdateRejectsSetAndClearBeforeCallingAPI pins the
+// validateTaskClearFlags call site: without it the request goes out and the
+// server lets the set win, so a --clear-due that did nothing looks like it
+// worked.
+func TestTasksUpdateRejectsSetAndClearBeforeCallingAPI(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{})
+	_, err := runCLI(t, m, "tasks", "update", canonicalTaskID, "--due", "2026-08-01", "--clear-due")
+	if err == nil {
+		t.Fatal("--due with --clear-due must fail")
+	}
+	if len(m.calls()) != 0 {
+		t.Errorf("nothing should be requested, got %v", m.calls())
+	}
+}
+
+// TestTasksCreateRequiresTitle pins the required-title guard: without it an
+// empty title is sent and a blank task is created.
+func TestTasksCreateRequiresTitle(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{})
+	_, err := runCLI(t, m, "tasks", "create")
+	if err == nil {
+		t.Fatal("create without --title must fail")
+	}
+	if len(m.calls()) != 0 {
+		t.Errorf("no task should be created, got %v", m.calls())
+	}
+}
+
+// TestTasksUpdateRequiresAField pins the empty-update guard: an empty PATCH
+// still allocates a USN and syncs a no-op change to every device.
+func TestTasksUpdateRequiresAField(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{})
+	_, err := runCLI(t, m, "tasks", "update", canonicalTaskID)
+	if err == nil {
+		t.Fatal("update with no field flags must fail")
+	}
+	if len(m.calls()) != 0 {
+		t.Errorf("no request should be made, got %v", m.calls())
+	}
+}
+
+// TestTasksListForwardsFilters pins that --status and --due-before actually
+// reach the query string, and that an unset --status sends nothing so the
+// server's own default applies.
+func TestTasksListForwardsFilters(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/tasks": {Status: 200, Body: `{"data":[],"paging":{}}`},
+	})
+	if _, err := runCLI(t, m, "tasks", "list", "--status", "today", "--due-before", "1785542400000"); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	q := m.queryOf(t, "GET /api/v1/tasks")
+	if q.Get("status") != "today" {
+		t.Errorf("status = %q, want today", q.Get("status"))
+	}
+	if q.Get("due_before") != "1785542400000" {
+		t.Errorf("due_before = %q", q.Get("due_before"))
+	}
+
+	m2 := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/tasks": {Status: 200, Body: `{"data":[],"paging":{}}`},
+	})
+	if _, err := runCLI(t, m2, "tasks", "list"); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if _, ok := m2.queryOf(t, "GET /api/v1/tasks")["status"]; ok {
+		t.Error("an unset --status must send nothing, so the server default applies")
+	}
+}
+
+// TestTasksListNoteUsesTheNoteEndpoint pins the routing: a --note listing is a
+// read of the note's own task list, not a filtered account-wide list.
+func TestTasksListNoteUsesTheNoteEndpoint(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/notes/" + canonicalTaskID + "/tasks": {Status: 200, Body: `{"data":[],"paging":{}}`},
+	})
+	if _, err := runCLI(t, m, "tasks", "list", "--note", canonicalTaskID); err != nil {
+		t.Fatalf("list --note: %v", err)
+	}
+	want := "GET /api/v1/notes/" + canonicalTaskID + "/tasks"
+	if calls := m.calls(); len(calls) != 1 || calls[0] != want {
+		t.Errorf("calls = %v, want [%s]", calls, want)
+	}
+}
+
+// TestTasksDoneForwardsTime pins that --time becomes done_time, and that an
+// omitted --time posts an empty object rather than null so the server stamps
+// the completion itself.
+func TestTasksDoneForwardsTime(t *testing.T) {
+	route := "POST /api/v1/tasks/" + canonicalTaskID + "/done"
+	m := newAPIMock(t, map[string]mockReply{route: {Status: 200, Body: taskReply}})
+	if _, err := runCLI(t, m, "tasks", "done", canonicalTaskID, "--time", "1785542400000"); err != nil {
+		t.Fatalf("done: %v", err)
+	}
+	if got := m.bodyOf(t, route)["done_time"]; got != float64(1785542400000) {
+		t.Errorf("done_time = %v, want 1785542400000", got)
+	}
+
+	m2 := newAPIMock(t, map[string]mockReply{route: {Status: 200, Body: taskReply}})
+	if _, err := runCLI(t, m2, "tasks", "done", canonicalTaskID); err != nil {
+		t.Fatalf("done: %v", err)
+	}
+	if got := m2.rawBodyOf(t, route); got != "{}" {
+		t.Errorf("body = %q, want {} so the server defaults done_time to now", got)
+	}
+}
+
+// TestTasksUpdateClearSentinels pins the clear_* booleans in both directions:
+// passing --clear-due sends the sentinel, and NOT passing it must not. An
+// inverted condition breaks exactly one of those, so both are asserted.
+func TestTasksUpdateClearSentinels(t *testing.T) {
+	route := "PATCH /api/v1/tasks/" + canonicalTaskID
+	for flag, key := range map[string]string{
+		"--clear-due":        "clear_due_at",
+		"--clear-reminder":   "clear_reminder_at",
+		"--clear-recurrence": "clear_recurrence",
+	} {
+		m := newAPIMock(t, map[string]mockReply{route: {Status: 200, Body: taskReply}})
+		if _, err := runCLI(t, m, "tasks", "update", canonicalTaskID, flag); err != nil {
+			t.Fatalf("%s: %v", flag, err)
+		}
+		if got := m.bodyOf(t, route)[key]; got != true {
+			t.Errorf("%s: %s = %v, want true", flag, key, got)
+		}
+
+		m2 := newAPIMock(t, map[string]mockReply{route: {Status: 200, Body: taskReply}})
+		if _, err := runCLI(t, m2, "tasks", "update", canonicalTaskID, "--title", "Renamed"); err != nil {
+			t.Fatalf("%s (unset): %v", flag, err)
+		}
+		if _, ok := m2.bodyOf(t, route)[key]; ok {
+			t.Errorf("%s: %s must be absent when the flag is not passed", flag, key)
+		}
+	}
+}
+
+// TestTasksCreateSendsDueHasTimeForDateOnly is the end-to-end version of the
+// headline behaviour: a plain-date --due must put due_has_time=false on the
+// wire, because the server defaults an ABSENT flag to true and the task would
+// come back looking timed.
+func TestTasksCreateSendsDueHasTimeForDateOnly(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"POST /api/v1/tasks": {Status: 201, Body: taskReply},
+	})
+	if _, err := runCLI(t, m, "tasks", "create", "--title", "X", "--due", "2026-08-01"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	body := m.bodyOf(t, "POST /api/v1/tasks")
+	if body["due_has_time"] != false {
+		t.Errorf("due_has_time = %v, want false", body["due_has_time"])
+	}
+	if body["due_at"] != float64(time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC).UnixMilli()) {
+		t.Errorf("due_at = %v", body["due_at"])
+	}
+}
+
+// TestTasksUndoneAndDeleteRoutes pins the two DELETE verbs, which differ only by
+// a path suffix — reopening a task and destroying it must not be confusable.
+func TestTasksUndoneAndDeleteRoutes(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"DELETE /api/v1/tasks/" + canonicalTaskID + "/done": {Status: 200, Body: taskReply},
+	})
+	if _, err := runCLI(t, m, "tasks", "undone", canonicalTaskID); err != nil {
+		t.Fatalf("undone: %v", err)
+	}
+	if want := "DELETE /api/v1/tasks/" + canonicalTaskID + "/done"; m.calls()[0] != want {
+		t.Errorf("undone called %v, want %s", m.calls(), want)
+	}
+
+	m2 := newAPIMock(t, map[string]mockReply{
+		"DELETE /api/v1/tasks/" + canonicalTaskID: {Status: 204, Body: ``},
+	})
+	out, err := runCLI(t, m2, "tasks", "delete", canonicalTaskID)
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if want := "DELETE /api/v1/tasks/" + canonicalTaskID; m2.calls()[0] != want {
+		t.Errorf("delete called %v, want %s", m2.calls(), want)
+	}
+	if !strings.Contains(out, "deleted") {
+		t.Errorf("delete should confirm:\n%s", out)
+	}
+}
+
+// TestTasksIDArgIsCanonicalized verifies the accepted UUID spellings all reach
+// the same canonical path. The server canonicalizes ids only on create, so an
+// id typed in upper case or pasted with braces would otherwise 404 on a live
+// task and be reported as a deletion.
+func TestTasksIDArgIsCanonicalized(t *testing.T) {
+	for _, spelling := range []string{
+		strings.ToUpper(canonicalTaskID),
+		strings.ReplaceAll(canonicalTaskID, "-", ""),
+		"{" + canonicalTaskID + "}",
+		"urn:uuid:" + canonicalTaskID,
+		"  " + canonicalTaskID + "  ",
+	} {
+		m := newAPIMock(t, map[string]mockReply{
+			"GET /api/v1/tasks/" + canonicalTaskID: {Status: 200, Body: taskReply},
+		})
+		if _, err := runCLI(t, m, "tasks", "get", spelling); err != nil {
+			t.Errorf("get %q: %v", spelling, err)
+			continue
+		}
+		if want := "GET /api/v1/tasks/" + canonicalTaskID; m.calls()[0] != want {
+			t.Errorf("get %q called %v, want %s", spelling, m.calls(), want)
+		}
+	}
+}
+
+// TestTasksMalformedIDIsReportedAsSuch verifies a value that is not an id is
+// reported as a spelling problem before any request — telling someone their
+// note was deleted when they mistyped the id sends them looking for a data loss
+// that never happened.
+func TestTasksMalformedIDIsReportedAsSuch(t *testing.T) {
+	for _, bad := range []string{"3f1a2b7c", "not-a-uuid", canonicalTaskID + "extra", "3f1a2b7c-9d4e-4a1b-8c2d-5e6f7a8b9c0z"} {
+		m := newAPIMock(t, map[string]mockReply{})
+		_, err := runCLI(t, m, "tasks", "get", bad)
+		if err == nil {
+			t.Errorf("get %q should fail", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "is not a task id") {
+			t.Errorf("get %q: err = %q, want it to name the id as malformed", bad, err)
+		}
+		if len(m.calls()) != 0 {
+			t.Errorf("get %q: nothing should be requested, got %v", bad, m.calls())
+		}
+	}
+	// The same rule for --note, which names a note rather than a task.
+	m := newAPIMock(t, map[string]mockReply{})
+	_, err := runCLI(t, m, "tasks", "list", "--note", "nope")
+	if err == nil || !strings.Contains(err.Error(), "is not a note id") {
+		t.Errorf("list --note nope: err = %v, want it to name the note id as malformed", err)
+	}
+}
+
+// TestCanonicalUUID covers the normalizer directly, including the near-misses
+// that must NOT be accepted — a hyphen in the wrong place is a typo, and
+// silently "fixing" it would target a different record.
+func TestCanonicalUUID(t *testing.T) {
+	for _, in := range []string{
+		canonicalTaskID,
+		strings.ToUpper(canonicalTaskID),
+		strings.ReplaceAll(canonicalTaskID, "-", ""),
+		"{" + canonicalTaskID + "}",
+		"urn:uuid:" + strings.ToUpper(canonicalTaskID),
+	} {
+		got, ok := canonicalUUID(in)
+		if !ok || got != canonicalTaskID {
+			t.Errorf("canonicalUUID(%q) = %q, %v; want %q, true", in, got, ok, canonicalTaskID)
+		}
+	}
+	for _, in := range []string{
+		"", "3f1a2b7c", "not-a-uuid",
+		"3f1a2b7c9d4e4a1b8c2d5e6f7a8b9c0d0",     // one hex digit too many
+		"3f1a2b7c-9d4e-4a1b-8c2d-5e6f7a8b9c0z",  // non-hex
+		"3f1a2b7c9-d4e-4a1b-8c2d-5e6f7a8b9c0d",  // hyphens misplaced
+		"{3f1a2b7c-9d4e-4a1b-8c2d-5e6f7a8b9c0d", // unbalanced brace
+	} {
+		if got, ok := canonicalUUID(in); ok {
+			t.Errorf("canonicalUUID(%q) = %q, true; want rejected", in, got)
+		}
 	}
 }

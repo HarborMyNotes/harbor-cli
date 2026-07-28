@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -27,9 +28,12 @@ import (
 // against a mock API so the call sites are pinned too, not just their parts.
 
 // mockRequest is one request a command actually sent, as observed by the server.
+// Query is kept separate from Path so a test can pin the filters a list command
+// forwarded — dropping one silently returns the wrong rows rather than failing.
 type mockRequest struct {
 	Method string
 	Path   string
+	Query  url.Values
 	Body   string
 }
 
@@ -56,7 +60,9 @@ func newAPIMock(t *testing.T, routes map[string]mockReply) *apiMock {
 	m := &apiMock{t: t, routes: routes}
 	m.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		m.requests = append(m.requests, mockRequest{Method: r.Method, Path: r.URL.Path, Body: string(body)})
+		m.requests = append(m.requests, mockRequest{
+			Method: r.Method, Path: r.URL.Path, Query: r.URL.Query(), Body: string(body),
+		})
 		reply, ok := m.routes[r.Method+" "+r.URL.Path]
 		if !ok {
 			m.t.Errorf("apiMock: unrouted request %s %s", r.Method, r.URL.Path)
@@ -103,6 +109,34 @@ func (m *apiMock) bodyOf(t *testing.T, methodAndPath string) map[string]any {
 	}
 	t.Fatalf("bodyOf(%s): no such request in %v", methodAndPath, m.calls())
 	return nil
+}
+
+// queryOf returns the query parameters of the first request matching
+// "METHOD /path", so a test can pin the filters a command actually forwarded.
+func (m *apiMock) queryOf(t *testing.T, methodAndPath string) url.Values {
+	t.Helper()
+	for _, r := range m.requests {
+		if r.Method+" "+r.Path == methodAndPath {
+			return r.Query
+		}
+	}
+	t.Fatalf("queryOf(%s): no such request in %v", methodAndPath, m.calls())
+	return nil
+}
+
+// rawBodyOf returns the request body of the first request matching
+// "METHOD /path" as the exact bytes sent, for the cases where the spelling
+// matters and a decoded map would erase it (JSON `null` and `{}` both decode to
+// an empty map).
+func (m *apiMock) rawBodyOf(t *testing.T, methodAndPath string) string {
+	t.Helper()
+	for _, r := range m.requests {
+		if r.Method+" "+r.Path == methodAndPath {
+			return r.Body
+		}
+	}
+	t.Fatalf("rawBodyOf(%s): no such request in %v", methodAndPath, m.calls())
+	return ""
 }
 
 // runCLI executes the real command tree — the same rootCmd main() runs — with

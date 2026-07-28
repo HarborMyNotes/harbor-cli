@@ -93,6 +93,10 @@ and usn. Anything else is rejected by the server.`,
 			if verr := validateTaskNoteFilters(cmd); verr != nil {
 				return verr
 			}
+			noteID, verr := canonicalIDArg("note", noteID)
+			if verr != nil {
+				return verr
+			}
 			data, lerr := c.ListNoteTasks(noteID, params)
 			if lerr != nil {
 				return mapTaskError(lerr)
@@ -132,7 +136,11 @@ var tasksGetCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		data, err := c.GetTask(args[0])
+		id, err := canonicalIDArg("task", args[0])
+		if err != nil {
+			return err
+		}
+		data, err := c.GetTask(id)
 		if err != nil {
 			return mapTaskError(err)
 		}
@@ -238,7 +246,11 @@ recurring tasks advance correctly. A task cannot be moved between notes.`,
 		if len(body) == 0 {
 			return errors.New("nothing to update — pass at least one field flag")
 		}
-		data, err := c.UpdateTask(args[0], body)
+		id, err := canonicalIDArg("task", args[0])
+		if err != nil {
+			return err
+		}
+		data, err := c.UpdateTask(id, body)
 		if err != nil {
 			return mapTaskError(err)
 		}
@@ -274,7 +286,11 @@ happened.`,
 			}
 			body = map[string]any{"done_time": ms}
 		}
-		data, err := c.CompleteTask(args[0], body)
+		id, err := canonicalIDArg("task", args[0])
+		if err != nil {
+			return err
+		}
+		data, err := c.CompleteTask(id, body)
 		if err != nil {
 			return mapTaskError(err)
 		}
@@ -296,7 +312,11 @@ var tasksUndoneCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		data, err := c.UncompleteTask(args[0])
+		id, err := canonicalIDArg("task", args[0])
+		if err != nil {
+			return err
+		}
+		data, err := c.UncompleteTask(id)
 		if err != nil {
 			return mapTaskError(err)
 		}
@@ -318,7 +338,11 @@ var tasksDeleteCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		if _, err := c.DeleteTask(args[0]); err != nil {
+		id, err := canonicalIDArg("task", args[0])
+		if err != nil {
+			return err
+		}
+		if _, err := c.DeleteTask(id); err != nil {
 			return mapTaskError(err)
 		}
 		fmt.Println("Task deleted.")
@@ -372,6 +396,54 @@ func addTaskReminderToBody(cmd *cobra.Command, body map[string]any) error {
 	}
 	body["reminder_at"] = ms
 	return nil
+}
+
+// canonicalUUID normalizes the four spellings of a UUID that Harbor's server
+// accepts — hyphenated, bare 32-hex, {braced}, and urn:uuid: — into the single
+// canonical lower-case hyphenated form, reporting false for anything else.
+//
+// It exists because the server canonicalizes ids only on CREATE
+// (HarborMyNotes/app.harbor.my#1094); every lookup then matches the stored
+// canonical string literally. So an id typed in upper case, or pasted with
+// braces, is a live id that 404s — which the CLI would otherwise report as "it
+// may have been deleted". Normalizing here makes those spellings simply work,
+// and leaves the not-found message for things that genuinely are not there.
+func canonicalUUID(raw string) (string, bool) {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	s = strings.TrimPrefix(s, "urn:uuid:")
+	if len(s) > 1 && s[0] == '{' && s[len(s)-1] == '}' {
+		s = s[1 : len(s)-1]
+	}
+	// Accept the hyphenated form only with the hyphens in their canonical
+	// positions; anything else with a hyphen is a typo, not a spelling.
+	if len(s) == 36 {
+		for _, i := range []int{8, 13, 18, 23} {
+			if s[i] != '-' {
+				return "", false
+			}
+		}
+		s = s[:8] + s[9:13] + s[14:18] + s[19:23] + s[24:]
+	}
+	if len(s) != 32 {
+		return "", false
+	}
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return "", false
+		}
+	}
+	return s[0:8] + "-" + s[8:12] + "-" + s[12:16] + "-" + s[16:20] + "-" + s[20:32], true
+}
+
+// canonicalIDArg canonicalizes an id typed on the command line, and reports a
+// value that is not an id at all as exactly that. Saying "no such task" for a
+// mistyped id sends the user looking for a deletion that never happened.
+func canonicalIDArg(kind, raw string) (string, error) {
+	id, ok := canonicalUUID(raw)
+	if !ok {
+		return "", fmt.Errorf("%q is not a %s id — expected a UUID like 3f1a2b7c-9d4e-4a1b-8c2d-5e6f7a8b9c0d (list output abbreviates ids; --json prints them in full)", raw, kind)
+	}
+	return id, nil
 }
 
 // validateTaskNoteFilters rejects the account-wide list filters when --note is
