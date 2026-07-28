@@ -62,9 +62,10 @@ to test and picked the easiest target.
    | `dev-clipper@harbor.my` | cloudmanic/harbor-webclipper |
 
    All six share one password — 1Password, **Autumn** vault, item
-   **`Harbor Test Accounts Password`**. None has two-factor. Fetch it with the
-   service-account token; never hardcode it, and never print it into a commit, issue,
-   PR or log:
+   **`Harbor Test Accounts Password`**. Each is email-verified and has **no two-factor**,
+   so a password grant returns a token bundle directly — no 2FA challenge to handle in
+   a scripted login. Fetch the password with the service-account token; never hardcode
+   it, and never print it into a commit, issue, PR or log:
    ```bash
    export OP_SERVICE_ACCOUNT_TOKEN=$(jq -r .service_account_token ~/.config/1password.json)
    op item get "Harbor Test Accounts Password" --vault Autumn --fields label=password --reveal
