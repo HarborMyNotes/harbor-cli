@@ -45,14 +45,42 @@ to test and picked the easiest target.
 
 2. **A local instance**, when the change doesn't need the hosted stack.
 
-3. **`dev@harbor.my` — the ONE production account you may use.** It exists purely for QA.
-   Create, update and delete whatever you need in it. Its password is in 1Password (Autumn
-   vault, item "Harbor Dev Account"); fetch it with the service-account token, never
-   hardcode it:
+3. **`dev-cli@harbor.my` — this repo's own production QA account.** Every Harbor client repo has
+   one (app.harbor.my#995) so that concurrent agents stop colliding in a shared account:
+   client testing is destructive by nature (shortcuts, bulk delete, empty-trash), and when
+   every repo shared `dev@harbor.my` a real note was trashed twice by two different
+   clients' testing. **For day-to-day testing, this repo's account is the preferred
+   method.** Create, update and delete whatever you need in it.
+
+   | Account | Repo |
+   |---|---|
+   | `dev-apple@harbor.my` | cloudmanic/harbor-swift |
+   | `dev-android@harbor.my` | cloudmanic/harbor-android |
+   | `dev-windows@harbor.my` | cloudmanic/harbor-windows |
+   | `dev-cli@harbor.my` | cloudmanic/harbor-cli |
+   | `dev-web@harbor.my` | HarborMyNotes/app.harbor.my (web) |
+   | `dev-clipper@harbor.my` | cloudmanic/harbor-webclipper |
+
+   All six share one password — 1Password, **Autumn** vault, item
+   **`Harbor Test Accounts Password`**. None has two-factor. Fetch it with the
+   service-account token; never hardcode it, and never print it into a commit, issue,
+   PR or log:
    ```bash
    export OP_SERVICE_ACCOUNT_TOKEN=$(jq -r .service_account_token ~/.config/1password.json)
-   op read "op://Autumn/Harbor Dev Account/password"
+   op item get "Harbor Test Accounts Password" --vault Autumn --fields label=password --reveal
    ```
+   - **Never change the password.** It is shared, so rotating it locks out five other repos.
+   - **If you cannot log in, STOP and ask Spicer** — do not reset it, do not create a
+     replacement account, do not switch to a different account.
+   - **Use a sprite for anything destructive**, or whenever you need to keep moving and
+     this account is in the way.
+   - `dev@harbor.my` remains the **general-purpose** QA account (1Password item
+     "Harbor Dev Account") for work not tied to one client.
+
+   Each account carries a small, disposable seed corpus (a notebook, tags, an attachment
+   and five notes, including a unique `SEEDFIXTURE-…` search marker). Trash it freely —
+   `tools/dev-accounts/seed.py` in app.harbor.my re-seeds it.
+
    Reach production explicitly (e.g. `-HarborAPIBaseURL https://app.harbor.my`, or the
    client's equivalent) rather than by accident.
 
@@ -62,13 +90,15 @@ to test and picked the easiest target.
   screenshot or export it, and never put its data in a commit, PR, issue or log.
 - **`harbormaster@harbor.my`** — the pristine demo/marketing-screenshot account. Read-only
   as far as you are concerned: never create, edit or delete anything in it.
-- **Any other production account.** If it isn't `dev@harbor.my`, it isn't yours.
+- **Another repo's `dev-*` account.** They exist precisely so that testing does not
+  collide; signing into someone else's defeats the point.
+- **Any other production account.** If it isn't `dev-cli@harbor.my` or `dev@harbor.my`, it isn't yours.
 
 ### If you genuinely need a new production account
 
-**Stop and ask Spicer.** Explain what you're testing and why a sprite, a local instance
-and `dev@harbor.my` can't cover it. He may say yes — that's his call to make, and it takes
-one message. Creating one and mentioning it afterwards is not the same thing.
+**Stop and ask Spicer.** Explain what you're testing and why a sprite, a local instance,
+`dev-cli@harbor.my` and `dev@harbor.my` can't cover it. He may say yes — that's his call to make,
+and it takes one message. Creating one and mentioning it afterwards is not the same thing.
 
 ## Layout
 

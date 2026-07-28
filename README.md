@@ -102,6 +102,50 @@ access + refresh tokens in:
   variable, or the `api_url` field in the credentials file — customers never
   need to.
 
+## Dev & QA account — `dev-cli@harbor.my`
+
+This repo has its **own production QA account** on `https://app.harbor.my`:
+
+```
+dev-cli@harbor.my
+```
+
+Every Harbor client repo has one ([app.harbor.my#995][i995]) because testing a client
+is destructive by nature — keyboard shortcuts, bulk delete, empty-trash, trash/restore.
+When every repo shared one login that testing collided: a real note was trashed twice by
+two different clients' testing and had to be rescued both times. **For day-to-day testing
+this account is the preferred method** — create, edit and delete whatever you need in it.
+
+[i995]: https://github.com/HarborMyNotes/app.harbor.my/issues/995
+
+**Getting the password.** All the `dev-*@harbor.my` accounts share one password —
+deliberately, since they hold nothing real. It lives in **1Password**, *Autumn* vault,
+item **`Harbor Test Accounts Password`**. Read it non-interactively with the
+service-account token; never hard-code it and never paste it into a commit, issue, PR
+or log:
+
+```sh
+export OP_SERVICE_ACCOUNT_TOKEN=$(jq -r .service_account_token ~/.config/1password.json)
+op item get "Harbor Test Accounts Password" --vault Autumn --fields label=password --reveal
+```
+
+The account is email-verified and has **no two-factor**, so a password grant returns a
+token bundle directly.
+
+**Rules.**
+
+- **Never change the password** — it is shared, so rotating it locks out five other repos.
+- **If you cannot log in, stop and ask Spicer.** Do not reset it, do not create a
+  replacement account, do not switch to another account.
+- **Use a PR-preview sprite for anything genuinely destructive**, or whenever you need to
+  keep moving and this account is in the way.
+- Never sign in to another repo's `dev-*` account, to `harbormaster@harbor.my`, or to
+  `me@spicer.cc`.
+
+The account carries a small, disposable seed corpus (a notebook, three tags, an
+attachment and five notes, including a unique `SEEDFIXTURE-…` search marker). Trash it
+freely — `tools/dev-accounts/seed.py` in `app.harbor.my` re-seeds it.
+
 ## Global flags
 
 | Flag | Description |
