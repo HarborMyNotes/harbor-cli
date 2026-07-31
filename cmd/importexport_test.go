@@ -87,6 +87,38 @@ func TestMapImportExportError(t *testing.T) {
 	}
 }
 
+// TestExportEnexDeprecationNotice pins which mode of the synchronous ENEX export
+// is deprecated. --notebook has a successor on the job path and must point at it;
+// --notes deliberately does NOT (per-note scoping is out of scope for the export
+// work), so warning about it would send people to a command that cannot do what
+// they asked. The notice must also flag that the successor is not a drop-in: it
+// includes trashed notes, which this endpoint leaves out.
+func TestExportEnexDeprecationNotice(t *testing.T) {
+	notice := exportEnexDeprecationNotice("true", "nb1")
+	for _, want := range []string{"deprecated", "harbor account export --format enex --notebook nb1", "trash"} {
+		if !strings.Contains(notice, want) {
+			t.Errorf("notebook notice missing %q:\n%s", want, notice)
+		}
+	}
+
+	// A note selection is fully supported — silence, with or without a header.
+	if got := exportEnexDeprecationNotice("", ""); got != "" {
+		t.Errorf("a note selection should not warn, got %q", got)
+	}
+
+	// The flag alone is enough: a server that has not shipped the header yet must
+	// still produce the notice.
+	if got := exportEnexDeprecationNotice("", "nb1"); got == "" {
+		t.Error("a notebook export should warn even without the response header")
+	}
+
+	// And if the server ever deprecates a mode this CLI does not know about, relay
+	// it rather than swallow it.
+	if got := exportEnexDeprecationNotice("true", ""); !strings.Contains(got, "deprecated") {
+		t.Errorf("an unexpected Deprecation header should be surfaced, got %q", got)
+	}
+}
+
 // TestImportExportSkipCount verifies header parsing tolerates missing/garbage
 // values.
 func TestImportExportSkipCount(t *testing.T) {

@@ -375,10 +375,20 @@ output; `reset` is the revocation path.
 
 | Command | What it does | Key flags |
 |---|---|---|
-| `harbor account export` | Start a full-account export job | |
-| `harbor account export-status <id>` | Poll / download the ZIP | `--download <path>` |
+| `harbor account export` | Start an export job | `--format enex\|html`, `--notebook <id>`, `--wait`, `--download <path>` |
+| `harbor account exports` | Show the current export per format | |
+| `harbor account export-status <id>` | Poll / download the ZIP | `--download <path>`, `--wait` |
+| `harbor account export-delete <id>` | Delete an export, freeing its slot | `--yes` |
 | `harbor account delete` | Schedule deletion (grace period) | `--confirm "DELETE MY ACCOUNT"`, `--yes` |
 | `harbor account cancel-delete` | Cancel within grace window | |
+
+**Exports.** You hold one export per format — one ENEX, one HTML — and scoping to
+a notebook does not create a third. Starting a second of the same format while
+one is ready is refused; delete it or wait for it to expire (72 hours). Exports
+run one at a time server-wide, so a new job may sit `queued` (waiting its turn)
+before it starts; progress is counted in **notes**. Lost the job id? `harbor
+account exports` reads it back off the server — export state lives there, not in
+your shell. One-shot: `harbor account export --wait --download ~/Downloads`.
 
 ---
 
@@ -389,6 +399,13 @@ output; `reset` is the revocation path.
 | `harbor import enex <file.enex>` | Import an Evernote export | `--notebook`, `--filename` |
 | `harbor import status <job-id>` | Poll an import job | |
 | `harbor export enex` | Export notes to `.enex` | `--notebook` *or* `--notes id1,id2`, `--include-resources`, `--output` (`-`=stdout) |
+
+`--notebook` here is **deprecated** — use `harbor account export --format enex
+--notebook <id>`, which runs a real export job (progress, email, retention,
+delete) and streams instead of building the document in memory. Not a drop-in:
+the job path writes a ZIP and, being the GDPR archive, includes notes in the
+trash that this command leaves out. `--notes` is **not** deprecated and stays
+here — a note selection has no successor.
 
 ---
 

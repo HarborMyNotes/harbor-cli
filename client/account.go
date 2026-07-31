@@ -3,17 +3,60 @@
 
 package client
 
-// StartAccountExport starts a full-account GDPR data export. The call is
-// idempotent-ish: if a queued/running export job already exists for the user the
-// server returns that job instead of starting a new one. Returns the data-wrapped
-// export job ({export_job_id, status}); the response status is 202 Accepted.
-func (c *Client) StartAccountExport() ([]byte, error) {
-	return c.doPost("/account/export", map[string]any{})
+// StartAccountExport starts an export job. Both arguments are optional: an empty
+// pair starts a whole-account ENEX export (the original behavior). format selects
+// the archive kind — "enex" (the GDPR ZIP: one ENEX per notebook, the attachment
+// bytes, a manifest) or "html" (a self-contained, browsable offline website) —
+// and notebookID scopes the export to a single notebook, for either format.
+// Returns the data-wrapped job ({export_job_id, status, format, notebook_id,
+// notebook_name}); the response status is 202 Accepted.
+//
+// An account holds at most one live export PER FORMAT, and scope does not create
+// a third slot. A queued/running export of the same format is handed back rather
+// than started twice; a completed, unexpired one is refused with 409
+// export_exists whose details carry export_job_id, format, scope, notebook_id,
+// notebook_name and result_expires_at — everything needed to explain the refusal
+// without a second request.
+func (c *Client) StartAccountExport(format, notebookID string) ([]byte, error) {
+	body := map[string]any{}
+	if format != "" {
+		body["format"] = format
+	}
+	if notebookID != "" {
+		body["notebook_id"] = notebookID
+	}
+	return c.doPost("/account/export", body)
+}
+
+// ListAccountExports returns what this account's export slots hold right now:
+// the most recent export per format (at most two entries — one ENEX, one HTML),
+// each in exactly the shape GetAccountExport returns, including a freshly minted
+// download_url for a ready one. A format with no export history is simply absent
+// from the array, and an account that has never exported returns an empty one.
+//
+// This is how a client that did not start the export — a fresh shell, another
+// machine — discovers it at all: export state lives on the server, so it has to
+// be read from there rather than remembered locally.
+func (c *Client) ListAccountExports() ([]byte, error) {
+	return c.doGet("/account/export", nil)
+}
+
+// DeleteAccountExport deletes an export's archive from the blob store and frees
+// that format's slot so a new export can start immediately. It is idempotent:
+// deleting an export whose archive is already gone returns 200 carrying the
+// status it already has, so an expired export is reported back as expired rather
+// than rewritten to deleted. An export that is still being built is refused with
+// 409 export_in_progress — the queue has no per-job cancellation.
+func (c *Client) DeleteAccountExport(id string) ([]byte, error) {
+	return c.doDelete("/account/export/"+id, nil)
 }
 
 // GetAccountExport polls an export job by id. When the job is completed and the
 // result blob has not expired, the data-wrapped job includes a short-lived
-// presigned download_url and a result_expires_at. A failed job carries error_text.
+// presigned download_url, the filename the archive should be saved as, and a
+// result_expires_at. Progress is reported in NOTES via total_units/done_units, a
+// queued job carries its 1-based queue_position, a completed one its
+// completed_at, and a failed one its error_text.
 func (c *Client) GetAccountExport(id string) ([]byte, error) {
 	return c.doGet("/account/export/"+id, nil)
 }

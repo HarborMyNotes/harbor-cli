@@ -84,6 +84,39 @@ func TestBytesHuman(t *testing.T) {
 	}
 }
 
+func TestCommaNum(t *testing.T) {
+	cases := map[int64]string{
+		0:       "0",
+		999:     "999",
+		1000:    "1,000",
+		4120:    "4,120",
+		36500:   "36,500",
+		-36500:  "-36,500",
+		1000000: "1,000,000",
+	}
+	for in, want := range cases {
+		if got := commaNum(in); got != want {
+			t.Errorf("commaNum(%d) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestOrdinal covers the teens, which are the whole reason this is a function
+// and not a lookup on the last digit.
+func TestOrdinal(t *testing.T) {
+	cases := map[int]string{
+		1: "1st", 2: "2nd", 3: "3rd", 4: "4th",
+		11: "11th", 12: "12th", 13: "13th",
+		21: "21st", 22: "22nd", 23: "23rd",
+		101: "101st", 111: "111th",
+	}
+	for in, want := range cases {
+		if got := ordinal(in); got != want {
+			t.Errorf("ordinal(%d) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestTruncate(t *testing.T) {
 	if got := truncate("hello", 10); got != "hello" {
 		t.Errorf("short truncate = %q", got)
