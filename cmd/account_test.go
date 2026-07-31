@@ -467,11 +467,34 @@ func TestAccountExportNotReadyReason(t *testing.T) {
 		"failed":  "start a new one",
 		"expired": "retention window",
 		"deleted": "was deleted",
+		// Reached only via the 403/404 re-check, when the link failed but the
+		// export still says it is ready. "Not ready (status: completed)" is a
+		// contradiction that leaves the user nothing to try.
+		"completed": "try again",
 	}
 	for status, want := range cases {
 		if got := accountExportNotReadyReason(status, "e1"); !strings.Contains(got, want) {
 			t.Errorf("reason(%s) = %q, want substring %q", status, got, want)
 		}
+	}
+	if got := accountExportNotReadyReason("completed", "e1"); strings.Contains(got, "not ready") {
+		t.Errorf("a completed export must not be described as not ready: %q", got)
+	}
+}
+
+// TestAccountExportExistsMessageScopeOnly falls back on the authoritative scope
+// field when the 409 names neither the notebook nor its id. Defaulting to "your
+// whole account" there states the opposite of what the server said and points
+// the user at the wrong export to delete.
+func TestAccountExportExistsMessageScopeOnly(t *testing.T) {
+	got := accountExportExistsMessage(map[string]any{
+		"export_job_id": "e1", "format": "enex", "scope": "notebook",
+	})
+	if strings.Contains(got, "whole account") {
+		t.Errorf("scope=notebook must not render as a whole-account export:\n%s", got)
+	}
+	if !strings.Contains(got, "notebook") {
+		t.Errorf("refusal should still say it covers a notebook:\n%s", got)
 	}
 }
 
@@ -635,6 +658,121 @@ func TestAccountExportWaitAndDownload(t *testing.T) {
 	}
 	if !strings.Contains(out, "Wrote") {
 		t.Errorf("download report missing:\n%s", out)
+	}
+}
+
+// exportProgressMock points an apiMock at a handler that walks an export from
+// queued to completed, one step per status read, so a test can prove a command
+// POLLED rather than merely asked once. dl, when non-empty, is served as the
+// archive at /dl/export.zip and named in the completed job's download_url.
+func exportProgressMock(t *testing.T, dl string) *apiMock {
+	t.Helper()
+	m := newAPIMock(t, map[string]mockReply{})
+	polls := 0
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/dl/export.zip":
+			_, _ = w.Write([]byte(dl))
+		case r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"data":{"export_job_id":"e1","status":"queued","format":"enex"}}`))
+		case polls == 0:
+			polls++
+			_, _ = w.Write([]byte(`{"data":{"id":"e1","status":"queued","queue_position":2}}`))
+		case polls == 1:
+			polls++
+			_, _ = w.Write([]byte(`{"data":{"id":"e1","status":"running","total_units":10,"done_units":4}}`))
+		default:
+			polls++
+			_, _ = w.Write([]byte(fmt.Sprintf(
+				`{"data":{"id":"e1","format":"enex","status":"completed","total_units":10,"done_units":10,`+
+					`"filename":"harbor-export.zip","download_url":%q,"completed_at":1749744400000,`+
+					`"result_expires_at":1750003600000}}`, m.srv.URL+"/dl/export.zip")))
+		}
+	}
+	return m
+}
+
+// TestAccountExportWaitPollsWithoutDownload is the flag-to-behaviour wiring for
+// --wait on its own. The polling loop itself is covered below, but a --wait that
+// never reaches it looks identical from inside the loop: the command exits 0
+// showing "queued", which is exactly what someone scripting
+// 'export --wait --json | jq .status' would silently mis-read as a finished job.
+func TestAccountExportWaitPollsWithoutDownload(t *testing.T) {
+	for _, args := range [][]string{
+		{"account", "export", "--wait", "--poll-interval", "1ms"},
+		{"account", "export-status", "e1", "--wait", "--poll-interval", "1ms"},
+	} {
+		t.Run(args[1], func(t *testing.T) {
+			m := exportProgressMock(t, "")
+			out, err := runCLI(t, m, args...)
+			if err != nil {
+				t.Fatalf("%v: %v", args, err)
+			}
+			if !strings.Contains(out, "completed") {
+				t.Errorf("--wait returned before the job finished:\n%s", out)
+			}
+			if strings.Contains(out, "queued") {
+				t.Errorf("--wait rendered a non-final state:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestAccountExportDownloadToStdoutEmitsOnlyTheArchive is the criterion that
+// makes '--download -' worth having: stdout must be the ZIP and nothing else.
+// A status card in front of the bytes does not fail, it produces a file that is
+// not a ZIP — and the exit code still says success, so a script never notices.
+func TestAccountExportDownloadToStdoutEmitsOnlyTheArchive(t *testing.T) {
+	const archive = "PK\x03\x04harbor-archive-bytes"
+	m := exportProgressMock(t, archive)
+	out, err := runCLI(t, m, "account", "export", "--download", "-", "--poll-interval", "1ms")
+	if err != nil {
+		t.Fatalf("account export --download -: %v", err)
+	}
+	if out != archive {
+		t.Errorf("stdout must be the archive verbatim.\n got %q\nwant %q", out, archive)
+	}
+}
+
+// TestAccountExportDownloadSaysEachThingOnce covers the two ways the download
+// view used to repeat itself: telling someone to download an archive it had just
+// downloaded, and — for a state that cannot be downloaded at all — printing the
+// explanation as a hint and then again as the error.
+func TestAccountExportDownloadSaysEachThingOnce(t *testing.T) {
+	m := exportProgressMock(t, "PK-zip")
+	dir := t.TempDir()
+	out, err := runCLI(t, m, "account", "export", "--download", dir, "--poll-interval", "1ms")
+	if err != nil {
+		t.Fatalf("account export --download: %v", err)
+	}
+	if !strings.Contains(out, "Wrote") {
+		t.Fatalf("download report missing:\n%s", out)
+	}
+	for _, unwanted := range []string{"Download it", "Download URL"} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("a completed download should not still offer %q:\n%s", unwanted, out)
+		}
+	}
+	// Freeing the slot is the one genuinely useful next step, and it belongs
+	// after the write rather than above it.
+	if !strings.Contains(out, "export-delete e1") {
+		t.Errorf("the delete hint should survive:\n%s", out)
+	}
+
+	// An expired export explains itself once, as the error.
+	m2 := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/account/export/e1": {Status: 200, Body: `{"data":{"id":"e1","format":"enex","status":"expired"}}`},
+	})
+	out2, err2 := runCLI(t, m2, "account", "export-status", "e1", "--download", filepath.Join(t.TempDir(), "x.zip"))
+	if err2 == nil {
+		t.Fatal("downloading an expired export must fail")
+	}
+	if strings.Contains(out2, "retention window") {
+		t.Errorf("the state is already in the error; the card must not say it too:\n%s", out2)
+	}
+	if !strings.Contains(err2.Error(), "retention window") {
+		t.Errorf("the error should carry the explanation: %v", err2)
 	}
 }
 

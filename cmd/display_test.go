@@ -38,6 +38,24 @@ func captureStdout(t *testing.T, fn func()) string {
 	return string(out)
 }
 
+// captureStderr is captureStdout's counterpart, for the notices a command sends
+// to stderr precisely so they cannot corrupt a piped stdout. Colour is left
+// alone: this is meant to nest inside runCLI, which already disables it.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stderr = w
+	fn()
+	_ = w.Close()
+	os.Stderr = old
+	out, _ := io.ReadAll(r)
+	return string(out)
+}
+
 func TestEpochMS(t *testing.T) {
 	utcFlag = true
 	defer func() { utcFlag = false }()

@@ -4,6 +4,8 @@
 package cmd
 
 import (
+	"io"
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -116,6 +118,56 @@ func TestExportEnexDeprecationNotice(t *testing.T) {
 	// it rather than swallow it.
 	if got := exportEnexDeprecationNotice("true", ""); !strings.Contains(got, "deprecated") {
 		t.Errorf("an unexpected Deprecation header should be surfaced, got %q", got)
+	}
+}
+
+// TestExportEnexEmitsDeprecationNoticeOnStderr covers the WIRING the test above
+// cannot: that the command actually calls the notice, sends it to stderr so a
+// '--output -' pipe stays a valid ENEX, and stays silent for --notes. Deleting
+// the call site leaves the notice function fully tested and the user unwarned.
+func TestExportEnexEmitsDeprecationNoticeOnStderr(t *testing.T) {
+	newMock := func(t *testing.T) *apiMock {
+		m := newAPIMock(t, map[string]mockReply{})
+		m.handler = func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			if strings.Contains(string(body), "notebook_id") {
+				w.Header().Set("Deprecation", "true")
+				w.Header().Set("Link", `</api/v1/account/export>; rel="successor-version"`)
+			}
+			_, _ = w.Write([]byte("<?xml version='1.0'?><en-export></en-export>"))
+		}
+		return m
+	}
+
+	var out string
+	var err error
+	errOut := captureStderr(t, func() {
+		out, err = runCLI(t, newMock(t), "export", "enex", "--notebook", "nb1", "--output", "-")
+	})
+	if err != nil {
+		t.Fatalf("export enex --notebook: %v", err)
+	}
+	if !strings.Contains(errOut, "deprecated") || !strings.Contains(errOut, "account export") {
+		t.Errorf("the deprecation notice never reached stderr:\n%s", errOut)
+	}
+	// The pipe must stay a usable ENEX document.
+	if strings.Contains(out, "deprecated") {
+		t.Errorf("the notice leaked into the exported document:\n%s", out)
+	}
+	if !strings.HasPrefix(out, "<?xml") {
+		t.Errorf("stdout should be the ENEX verbatim:\n%s", out)
+	}
+
+	// --notes has no successor, so warning about it would send people to a
+	// command that cannot do what they asked.
+	errOut2 := captureStderr(t, func() {
+		_, err = runCLI(t, newMock(t), "export", "enex", "--notes", "n1,n2", "--output", "-")
+	})
+	if err != nil {
+		t.Fatalf("export enex --notes: %v", err)
+	}
+	if strings.Contains(errOut2, "deprecated") {
+		t.Errorf("a note selection must not be warned about:\n%s", errOut2)
 	}
 }
 

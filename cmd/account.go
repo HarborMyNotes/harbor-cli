@@ -362,13 +362,24 @@ func accountWarnScopeMismatch(data []byte, wantNotebook string) {
 // 'export --wait' and 'export-status --wait/--download' so the two cannot drift.
 //
 // The final status is rendered on stdout exactly as a plain poll would render it
-// (so --json still emits the job), and a download report follows it.
+// (so --json still emits the job), and a download report follows it — EXCEPT
+// when the archive itself is stdout. Both entry points reach here only after
+// --wait or --download was given, so the poll always waits.
 func accountWaitAndMaybeDownload(cmd *cobra.Command, c *client.Client, id, out string) error {
-	data, err := accountPollExport(c, id, durationFlag(cmd, "poll-interval"), durationFlag(cmd, "timeout"), out != "")
+	data, err := accountPollExport(c, id, durationFlag(cmd, "poll-interval"), durationFlag(cmd, "timeout"), true)
 	if err != nil {
 		return err
 	}
-	printResult(data, displayExportJob)
+	// With --download - the archive IS stdout, so nothing human may go there: a
+	// status card in front of the ZIP bytes produces a file that is not a ZIP.
+	// Progress already went to stderr, and a failure still comes back as an error.
+	if out != "-" {
+		display := displayExportJob
+		if out != "" {
+			display = displayExportJobDownloading
+		}
+		printResult(data, display)
+	}
 	if out == "" {
 		return nil
 	}
@@ -453,6 +464,11 @@ func accountDownloadExport(c *client.Client, id, out string, data []byte) error 
 	}
 	if path != "-" {
 		fmt.Printf("Wrote %s to %s\n", bytesHuman(float64(n)), path)
+		// The archive still holds that format's slot until it is deleted or
+		// expires, so freeing it is the one useful next step after a saved copy
+		// exists. It goes here rather than in the card above so it reads as a
+		// follow-up to the write, not as an instruction to download again.
+		fmt.Println(dim("Delete it: harbor account export-delete " + id))
 	}
 	return nil
 }
@@ -483,6 +499,13 @@ func accountExportNotReadyReason(status, id string) string {
 		return "the archive was deleted at the end of its 72-hour retention window — start a new export"
 	case "deleted":
 		return "this export was deleted — start a new export"
+	case "completed":
+		// Only reachable from the 403/404 re-check: the link was refused but the
+		// export still reports itself ready, so the archive is probably fine and
+		// the LINK is the problem. Saying "not ready (status: completed)" would be
+		// a contradiction with no way out; a fresh link is minted on every status
+		// read, so asking for one again is the actual fix.
+		return fmt.Sprintf("the download link was refused, but the export still reports itself ready — the link is short-lived, so try again for a fresh one: harbor account export-status %s --download .", id)
 	case "":
 		return "the export is not ready to download"
 	default:
@@ -658,6 +681,12 @@ func accountExportExistsMessage(details map[string]any) string {
 		scope = fmt.Sprintf("of the notebook %q", name)
 	} else if id := str(d, "notebook_id"); id != "" {
 		scope = fmt.Sprintf("of notebook %s", id)
+	} else if str(d, "scope") == "notebook" {
+		// scope is the authoritative field and the other two are the detail. If
+		// the server says this export covers ONE notebook but names neither, an
+		// unhelpful answer beats a confident wrong one: telling someone their
+		// whole account is already exported sends them to delete the wrong thing.
+		scope = "of a single notebook"
 	}
 
 	msg := fmt.Sprintf("you already have %s %s export %s ready to download", accountArticle(format), format, scope)
@@ -673,10 +702,12 @@ func accountExportExistsMessage(details map[string]any) string {
 
 // accountDetailEpoch reads an epoch-ms timestamp out of an error's details.
 //
-// Every value in the error envelope's `details` is serialized as a JSON string,
-// including numeric ones, while the same field is a number in a success body.
-// Accepting both spellings means the message renders a real date whichever one
-// arrives, instead of silently dropping the expiry.
+// The wire contract is that result_expires_at is a NUMBER everywhere — the
+// status body and the 409 details alike (app.harbor.my#1107 fixed the details
+// copy, which used to be a string). The string branch is therefore only a
+// tolerance for an older server still in the wild, not the shape to expect:
+// reading a real date either way beats silently dropping the expiry out of the
+// refusal message.
 func accountDetailEpoch(d map[string]any, key string) float64 {
 	if v := num(d, key); v > 0 {
 		return v
@@ -700,7 +731,18 @@ func accountDetailEpoch(d map[string]any, key string) float64 {
 //
 // It renders both shapes the API returns for an export: the 202 from starting
 // one (export_job_id, no progress yet) and the full status view.
-func displayExportJob(data []byte) {
+func displayExportJob(data []byte) { displayExportJobCard(data, false) }
+
+// displayExportJobDownloading renders the same card for a run that is saving the
+// archive in the same breath. That run is a receipt rather than a menu: the
+// presigned URL is noise when nobody has to paste it anywhere, and the follow-up
+// lines would either instruct a download that is already happening or repeat,
+// word for word, the error the caller is about to return.
+func displayExportJobDownloading(data []byte) { displayExportJobCard(data, true) }
+
+// displayExportJobCard is the shared body of the two views above; downloading
+// selects the receipt wording.
+func displayExportJobCard(data []byte, downloading bool) {
 	j := parseJSON(client.UnwrapData(data))
 	if j == nil {
 		fmt.Println(string(data))
@@ -750,12 +792,12 @@ func displayExportJob(data []byte) {
 	// The presigned URL is several hundred characters, so it goes BELOW the table
 	// rather than in a cell: inside one it stretches every row to the width of the
 	// signature and makes the whole view unreadable.
-	if url := str(j, "download_url"); url != "" {
+	if url := str(j, "download_url"); url != "" && !downloading {
 		fmt.Println(dim("Download URL (short-lived):"))
 		fmt.Println(url)
 	}
 
-	for _, line := range accountExportHints(j, id) {
+	for _, line := range accountExportHints(j, id, downloading) {
 		fmt.Println(dim(line))
 	}
 }
@@ -886,7 +928,16 @@ func accountExportProgressLine(j map[string]any) string {
 // what it is doing and what to do about it. Every state gets one, so an export
 // that is waiting, gone or broken explains itself rather than leaving a bare
 // status word on screen.
-func accountExportHints(j map[string]any, id string) []string {
+//
+// A run that is downloading gets none of them. "Download it" is what is already
+// happening, and for every state that CANNOT be downloaded the caller returns an
+// error carrying the same sentence the hint would have printed — so a hint here
+// would tell an expired export's owner twice, in consecutive lines, that their
+// archive aged out. The successful case is picked back up after the write.
+func accountExportHints(j map[string]any, id string, downloading bool) []string {
+	if downloading {
+		return nil
+	}
 	switch str(j, "status") {
 	case "queued":
 		return []string{
