@@ -4,6 +4,7 @@
 package client
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -138,4 +139,44 @@ func TestFetchURLUnauthenticated(t *testing.T) {
 		t.Fatalf("FetchURL error: %v", err)
 	}
 	resp.Body.Close()
+}
+
+// TestFetchURLDownloadError pins that a non-2xx from a presigned URL comes back
+// as a *DownloadError carrying the status, and that Gone() marks exactly the
+// object-is-missing statuses. An account export reads that distinction to decide
+// between "the download broke" and "re-check the export — it may be gone".
+func TestFetchURLDownloadError(t *testing.T) {
+	cases := []struct {
+		status   int
+		wantGone bool
+	}{
+		{http.StatusForbidden, true},
+		{http.StatusNotFound, true},
+		{http.StatusInternalServerError, false},
+	}
+	for _, tc := range cases {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(tc.status)
+			_, _ = w.Write([]byte(`<Error><Code>NoSuchKey</Code></Error>`))
+		}))
+
+		_, err := testClient(srv.URL).FetchURL(srv.URL + "/x?sig=1")
+		srv.Close()
+		if err == nil {
+			t.Fatalf("HTTP %d: expected an error", tc.status)
+		}
+		var derr *DownloadError
+		if !errors.As(err, &derr) {
+			t.Fatalf("HTTP %d: error type = %T, want *DownloadError", tc.status, err)
+		}
+		if derr.Status != tc.status {
+			t.Errorf("status = %d, want %d", derr.Status, tc.status)
+		}
+		if derr.Gone() != tc.wantGone {
+			t.Errorf("HTTP %d: Gone() = %v, want %v", tc.status, derr.Gone(), tc.wantGone)
+		}
+		if !strings.Contains(derr.Error(), "download failed") {
+			t.Errorf("message = %q, want the original wording", derr.Error())
+		}
+	}
 }

@@ -102,9 +102,32 @@ func (c *Client) RawDownload(hash string) (*http.Response, error) {
 	return c.doGetRaw("/files/"+hash+"/raw", nil)
 }
 
+// DownloadError is a non-2xx response from a presigned storage URL. Those URLs
+// answer in raw S3 XML rather than the Harbor error envelope, so there is no
+// *APIError to branch on — the HTTP status is all the caller gets, and it is
+// worth keeping: a 403/404 means "the object is gone", which for an account
+// export is a cue to re-read the status endpoint rather than to report a broken
+// download (the archive may have been deleted or expired from another device).
+type DownloadError struct {
+	Status int
+}
+
+// Error renders the status-only message this used to return as a flat error, so
+// existing callers that only print it read exactly as before.
+func (e *DownloadError) Error() string {
+	return "download failed: HTTP " + strconv.Itoa(e.Status)
+}
+
+// Gone reports whether the failure means the object itself is missing (403 or
+// 404) rather than the request being at fault.
+func (e *DownloadError) Gone() bool {
+	return e.Status == http.StatusForbidden || e.Status == http.StatusNotFound
+}
+
 // FetchURL performs an unauthenticated GET against a presigned URL (its
 // credentials live in the query string), returning the live response for
-// streaming. The caller must close the body.
+// streaming. The caller must close the body. A non-2xx reply comes back as a
+// *DownloadError carrying the status.
 func (c *Client) FetchURL(rawURL string) (*http.Response, error) {
 	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -116,7 +139,7 @@ func (c *Client) FetchURL(rawURL string) (*http.Response, error) {
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		resp.Body.Close()
-		return nil, fmt.Errorf("download failed: HTTP %s", strconv.Itoa(resp.StatusCode))
+		return nil, &DownloadError{Status: resp.StatusCode}
 	}
 	return resp, nil
 }

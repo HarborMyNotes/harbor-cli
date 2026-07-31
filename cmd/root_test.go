@@ -51,6 +51,13 @@ type apiMock struct {
 	srv      *httptest.Server
 	routes   map[string]mockReply
 	requests []mockRequest
+
+	// handler, when set, answers instead of the route table. A fixed table can
+	// only say one thing per path, which cannot express an answer that CHANGES
+	// between requests ("queued, then running, then completed") or one that
+	// carries response headers — both of which the export commands read. Requests
+	// are still recorded, so the traffic assertions work unchanged.
+	handler http.HandlerFunc
 }
 
 // newAPIMock starts a stub API. Routes are keyed "METHOD /path", e.g.
@@ -63,6 +70,10 @@ func newAPIMock(t *testing.T, routes map[string]mockReply) *apiMock {
 		m.requests = append(m.requests, mockRequest{
 			Method: r.Method, Path: r.URL.Path, Query: r.URL.Query(), Body: string(body),
 		})
+		if m.handler != nil {
+			m.handler(w, r)
+			return
+		}
 		reply, ok := m.routes[r.Method+" "+r.URL.Path]
 		if !ok {
 			m.t.Errorf("apiMock: unrouted request %s %s", r.Method, r.URL.Path)

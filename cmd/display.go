@@ -267,6 +267,44 @@ func relTime(ms float64) string {
 	return s + " ago"
 }
 
+// commaNum renders an integer with thousands separators ("36500" → "36,500").
+// Used wherever a count is large enough that the raw digits stop being readable
+// at a glance — an export's note progress, for instance.
+func commaNum(n int64) string {
+	s := fmt.Sprintf("%d", n)
+	sign := ""
+	if strings.HasPrefix(s, "-") {
+		sign, s = "-", s[1:]
+	}
+	var b strings.Builder
+	for i, r := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			b.WriteByte(',')
+		}
+		b.WriteRune(r)
+	}
+	return sign + b.String()
+}
+
+// ordinal renders a 1-based position as an English ordinal ("1st", "2nd",
+// "13th", "21st") — for places in a queue, where "3rd in line" reads as a
+// position and a bare "3" reads as a count.
+func ordinal(n int) string {
+	suffix := "th"
+	// 11th/12th/13th are the exceptions to the 1st/2nd/3rd pattern.
+	if n%100 < 11 || n%100 > 13 {
+		switch n % 10 {
+		case 1:
+			suffix = "st"
+		case 2:
+			suffix = "nd"
+		case 3:
+			suffix = "rd"
+		}
+	}
+	return fmt.Sprintf("%d%s", n, suffix)
+}
+
 // bytesHuman renders a byte count in human units (e.g. "1.2 MB").
 func bytesHuman(n float64) string {
 	const unit = 1024

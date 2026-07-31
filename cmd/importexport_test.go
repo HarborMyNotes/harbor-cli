@@ -4,6 +4,8 @@
 package cmd
 
 import (
+	"io"
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -84,6 +86,88 @@ func TestMapImportExportError(t *testing.T) {
 	other := apiErr("not_found")
 	if got := mapImportExportError(other); got != other {
 		t.Errorf("unrelated error should pass through, got %v", got)
+	}
+}
+
+// TestExportEnexDeprecationNotice pins which mode of the synchronous ENEX export
+// is deprecated. --notebook has a successor on the job path and must point at it;
+// --notes deliberately does NOT (per-note scoping is out of scope for the export
+// work), so warning about it would send people to a command that cannot do what
+// they asked. The notice must also flag that the successor is not a drop-in: it
+// includes trashed notes, which this endpoint leaves out.
+func TestExportEnexDeprecationNotice(t *testing.T) {
+	notice := exportEnexDeprecationNotice("true", "nb1")
+	for _, want := range []string{"deprecated", "harbor account export --format enex --notebook nb1", "trash"} {
+		if !strings.Contains(notice, want) {
+			t.Errorf("notebook notice missing %q:\n%s", want, notice)
+		}
+	}
+
+	// A note selection is fully supported — silence, with or without a header.
+	if got := exportEnexDeprecationNotice("", ""); got != "" {
+		t.Errorf("a note selection should not warn, got %q", got)
+	}
+
+	// The flag alone is enough: a server that has not shipped the header yet must
+	// still produce the notice.
+	if got := exportEnexDeprecationNotice("", "nb1"); got == "" {
+		t.Error("a notebook export should warn even without the response header")
+	}
+
+	// And if the server ever deprecates a mode this CLI does not know about, relay
+	// it rather than swallow it.
+	if got := exportEnexDeprecationNotice("true", ""); !strings.Contains(got, "deprecated") {
+		t.Errorf("an unexpected Deprecation header should be surfaced, got %q", got)
+	}
+}
+
+// TestExportEnexEmitsDeprecationNoticeOnStderr covers the WIRING the test above
+// cannot: that the command actually calls the notice, sends it to stderr so a
+// '--output -' pipe stays a valid ENEX, and stays silent for --notes. Deleting
+// the call site leaves the notice function fully tested and the user unwarned.
+func TestExportEnexEmitsDeprecationNoticeOnStderr(t *testing.T) {
+	newMock := func(t *testing.T) *apiMock {
+		m := newAPIMock(t, map[string]mockReply{})
+		m.handler = func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			if strings.Contains(string(body), "notebook_id") {
+				w.Header().Set("Deprecation", "true")
+				w.Header().Set("Link", `</api/v1/account/export>; rel="successor-version"`)
+			}
+			_, _ = w.Write([]byte("<?xml version='1.0'?><en-export></en-export>"))
+		}
+		return m
+	}
+
+	var out string
+	var err error
+	errOut := captureStderr(t, func() {
+		out, err = runCLI(t, newMock(t), "export", "enex", "--notebook", "nb1", "--output", "-")
+	})
+	if err != nil {
+		t.Fatalf("export enex --notebook: %v", err)
+	}
+	if !strings.Contains(errOut, "deprecated") || !strings.Contains(errOut, "account export") {
+		t.Errorf("the deprecation notice never reached stderr:\n%s", errOut)
+	}
+	// The pipe must stay a usable ENEX document.
+	if strings.Contains(out, "deprecated") {
+		t.Errorf("the notice leaked into the exported document:\n%s", out)
+	}
+	if !strings.HasPrefix(out, "<?xml") {
+		t.Errorf("stdout should be the ENEX verbatim:\n%s", out)
+	}
+
+	// --notes has no successor, so warning about it would send people to a
+	// command that cannot do what they asked.
+	errOut2 := captureStderr(t, func() {
+		_, err = runCLI(t, newMock(t), "export", "enex", "--notes", "n1,n2", "--output", "-")
+	})
+	if err != nil {
+		t.Fatalf("export enex --notes: %v", err)
+	}
+	if strings.Contains(errOut2, "deprecated") {
+		t.Errorf("a note selection must not be warned about:\n%s", errOut2)
 	}
 }
 

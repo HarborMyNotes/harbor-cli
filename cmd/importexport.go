@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
 	"github.com/spf13/cobra"
@@ -101,6 +102,15 @@ note selection.`,
 }
 
 // exportEnexCmd streams a notebook or note selection out as a raw .enex file.
+//
+// --notebook is DEPRECATED here (issue #1108): a notebook export belongs on the
+// job path, 'harbor account export --format enex --notebook <id>', which gives
+// it progress, the ready email, 72-hour retention, a delete action and the
+// account's export slot — none of which a synchronous response can. It also
+// cannot safely export a LARGE notebook: it marshals the whole document into
+// memory. It still works and is not going away while clients depend on it, so
+// this command keeps working byte-for-byte and merely points at the successor.
+// --notes is NOT deprecated: per-note scoping has no successor to move to.
 var exportEnexCmd = &cobra.Command{
 	Use:   "enex",
 	Short: "Export notes to an Evernote .enex file",
@@ -108,10 +118,21 @@ var exportEnexCmd = &cobra.Command{
 Provide exactly one of --notebook or --notes. With --include-resources each
 linked attachment's bytes are inlined as base64. Encrypted notes hold only
 ciphertext, so they are skipped and the count is reported. The document is
-written to --output (use - for stdout).`,
-	Example: `  harbor export enex --notebook 5b1f2c9a --output backup.enex
-  harbor export enex --notes n1,n2,n3 --include-resources --output sel.enex
-  harbor export enex --notebook 5b1f2c9a --output -`,
+written to --output (use - for stdout).
+
+DEPRECATED: --notebook. Use 'harbor account export --format enex --notebook
+<id>' instead — that runs a real export job, so a big notebook gets progress,
+the "your export is ready" email, 72-hour retention and a delete action, and it
+streams rather than building the whole document in memory. This command is
+unchanged and is not going away; it is simply the wrong tool for a whole
+notebook. Note the two do not produce the same thing: this one writes a single
+.enex of a notebook's LIVE notes, while the job path writes a ZIP and, being the
+GDPR archive, also includes notes sitting in the TRASH.
+
+--notes is not deprecated — a note selection has no successor and belongs here.`,
+	Example: `  harbor export enex --notes n1,n2,n3 --include-resources --output sel.enex
+  harbor export enex --notebook 5b1f2c9a --output backup.enex   # deprecated
+  harbor account export --format enex --notebook 5b1f2c9a       # the successor`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c, _, err := loadClientFromConfig()
 		if err != nil {
@@ -139,6 +160,12 @@ written to --output (use - for stdout).`,
 		// The skipped-encrypted count rides in a header (the body is raw XML, so
 		// it cannot carry a JSON field). Read it before streaming the body out.
 		skipped := resp.Header.Get("X-Skipped-Encrypted")
+
+		// The server marks a notebook-scoped request deprecated in its headers.
+		// Surface that once, on stderr, so it cannot corrupt a `--output -` pipe.
+		if notice := exportEnexDeprecationNotice(resp.Header.Get("Deprecation"), notebook); notice != "" {
+			fmt.Fprintln(os.Stderr, notice)
+		}
 
 		n, err := writeOutput(out, resp.Body)
 		if err != nil {
@@ -194,6 +221,31 @@ func filepathBase(path string) string {
 		}
 	}
 	return path
+}
+
+// exportEnexDeprecationNotice returns the warning to print for a notebook-scoped
+// ENEX export, or "" when none applies.
+//
+// The server flags this mode with `Deprecation: true` and a successor-version
+// Link (issue #1108), and the flag itself is the other half of the same signal:
+// either is enough, so a server that has not shipped the header yet still gets
+// the notice, and a future deprecation of a mode this CLI does not know about
+// still surfaces. The trashed-notes difference is called out because the
+// successor is deliberately NOT a drop-in — the job path is the GDPR archive and
+// includes notes in the trash, which this endpoint excludes.
+func exportEnexDeprecationNotice(deprecationHeader, notebook string) string {
+	deprecated := strings.EqualFold(strings.TrimSpace(deprecationHeader), "true")
+	if notebook == "" {
+		// A note selection is fully supported and carries no such header. If the
+		// server ever says otherwise, relay it rather than swallow it.
+		if deprecated {
+			return dim("note: the server marked this export mode deprecated — see 'harbor account export'.")
+		}
+		return ""
+	}
+	return dim("note: --notebook here is deprecated. Use 'harbor account export --format enex --notebook " + notebook +
+		"' — a real export job with progress, an email, retention and a delete action.\n" +
+		"      It is not a drop-in: it writes a ZIP, and includes notes in the trash that this command leaves out.")
 }
 
 // importExportSkipCount parses the X-Skipped-Encrypted header into a count,
@@ -291,7 +343,7 @@ func init() {
 	importCmd.AddCommand(importEnexCmd, importStatusCmd)
 	rootCmd.AddCommand(importCmd)
 
-	exportEnexCmd.Flags().String("notebook", "", "Export every live note in this notebook id")
+	exportEnexCmd.Flags().String("notebook", "", "DEPRECATED — use 'harbor account export --format enex --notebook <id>'. Exports this notebook's live notes (the successor also includes trashed ones)")
 	exportEnexCmd.Flags().String("notes", "", "Export exactly these note ids (comma-separated)")
 	exportEnexCmd.Flags().Bool("include-resources", false, "Inline each linked attachment's bytes as base64")
 	exportEnexCmd.Flags().String("output", "", "Output path, or - for stdout (required)")

@@ -7,8 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
+	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -26,34 +31,116 @@ var accountCmd = &cobra.Command{
 	GroupID: groupAccount,
 	Long: `Whole-account operations.
 
-  export        start a full-account GDPR data export (async job)
+  export        start an export job (ENEX or HTML, whole account or one notebook)
+  exports       show what this account's export slots hold right now
   export-status poll an export job and download the ZIP when it completes
+  export-delete delete an export's archive, freeing that format's slot
   delete        schedule account deletion after a grace period (destructive)
   cancel-delete cancel a pending deletion within the grace window
+
+You hold at most one live export PER FORMAT — one ENEX and one HTML — and
+scoping an export to a single notebook does not create a third slot. Exports run
+one at a time server-wide, so a new one may sit "queued" (waiting its turn)
+before it starts. A finished archive is kept for 72 hours, then deleted.
 
 Deletion is a soft-delete: a confirmed request records a purge date and revokes
 your other sessions, but destroys nothing until the grace window elapses — you
 can cancel until then.`,
 }
 
-// accountExportCmd starts a full-account export job. If a job is already
-// queued/running the server returns it instead of starting another.
+// accountExportCmd starts an export job for one format, optionally scoped to a
+// single notebook. A queued/running export of the same format is handed back
+// instead of starting a second one; a completed, unexpired one is refused.
 var accountExportCmd = &cobra.Command{
 	Use:   "export",
-	Short: "Start a full-account data export",
-	Long:  "Start an asynchronous full-account export (one ENEX per notebook, attachment bytes, and a manifest, packaged as a ZIP). Poll it with 'harbor account export-status <id>' and download the ZIP when it completes.",
+	Short: "Start a data export (ENEX or HTML, whole account or one notebook)",
+	Args:  cobra.NoArgs,
+	Long: `Start an asynchronous export job.
+
+  --format enex   (the default) a ZIP holding one ENEX document per notebook,
+                  every attachment's original bytes, and a manifest.json
+  --format html   a ZIP holding a self-contained, browsable offline website —
+                  unzip it and open index.html, no server and no internet
+
+With --notebook the export covers a single notebook instead of the whole
+account, for either format. It is still an ordinary export job, so it gets the
+same progress, ready email, 72-hour retention, delete action and export slot.
+
+You hold one export per format. Starting a second of the SAME format while one
+is ready is refused — delete it or wait for it to expire; the other format is
+unaffected. Because exports run one at a time server-wide, a new job may report
+"queued" (waiting its turn) for a while before it starts building.
+
+Poll it with 'harbor account export-status <id>', or pass --wait to poll here
+until it finishes. --download implies --wait and saves the ZIP straight to disk.`,
 	Example: `  harbor account export
+  harbor account export --format html
+  harbor account export --format enex --notebook 5b1f2c9a
+  harbor account export --wait --download harbor-export.zip
   harbor account export --json`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c, _, err := loadClientFromConfig()
 		if err != nil {
 			return err
 		}
-		data, err := c.StartAccountExport()
+
+		format, err := accountExportFormat(cmd)
+		if err != nil {
+			return err
+		}
+		notebook := stringFlag(cmd, "notebook")
+
+		data, err := c.StartAccountExport(format, notebook)
+		if err != nil {
+			return mapAccountExportStartError(err, notebook)
+		}
+
+		// The 202 echoes the scope of the job you were GIVEN, which is not
+		// necessarily the one you asked for: an already in-flight export of this
+		// format is handed back as-is. Say so rather than let the user believe
+		// their --notebook took effect.
+		accountWarnScopeMismatch(data, notebook)
+
+		out := stringFlag(cmd, "download")
+		if !boolFlag(cmd, "wait") && out == "" {
+			printResult(data, displayExportJob)
+			return nil
+		}
+
+		job := parseJSON(client.UnwrapData(data))
+		id := str(job, "export_job_id")
+		if id == "" {
+			id = str(job, "id")
+		}
+		return accountWaitAndMaybeDownload(cmd, c, id, out)
+	},
+}
+
+// accountExportsCmd shows what this account's export slots hold right now: the
+// latest export per format, straight from the server.
+var accountExportsCmd = &cobra.Command{
+	Use:   "exports",
+	Short: "Show this account's current exports (one per format)",
+	Args:  cobra.NoArgs,
+	Long: `List the most recent export per format — at most two rows, one ENEX and one
+HTML. A format you have never exported is simply absent.
+
+Export state lives on the server, not in this shell: this is how you find the
+export you started on another machine (or before you closed the terminal and
+lost the job id). A row in a state that does not hold the slot — failed, expired
+or deleted — is still shown, because it explains where a download went.`,
+	Example: `  harbor account exports
+  harbor account exports --json`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		c, _, err := loadClientFromConfig()
+		if err != nil {
+			return err
+		}
+		data, err := c.ListAccountExports()
 		if err != nil {
 			return mapAccountError(err)
 		}
-		printResult(data, displayExportJob)
+		printResult(data, displayExportList)
 		return nil
 	},
 }
@@ -64,47 +151,73 @@ var accountExportStatusCmd = &cobra.Command{
 	Use:   "export-status <id>",
 	Short: "Poll an export job and optionally download the ZIP",
 	Args:  cobra.ExactArgs(1),
-	Long:  "Poll an export job by id. When the job is completed and the result has not expired the response includes a short-lived presigned download URL. Pass --download <path> to fetch and save the ZIP (use - for stdout).",
+	Long: `Poll an export job by id.
+
+Progress is reported in NOTES ("4,120 / 36,500 notes"). A queued job is waiting
+its turn behind the server-wide one-at-a-time lock and says where it is in the
+line. A completed job reports when it finished and when its archive expires,
+plus a short-lived presigned download URL.
+
+Pass --download <path> to fetch and save the ZIP (use - for stdout); if <path>
+is a directory the server's own filename is used. --wait polls until the job
+reaches a final state first, so --wait --download is a one-shot "export and
+save". Lost the id? 'harbor account exports' reads it back off the server.`,
 	Example: `  harbor account export-status 0f9c2b1e-...
-  harbor account export-status 0f9c2b1e-... --download account-export.zip`,
+  harbor account export-status 0f9c2b1e-... --download account-export.zip
+  harbor account export-status 0f9c2b1e-... --wait --download ~/Downloads`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c, _, err := loadClientFromConfig()
 		if err != nil {
 			return err
 		}
+
+		out := stringFlag(cmd, "download")
+		if boolFlag(cmd, "wait") || out != "" {
+			return accountWaitAndMaybeDownload(cmd, c, args[0], out)
+		}
+
 		data, err := c.GetAccountExport(args[0])
 		if err != nil {
 			return mapAccountError(err)
 		}
+		printResult(data, displayExportJob)
+		return nil
+	},
+}
 
-		// With --download, follow the presigned ZIP URL (unauthenticated fetch)
-		// and stream it to the path; otherwise just render the job status.
-		out := stringFlag(cmd, "download")
-		if out == "" {
-			printResult(data, displayExportJob)
-			return nil
-		}
+// accountExportDeleteCmd deletes an export's archive, freeing that format's slot
+// so a new export of the same format can start immediately.
+var accountExportDeleteCmd = &cobra.Command{
+	Use:   "export-delete <id>",
+	Short: "Delete an export's archive and free that format's slot",
+	Args:  cobra.ExactArgs(1),
+	Long: `Delete a finished export. The archive is removed from storage, any emailed
+link stops working, and that format's slot is freed so you can export again
+straight away. The other format is untouched, and nothing in your account is
+deleted — an export is a disposable copy.
 
-		job := parseJSON(client.UnwrapData(data))
-		if status := str(job, "status"); status != "completed" {
-			return fmt.Errorf("export is not ready to download (status: %s)", status)
+This cannot be undone (the archive is gone; you would have to export again), so
+you will be asked to confirm by typing "yes" unless you pass --yes. In --json or
+non-interactive use, --yes is required.
+
+Deleting an export whose archive has already gone is not an error — it reports
+the state it is already in. An export that is still being BUILT is refused
+rather than cancelled: wait for it to finish, then delete it.`,
+	Example: `  harbor account export-delete 0f9c2b1e-...
+  harbor account export-delete 0f9c2b1e-... --yes`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		c, _, err := loadClientFromConfig()
+		if err != nil {
+			return err
 		}
-		url := str(job, "download_url")
-		if url == "" {
-			return errors.New("the export result has expired; start a new export")
+		if err := accountConfirmExportDelete(boolFlag(cmd, "yes")); err != nil {
+			return err
 		}
-		resp, ferr := c.FetchURL(url)
-		if ferr != nil {
-			return ferr
+		data, err := c.DeleteAccountExport(args[0])
+		if err != nil {
+			return mapAccountError(err)
 		}
-		defer resp.Body.Close()
-		n, werr := writeOutput(out, resp.Body)
-		if werr != nil {
-			return werr
-		}
-		if out != "-" {
-			fmt.Printf("Wrote %s to %s\n", bytesHuman(float64(n)), out)
-		}
+		printResult(data, displayExportDeleted)
 		return nil
 	},
 }
@@ -179,6 +292,263 @@ var accountCancelDeleteCmd = &cobra.Command{
 		printResult(data, displayMessage("Account deletion cancelled. Your account is active again."))
 		return nil
 	},
+}
+
+// ===========================================================================
+// Export lifecycle helpers
+// ===========================================================================
+
+// accountExportFormats are the archive kinds the server accepts. The CLI checks
+// the value itself so a typo costs a round-trip and a validation error rather
+// than an export of the wrong thing.
+var accountExportFormats = []string{"enex", "html"}
+
+// accountExportTerminalStates are the statuses an export never moves out of.
+// completed/failed are the job's own outcomes; expired/deleted are terminal
+// states of the RESULT — the archive is gone and that format's slot is free.
+var accountExportTerminalStates = []string{"completed", "failed", "expired", "deleted"}
+
+// accountExportFormat reads and validates --format. An unset flag returns the
+// empty string, which is then omitted from the request body so the server's own
+// default (enex) applies rather than one this CLI has hardcoded and could drift
+// from.
+func accountExportFormat(cmd *cobra.Command) (string, error) {
+	format := strings.ToLower(strings.TrimSpace(stringFlag(cmd, "format")))
+	if format == "" {
+		return "", nil
+	}
+	for _, valid := range accountExportFormats {
+		if format == valid {
+			return format, nil
+		}
+	}
+	return "", fmt.Errorf("--format must be one of %s", strings.Join(accountExportFormats, "|"))
+}
+
+// accountExportIsTerminal reports whether an export status is final, i.e. polling
+// it again will never show anything new.
+func accountExportIsTerminal(status string) bool {
+	for _, s := range accountExportTerminalStates {
+		if status == s {
+			return true
+		}
+	}
+	return false
+}
+
+// accountWarnScopeMismatch prints a notice when the job the server handed back
+// does not cover the notebook that was asked for.
+//
+// Starting an export while one of that format is already queued or running
+// returns the EXISTING job, so the 202 describes a scope the caller may not have
+// requested. Silently rendering it would tell someone their notebook export
+// started when what they actually have is the whole-account export from ten
+// minutes ago.
+func accountWarnScopeMismatch(data []byte, wantNotebook string) {
+	if wantNotebook == "" || jsonOutput {
+		return
+	}
+	job := parseJSON(client.UnwrapData(data))
+	got := str(job, "notebook_id")
+	if got == wantNotebook {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s an export of this format was already running, so that job was returned instead — it covers %s, not the notebook you asked for.\n",
+		colorize("note:", text.FgYellow), accountExportScopeLabel(job))
+}
+
+// accountWaitAndMaybeDownload polls an export to a final state and then, when
+// --download was given, saves the archive. It is the shared body of
+// 'export --wait' and 'export-status --wait/--download' so the two cannot drift.
+//
+// The final status is rendered on stdout exactly as a plain poll would render it
+// (so --json still emits the job), and a download report follows it — EXCEPT
+// when the archive itself is stdout. Both entry points reach here only after
+// --wait or --download was given, so the poll always waits.
+func accountWaitAndMaybeDownload(cmd *cobra.Command, c *client.Client, id, out string) error {
+	data, err := accountPollExport(c, id, durationFlag(cmd, "poll-interval"), durationFlag(cmd, "timeout"), true)
+	if err != nil {
+		return err
+	}
+	// With --download - the archive IS stdout, so nothing human may go there: a
+	// status card in front of the ZIP bytes produces a file that is not a ZIP.
+	// Progress already went to stderr, and a failure still comes back as an error.
+	if out != "-" {
+		display := displayExportJob
+		if out != "" {
+			display = displayExportJobDownloading
+		}
+		printResult(data, display)
+	}
+	if out == "" {
+		return nil
+	}
+	return accountDownloadExport(c, id, out, data)
+}
+
+// accountPollExport polls an export until it reaches a final state, returning the
+// last status body. When wait is false it fetches once and returns immediately.
+//
+// Progress goes to STDERR, not stdout: a job that takes an hour should show
+// movement, but 'harbor account export --wait --json | jq' must still receive
+// nothing but the final JSON. Each distinct progress line is printed once, so a
+// slow export scrolls at the speed it actually changes rather than the speed it
+// is polled. A zero timeout means "no limit" — the export is done when it is
+// done, and Ctrl-C is always available.
+func accountPollExport(c *client.Client, id string, interval, timeout time.Duration, wait bool) ([]byte, error) {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	deadline := time.Time{}
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+
+	last := ""
+	for {
+		data, err := c.GetAccountExport(id)
+		if err != nil {
+			return nil, mapAccountError(err)
+		}
+		job := parseJSON(client.UnwrapData(data))
+		if !wait || accountExportIsTerminal(str(job, "status")) {
+			return data, nil
+		}
+		if line := accountExportProgressLine(job); line != "" && line != last {
+			if !jsonOutput {
+				fmt.Fprintln(os.Stderr, dim(line))
+			}
+			last = line
+		}
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			return nil, fmt.Errorf("gave up waiting after %s (the export is still %s; poll it with: harbor account export-status %s)",
+				timeout, str(job, "status"), id)
+		}
+		time.Sleep(interval)
+	}
+}
+
+// accountDownloadExport streams a completed export's archive to out ("-" for
+// stdout, an existing directory to save under the server's own filename).
+//
+// A 403/404 from the presigned URL is NOT reported as a broken download: those
+// links are clamped to the archive's remaining retention and answer in raw S3
+// XML, so the honest reading is "the object is gone" — the export may have been
+// deleted or expired from another device since the URL was minted. Re-read the
+// status endpoint and report whatever it now says.
+func accountDownloadExport(c *client.Client, id, out string, data []byte) error {
+	job := parseJSON(client.UnwrapData(data))
+	status := str(job, "status")
+	if status != "completed" {
+		return errors.New(accountExportNotReadyReason(status, id))
+	}
+	url := str(job, "download_url")
+	if url == "" {
+		return errors.New("the archive is no longer available — start a new export")
+	}
+
+	path := accountExportOutputPath(out, str(job, "filename"))
+	resp, err := c.FetchURL(url)
+	if err != nil {
+		var derr *client.DownloadError
+		if errors.As(err, &derr) && derr.Gone() {
+			return accountExportGoneError(c, id)
+		}
+		return err
+	}
+	defer resp.Body.Close()
+
+	n, err := writeOutput(path, resp.Body)
+	if err != nil {
+		return err
+	}
+	if path != "-" {
+		fmt.Printf("Wrote %s to %s\n", bytesHuman(float64(n)), path)
+		// The archive still holds that format's slot until it is deleted or
+		// expires, so freeing it is the one useful next step after a saved copy
+		// exists. It goes here rather than in the card above so it reads as a
+		// follow-up to the write, not as an instruction to download again.
+		fmt.Println(dim("Delete it: harbor account export-delete " + id))
+	}
+	return nil
+}
+
+// accountExportGoneError re-reads an export whose download URL 403/404'd and
+// describes the state it is actually in, so the user is told "you deleted this
+// export" rather than "HTTP 403".
+func accountExportGoneError(c *client.Client, id string) error {
+	data, err := c.GetAccountExport(id)
+	if err != nil {
+		return errors.New("the export archive is no longer available — start a new export")
+	}
+	status := str(parseJSON(client.UnwrapData(data)), "status")
+	return errors.New(accountExportNotReadyReason(status, id))
+}
+
+// accountExportNotReadyReason explains, per state, why an archive cannot be
+// downloaded and what to do instead.
+func accountExportNotReadyReason(status, id string) string {
+	switch status {
+	case "queued":
+		return "the export has not started yet — it is waiting its turn (add --wait to poll until it is ready)"
+	case "running":
+		return "the export is still being built (add --wait to poll until it is ready)"
+	case "failed":
+		return fmt.Sprintf("the export failed, so there is nothing to download — start a new one (see 'harbor account export-status %s' for the reason)", id)
+	case "expired":
+		return "the archive was deleted at the end of its 72-hour retention window — start a new export"
+	case "deleted":
+		return "this export was deleted — start a new export"
+	case "completed":
+		// Only reachable from the 403/404 re-check: the link was refused but the
+		// export still reports itself ready, so the archive is probably fine and
+		// the LINK is the problem. Saying "not ready (status: completed)" would be
+		// a contradiction with no way out; a fresh link is minted on every status
+		// read, so asking for one again is the actual fix.
+		return fmt.Sprintf("the download link was refused, but the export still reports itself ready — the link is short-lived, so try again for a fresh one: harbor account export-status %s --download .", id)
+	case "":
+		return "the export is not ready to download"
+	default:
+		return fmt.Sprintf("the export is not ready to download (status: %s)", status)
+	}
+}
+
+// accountExportOutputPath resolves where an archive is written. "-" is stdout;
+// an existing directory is joined with the server's own filename (which names
+// the format and scope, e.g. harbor-export-recipes-2026-07-31.zip) so a download
+// into ~/Downloads does not have to be named by hand; anything else is used
+// verbatim.
+func accountExportOutputPath(out, filename string) string {
+	if out == "-" || filename == "" {
+		return out
+	}
+	info, err := os.Stat(out)
+	if err != nil || !info.IsDir() {
+		return out
+	}
+	return filepath.Join(out, filename)
+}
+
+// accountConfirmExportDelete gates the export delete. With --yes it returns nil
+// immediately. In --json mode or when stdin is not a terminal (scripts, CI, AI
+// agents) it refuses rather than prompting; on an interactive terminal it
+// requires the user to type exactly "yes".
+func accountConfirmExportDelete(yes bool) error {
+	if yes {
+		return nil
+	}
+	if jsonOutput || !accountIsInteractive() {
+		return errors.New("refusing to delete an export without confirmation — pass --yes")
+	}
+	fmt.Println("This deletes the export archive and any emailed link to it. Your notes are not affected, but you would have to export again.")
+	answer, err := promptLine(`Type "yes" to confirm: `)
+	if err != nil {
+		return err
+	}
+	if answer != "yes" {
+		return errors.New("aborted — the export was not deleted")
+	}
+	return nil
 }
 
 // ===========================================================================
@@ -271,6 +641,10 @@ func mapAccountError(err error) error {
 			return errors.New("the cancellation window has passed; the account is being purged")
 		case "reauth_required":
 			return errors.New("incorrect current password")
+		case "export_exists":
+			return errors.New(accountExportExistsMessage(apiErr.Details))
+		case "export_in_progress":
+			return errors.New("that export is still being built — wait for it to finish, then delete it")
 		case "not_found":
 			return errors.New("no such export job (or it is not yours)")
 		}
@@ -278,13 +652,97 @@ func mapAccountError(err error) error {
 	return err
 }
 
+// mapAccountExportStartError maps the errors specific to STARTING an export.
+// A 404 here means the --notebook does not exist rather than "no such export
+// job", which is what the shared mapper would otherwise say — the same code,
+// two entirely different things to fix.
+func mapAccountExportStartError(err error, notebook string) error {
+	var apiErr *client.APIError
+	if errors.As(err, &apiErr) && apiErr.Code == "not_found" && notebook != "" {
+		return fmt.Errorf("no such notebook %q (or it is not yours)", notebook)
+	}
+	return mapAccountError(err)
+}
+
+// accountExportExistsMessage turns the 409 refusal into an actionable sentence.
+//
+// The details carry everything needed to say WHAT is in the way — the format,
+// whether it covers the whole account or one notebook (and which), the id to
+// delete, and when it expires on its own — so the user is never told merely
+// "conflict" and left to go looking. There is no list endpoint, so for a client
+// that did not start the export this refusal is how it learns the export exists
+// at all; throwing the details away would cost a second round-trip to say
+// anything useful.
+func accountExportExistsMessage(details map[string]any) string {
+	d := map[string]any(details)
+	format := accountExportFormatLabel(str(d, "format"))
+	scope := "of your whole account"
+	if name := str(d, "notebook_name"); name != "" {
+		scope = fmt.Sprintf("of the notebook %q", name)
+	} else if id := str(d, "notebook_id"); id != "" {
+		scope = fmt.Sprintf("of notebook %s", id)
+	} else if str(d, "scope") == "notebook" {
+		// scope is the authoritative field and the other two are the detail. If
+		// the server says this export covers ONE notebook but names neither, an
+		// unhelpful answer beats a confident wrong one: telling someone their
+		// whole account is already exported sends them to delete the wrong thing.
+		scope = "of a single notebook"
+	}
+
+	msg := fmt.Sprintf("you already have %s %s export %s ready to download", accountArticle(format), format, scope)
+	if expires := accountDetailEpoch(d, "result_expires_at"); expires > 0 {
+		msg += fmt.Sprintf("; it expires on its own at %s (%s)", epochMS(expires), relTime(expires))
+	}
+	if id := str(d, "export_job_id"); id != "" {
+		msg += fmt.Sprintf("\nDownload it:  harbor account export-status %s --download .", id)
+		msg += fmt.Sprintf("\nOr delete it: harbor account export-delete %s", id)
+	}
+	return msg
+}
+
+// accountDetailEpoch reads an epoch-ms timestamp out of an error's details.
+//
+// The wire contract is that result_expires_at is a NUMBER everywhere — the
+// status body and the 409 details alike (app.harbor.my#1107 fixed the details
+// copy, which used to be a string). The string branch is therefore only a
+// tolerance for an older server still in the wild, not the shape to expect:
+// reading a real date either way beats silently dropping the expiry out of the
+// refusal message.
+func accountDetailEpoch(d map[string]any, key string) float64 {
+	if v := num(d, key); v > 0 {
+		return v
+	}
+	if s := str(d, key); s != "" {
+		if ms, err := strconv.ParseFloat(s, 64); err == nil {
+			return ms
+		}
+	}
+	return 0
+}
+
 // ===========================================================================
 // Display
 // ===========================================================================
 
-// displayExportJob renders an export job's status and, when present, its
-// progress and presigned download URL.
-func displayExportJob(data []byte) {
+// displayExportJob renders one export job: its format and scope, the state it is
+// in, and whatever that state has to say — a queue position, progress in notes,
+// the completed date and expiry, the failure reason, the download URL — followed
+// by the next thing to do about it.
+//
+// It renders both shapes the API returns for an export: the 202 from starting
+// one (export_job_id, no progress yet) and the full status view.
+func displayExportJob(data []byte) { displayExportJobCard(data, false) }
+
+// displayExportJobDownloading renders the same card for a run that is saving the
+// archive in the same breath. That run is a receipt rather than a menu: the
+// presigned URL is noise when nobody has to paste it anywhere, and the follow-up
+// lines would either instruct a download that is already happening or repeat,
+// word for word, the error the caller is about to return.
+func displayExportJobDownloading(data []byte) { displayExportJobCard(data, true) }
+
+// displayExportJobCard is the shared body of the two views above; downloading
+// selects the receipt wording.
+func displayExportJobCard(data []byte, downloading bool) {
 	j := parseJSON(client.UnwrapData(data))
 	if j == nil {
 		fmt.Println(string(data))
@@ -296,27 +754,237 @@ func displayExportJob(data []byte) {
 	if id == "" {
 		id = str(j, "export_job_id")
 	}
-	pairs := [][2]string{
-		{"Job ID", bold(id)},
-		{"Status", colorizeStatus(str(j, "status"))},
+	status := str(j, "status")
+
+	pairs := [][2]string{{"Job ID", bold(id)}}
+	if format := str(j, "format"); format != "" {
+		pairs = append(pairs, [2]string{"Format", accountExportFormatLabel(format)})
 	}
-	if _, ok := j["total_units"]; ok {
-		pairs = append(pairs, [2]string{"Progress", fmt.Sprintf("%d/%d notebooks", int(num(j, "done_units")), int(num(j, "total_units")))})
+	pairs = append(pairs,
+		[2]string{"Scope", accountExportScopeLabel(j)},
+		[2]string{"Status", colorizeStatus(status)},
+	)
+
+	// A queued export is waiting its turn behind the server-wide one-at-a-time
+	// lock — that is a position in a line, not a stalled job and not 0% progress.
+	if status == "queued" {
+		if pos := int(num(j, "queue_position")); pos > 0 {
+			pairs = append(pairs, [2]string{"Queue", fmt.Sprintf("%s in line", ordinal(pos))})
+		}
 	}
-	if url := str(j, "download_url"); url != "" {
-		pairs = append(pairs, [2]string{"Download URL", url})
-		pairs = append(pairs, [2]string{"URL expires", epochMS(num(j, "result_expires_at"))})
+	if progress := accountExportProgress(j); progress != "" && (status == "running" || status == "completed") {
+		pairs = append(pairs, [2]string{"Progress", progress})
+	}
+	if done := num(j, "completed_at"); done > 0 {
+		pairs = append(pairs, [2]string{"Completed", fmt.Sprintf("%s (%s)", epochMS(done), relTime(done))})
+	}
+	if expires := num(j, "result_expires_at"); expires > 0 {
+		pairs = append(pairs, [2]string{"Expires", fmt.Sprintf("%s (%s)", epochMS(expires), relTime(expires))})
+	}
+	if filename := str(j, "filename"); filename != "" {
+		pairs = append(pairs, [2]string{"File", filename})
 	}
 	if et := str(j, "error_text"); et != "" {
 		pairs = append(pairs, [2]string{"Error", et})
 	}
-	if str(j, "status") == "completed" && str(j, "download_url") == "" {
-		// Completed but the result blob has expired (no URL).
-		pairs = append(pairs, [2]string{"Note", "result expired — start a new export"})
-	}
 	printKV(pairs)
-	if str(j, "status") == "completed" && str(j, "download_url") != "" {
-		fmt.Println(dim("Download with: harbor account export-status " + id + " --download account-export.zip"))
+
+	// The presigned URL is several hundred characters, so it goes BELOW the table
+	// rather than in a cell: inside one it stretches every row to the width of the
+	// signature and makes the whole view unreadable.
+	if url := str(j, "download_url"); url != "" && !downloading {
+		fmt.Println(dim("Download URL (short-lived):"))
+		fmt.Println(url)
+	}
+
+	for _, line := range accountExportHints(j, id, downloading) {
+		fmt.Println(dim(line))
+	}
+}
+
+// displayExportList renders the account's export slots — at most two rows, one
+// per format. An account with no exports gets a plain sentence and the command
+// that starts one, not an empty table.
+func displayExportList(data []byte) {
+	items := client.CollectionItems(data)
+	if len(items) == 0 {
+		fmt.Println("No exports. Start one with: harbor account export")
+		return
+	}
+	rows := make([][]string, 0, len(items))
+	for _, raw := range items {
+		j := parseJSON(raw)
+		if j == nil {
+			continue
+		}
+		rows = append(rows, []string{
+			accountExportFormatLabel(str(j, "format")),
+			truncate(accountExportScopeLabel(j), 28),
+			colorizeStatus(str(j, "status")),
+			accountExportListDetail(j),
+			// The full id, not an abbreviation: every follow-up command takes it,
+			// and a truncated one cannot be copied into any of them.
+			str(j, "id"),
+		})
+	}
+	printTable([]string{"FORMAT", "SCOPE", "STATUS", "DETAIL", "ID"}, rows)
+	fmt.Println(dim("Poll one with: harbor account export-status <id>"))
+}
+
+// displayExportDeleted confirms a delete, wording it by the status the server
+// reports back rather than assuming the archive was the caller's to destroy —
+// the endpoint is idempotent, so an export that had already expired on its own
+// answers "expired" and should not be reported as "you deleted this".
+func displayExportDeleted(data []byte) {
+	j := parseJSON(client.UnwrapData(data))
+	if j == nil {
+		fmt.Println(string(data))
+		return
+	}
+	switch str(j, "status") {
+	case "expired":
+		fmt.Println("That export had already expired — its archive was gone. The slot is free.")
+	default:
+		fmt.Println("Export deleted. The archive is gone and that format's slot is free.")
+	}
+	fmt.Println(dim("Start a new one with: harbor account export"))
+}
+
+// accountExportFormatLabel renders a format code for humans. An export written
+// before the format column existed reports an empty format and is an ENEX one.
+func accountExportFormatLabel(format string) string {
+	switch format {
+	case "html":
+		return "HTML"
+	case "enex", "":
+		return "ENEX"
+	default:
+		return format
+	}
+}
+
+// accountArticle picks "a" or "an" for a format label. The labels are acronyms,
+// so what decides it is the sound of the first LETTER'S NAME — "an HTML" (aitch),
+// "an ENEX" (ee) — not merely whether that letter is a vowel.
+func accountArticle(label string) string {
+	if label == "" {
+		return "a"
+	}
+	if strings.ContainsRune("AEFHILMNORSX", rune(strings.ToUpper(label)[0])) {
+		return "an"
+	}
+	return "a"
+}
+
+// accountExportScopeLabel says what an export covers. It prefers the notebook
+// NAME, which the server freezes at export time — so an export still describes
+// the archive it produced even after the notebook has been renamed or deleted.
+func accountExportScopeLabel(j map[string]any) string {
+	if name := str(j, "notebook_name"); name != "" {
+		return "notebook " + name
+	}
+	if id := str(j, "notebook_id"); id != "" {
+		return "notebook " + id
+	}
+	return "whole account"
+}
+
+// accountExportProgress renders progress in NOTES — "4,120 / 36,500 notes" —
+// with a percentage once there is a total to divide by. The unit matters: these
+// counters used to be notebooks, which reported a 36,500-note account as "1/79".
+func accountExportProgress(j map[string]any) string {
+	total, ok := j["total_units"]
+	if !ok || total == nil {
+		return ""
+	}
+	done, all := int64(num(j, "done_units")), int64(num(j, "total_units"))
+	out := fmt.Sprintf("%s / %s notes", commaNum(done), commaNum(all))
+	if all > 0 {
+		out += fmt.Sprintf(" (%d%%)", done*100/all)
+	}
+	return out
+}
+
+// accountExportProgressLine is the one-line progress report --wait prints while
+// an export builds. It returns "" for a state with nothing to report.
+func accountExportProgressLine(j map[string]any) string {
+	switch str(j, "status") {
+	case "queued":
+		if pos := int(num(j, "queue_position")); pos > 0 {
+			return fmt.Sprintf("Waiting to start — %s in line (we build one export at a time).", ordinal(pos))
+		}
+		return "Waiting to start — we build one export at a time."
+	case "running":
+		if progress := accountExportProgress(j); progress != "" {
+			return "Building your export… " + progress + "."
+		}
+		return "Building your export…"
+	default:
+		return ""
+	}
+}
+
+// accountExportHints returns the follow-up lines for an export's current state:
+// what it is doing and what to do about it. Every state gets one, so an export
+// that is waiting, gone or broken explains itself rather than leaving a bare
+// status word on screen.
+//
+// A run that is downloading gets none of them. "Download it" is what is already
+// happening, and for every state that CANNOT be downloaded the caller returns an
+// error carrying the same sentence the hint would have printed — so a hint here
+// would tell an expired export's owner twice, in consecutive lines, that their
+// archive aged out. The successful case is picked back up after the write.
+func accountExportHints(j map[string]any, id string, downloading bool) []string {
+	if downloading {
+		return nil
+	}
+	switch str(j, "status") {
+	case "queued":
+		return []string{
+			"Waiting to start — we build one export at a time.",
+			"Poll it with: harbor account export-status " + id,
+		}
+	case "running":
+		return []string{"Poll it with: harbor account export-status " + id + " --wait"}
+	case "completed":
+		if str(j, "download_url") == "" {
+			return []string{"The archive is no longer available — start a new export."}
+		}
+		return []string{
+			"Download it: harbor account export-status " + id + " --download .",
+			"Delete it:   harbor account export-delete " + id,
+		}
+	case "failed":
+		return []string{"Start a new export to try again: harbor account export"}
+	case "expired":
+		return []string{"The archive was deleted at the end of its 72-hour retention window. Start a new export with: harbor account export"}
+	case "deleted":
+		return []string{"You deleted this export. Start a new one with: harbor account export"}
+	default:
+		return nil
+	}
+}
+
+// accountExportListDetail is the one-cell summary of an export row's state for
+// the list table: how far along it is, when it is ready until, or why it failed.
+func accountExportListDetail(j map[string]any) string {
+	switch str(j, "status") {
+	case "queued":
+		if pos := int(num(j, "queue_position")); pos > 0 {
+			return fmt.Sprintf("%s in line", ordinal(pos))
+		}
+		return "waiting its turn"
+	case "running":
+		return accountExportProgress(j)
+	case "completed":
+		if expires := num(j, "result_expires_at"); expires > 0 {
+			return fmt.Sprintf("ready %s · expires %s", relTime(num(j, "completed_at")), relTime(expires))
+		}
+		return "ready"
+	case "failed":
+		return truncate(str(j, "error_text"), 40)
+	default:
+		return "—"
 	}
 }
 
@@ -339,11 +1007,24 @@ func displayDeletionScheduled(data []byte) {
 }
 
 func init() {
-	accountExportStatusCmd.Flags().String("download", "", "Save the completed export ZIP to this path (- for stdout)")
+	accountExportCmd.Flags().String("format", "", "Archive format: enex (default) or html")
+	accountExportCmd.Flags().String("notebook", "", "Export only this notebook id (default: the whole account)")
+	accountExportCmd.Flags().Bool("wait", false, "Poll until the export finishes instead of returning the job id")
+	accountExportCmd.Flags().String("download", "", "Save the finished ZIP here (implies --wait; - for stdout, a directory to use the server's filename)")
+	accountExportCmd.Flags().Duration("poll-interval", 5*time.Second, "How often to poll while waiting")
+	accountExportCmd.Flags().Duration("timeout", 0, "Give up waiting after this long (0 = no limit)")
+
+	accountExportStatusCmd.Flags().String("download", "", "Save the completed export ZIP here (- for stdout, a directory to use the server's filename)")
+	accountExportStatusCmd.Flags().Bool("wait", false, "Poll until the export reaches a final state")
+	accountExportStatusCmd.Flags().Duration("poll-interval", 5*time.Second, "How often to poll while waiting")
+	accountExportStatusCmd.Flags().Duration("timeout", 0, "Give up waiting after this long (0 = no limit)")
+
+	accountExportDeleteCmd.Flags().Bool("yes", false, "Skip the confirmation prompt (required in --json/non-interactive use)")
 
 	accountDeleteCmd.Flags().String("confirm", "", fmt.Sprintf("Confirmation phrase (must equal %q); required with --yes in non-interactive/--json mode", accountDeleteConfirmPhrase))
 	accountDeleteCmd.Flags().Bool("yes", false, "Skip the interactive prompt (required, with --confirm, in non-interactive/--json mode)")
 
-	accountCmd.AddCommand(accountExportCmd, accountExportStatusCmd, accountDeleteCmd, accountCancelDeleteCmd)
+	accountCmd.AddCommand(accountExportCmd, accountExportsCmd, accountExportStatusCmd,
+		accountExportDeleteCmd, accountDeleteCmd, accountCancelDeleteCmd)
 	rootCmd.AddCommand(accountCmd)
 }

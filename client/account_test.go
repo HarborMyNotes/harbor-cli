@@ -13,7 +13,7 @@ func TestStartAccountExport(t *testing.T) {
 	var rec recordedRequest
 	srv := newTestServer(t, &rec, 202, `{"data":{"export_job_id":"e1","status":"queued"}}`)
 	defer srv.Close()
-	if _, err := testClient(srv.URL).StartAccountExport(); err != nil {
+	if _, err := testClient(srv.URL).StartAccountExport("", ""); err != nil {
 		t.Fatalf("StartAccountExport error: %v", err)
 	}
 	if rec.Method != "POST" {
@@ -24,6 +24,96 @@ func TestStartAccountExport(t *testing.T) {
 	}
 	if rec.Auth != "Bearer at_test_token" {
 		t.Errorf("auth = %q", rec.Auth)
+	}
+}
+
+// TestStartAccountExportOmitsUnsetFields pins that an unscoped, unformatted start
+// sends an EMPTY body. Sending format:"" would fail the server's enum check, and
+// hardcoding "enex" here would silently pin a default that belongs to the server.
+func TestStartAccountExportOmitsUnsetFields(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 202, `{"data":{"export_job_id":"e1","status":"queued"}}`)
+	defer srv.Close()
+	if _, err := testClient(srv.URL).StartAccountExport("", ""); err != nil {
+		t.Fatalf("StartAccountExport error: %v", err)
+	}
+	if body := string(rec.Body); body != "{}" {
+		t.Errorf("body = %s, want {}", body)
+	}
+}
+
+// TestStartAccountExportScoped verifies the format and notebook scope ride in the
+// body under the names the API expects.
+func TestStartAccountExportScoped(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 202, `{"data":{"export_job_id":"e1","status":"queued","format":"html","notebook_id":"nb1","notebook_name":"Recipes"}}`)
+	defer srv.Close()
+	if _, err := testClient(srv.URL).StartAccountExport("html", "nb1"); err != nil {
+		t.Fatalf("StartAccountExport error: %v", err)
+	}
+	if !containsAll(string(rec.Body), `"format"`, `"html"`, `"notebook_id"`, `"nb1"`) {
+		t.Errorf("body missing scope fields: %s", rec.Body)
+	}
+}
+
+// TestListAccountExports verifies the slot listing hits GET /account/export with
+// no id — the endpoint a client uses to find an export it did not start itself.
+func TestListAccountExports(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 200, `{"data":[{"id":"e1","format":"enex","status":"completed"}]}`)
+	defer srv.Close()
+	data, err := testClient(srv.URL).ListAccountExports()
+	if err != nil {
+		t.Fatalf("ListAccountExports error: %v", err)
+	}
+	if rec.Method != "GET" || rec.Path != "/account/export" {
+		t.Errorf("request = %s %s, want GET /account/export", rec.Method, rec.Path)
+	}
+	if len(CollectionItems(data)) != 1 {
+		t.Errorf("expected one slot row, got %d", len(CollectionItems(data)))
+	}
+}
+
+// TestDeleteAccountExport verifies the delete hits DELETE /account/export/:id.
+func TestDeleteAccountExport(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 200, `{"data":{"id":"e1","status":"deleted"}}`)
+	defer srv.Close()
+	if _, err := testClient(srv.URL).DeleteAccountExport("e1"); err != nil {
+		t.Fatalf("DeleteAccountExport error: %v", err)
+	}
+	if rec.Method != "DELETE" || rec.Path != "/account/export/e1" {
+		t.Errorf("request = %s %s, want DELETE /account/export/e1", rec.Method, rec.Path)
+	}
+}
+
+// TestStartAccountExportConflictDetails pins that the 409 refusal's details
+// survive decoding into the typed error. They are what lets the CLI say WHICH
+// export is in the way — there is no list endpoint on the refusal path, so a
+// client that dropped them would have to make a second request to say anything
+// useful.
+func TestStartAccountExportConflictDetails(t *testing.T) {
+	body := `{"error":{"code":"export_exists","message":"You already have an export.","details":{` +
+		`"export_job_id":"e1","format":"enex","scope":"notebook","notebook_id":"nb1",` +
+		`"notebook_name":"Recipes","result_expires_at":"1750003600000"}}}`
+	srv := newTestServer(t, nil, 409, body)
+	defer srv.Close()
+
+	_, err := testClient(srv.URL).StartAccountExport("enex", "nb1")
+	if err == nil {
+		t.Fatal("expected a 409 error")
+	}
+	apiErr, ok := err.(*APIError)
+	if !ok {
+		t.Fatalf("error type = %T, want *APIError", err)
+	}
+	if apiErr.Code != "export_exists" || apiErr.Status != 409 {
+		t.Errorf("code/status = %s/%d", apiErr.Code, apiErr.Status)
+	}
+	for _, key := range []string{"export_job_id", "format", "scope", "notebook_name", "result_expires_at"} {
+		if _, ok := apiErr.Details[key]; !ok {
+			t.Errorf("details missing %q: %v", key, apiErr.Details)
+		}
 	}
 }
 

@@ -5,6 +5,7 @@ package cmd
 
 import (
 	"strconv"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -51,6 +52,13 @@ func boolFlag(cmd *cobra.Command, name string) bool {
 // intFlag returns an int flag value.
 func intFlag(cmd *cobra.Command, name string) int {
 	v, _ := cmd.Flags().GetInt(name)
+	return v
+}
+
+// durationFlag returns a duration flag value (zero if unset or not a duration
+// flag), for the polling intervals and timeouts on long-running commands.
+func durationFlag(cmd *cobra.Command, name string) time.Duration {
+	v, _ := cmd.Flags().GetDuration(name)
 	return v
 }
 
