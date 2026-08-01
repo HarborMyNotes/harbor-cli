@@ -1,4 +1,4 @@
-<!-- Harbor agent skill — command reference • v1.0.0 -->
+<!-- Harbor agent skill — command reference • v1.1.0 -->
 <!-- Copyright (c) 2026 Cloudmanic Labs, LLC. All rights reserved. Date: 2026-06-22 -->
 
 # Harbor CLI — full command reference
@@ -17,7 +17,9 @@ what you need. The CLI's own help is always authoritative: `harbor <cmd> --help`
 - **IDs** are UUIDs. **Timestamps** are UTC epoch-milliseconds.
 - **Paging:** `--limit` (default 100, cap 500), `--offset`, `--order` (e.g.
   `-updated_at,title`; leading `-` = descending). Check `.paging.has_more`.
-- **Exit codes:** `0` ok, `1` error.
+- **Exit codes:** `0` ok, `1` error, `3` API unreachable (retryable), `4` plan
+  limit reached (never retryable — free up room or upgrade). Errors always go to
+  stderr; with `--json` they are the error envelope, not prose.
 
 ## Global flags (every command)
 
@@ -406,6 +408,33 @@ delete) and streams instead of building the document in memory. Not a drop-in:
 the job path writes a ZIP and, being the GDPR archive, includes notes in the
 trash that this command leaves out. `--notes` is **not** deprecated and stays
 here — a note selection has no successor.
+
+---
+
+## Plans & limits (read-only — the CLI never takes payment)
+
+| Command | What it does | Key flags |
+|---|---|---|
+| `harbor usage` | Used vs limit for every capped resource (notes, notebooks, tags, files, tasks); `∞` = unlimited. Also reports the read-only state | |
+| `harbor plan` | The current plan: source (`free`/`stripe`/`apple`/`google`/`comp`), status, renewal, who owns billing | |
+| `harbor plan list` | Plans offerable to this account, with prices and caps | `--limit`, `--offset`, `--order` |
+
+**Hitting a cap.** A create past a plan limit fails with `403
+plan_limit_reached` and **exit code 4**, and the CLI prints which resource, the
+used/limit numbers, and an upgrade URL. Two gates share that code: a per-resource
+cap (`details.gate = plan_limit`, blocks only that resource) and the
+whole-account read-only freeze (`details.gate = account_read_only`, blocks every
+create and edit; deletes and exports still work). Retrying never helps — free up
+room or upgrade in the web app. Check `harbor usage --json` before a bulk import
+to avoid failing halfway.
+
+**How a slot is actually freed** differs per resource — do not assume "delete it":
+
+| Resource | What frees a slot |
+|---|---|
+| notebooks, tags, tasks | `harbor <domain> delete <id>` — immediate |
+| notes | Trashing does **not** free it. `harbor notes delete <id> --permanent`, or trash then `harbor trash empty` |
+| files | **There is no `harbor files delete`.** A blob is released only when the notes holding it are **expunged** (and no other live-or-trashed note references it). An upload never attached to a note has no user-reachable delete at all |
 
 ---
 

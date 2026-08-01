@@ -230,7 +230,6 @@ func TestMapTaskError(t *testing.T) {
 		"not_found":              "no such task",
 		"invalid_priority":       "none, low, medium",
 		"invalid_recurrence":     "daily, weekly",
-		"plan_limit_reached":     "task limit",
 		"email_unverified_limit": "verify your email",
 	}
 	for code, sub := range cases {
@@ -241,7 +240,12 @@ func TestMapTaskError(t *testing.T) {
 	}
 	// validation_failed keeps its APIError so the renderer can print the
 	// server's per-field details; unrelated codes pass through too.
-	for _, code := range []string{"validation_failed", "rate_limited"} {
+	//
+	// plan_limit_reached is in this list deliberately: rewriting it here would
+	// strip the type the central plan-limit handler matches on, costing a task
+	// create its explanation and its exit code (see
+	// TestNoDomainErrorMapperSwallowsThePlanLimit).
+	for _, code := range []string{"validation_failed", "rate_limited", "plan_limit_reached"} {
 		e := apiErr(code)
 		if mapTaskError(e) != e {
 			t.Errorf("%s should pass through unchanged", code)

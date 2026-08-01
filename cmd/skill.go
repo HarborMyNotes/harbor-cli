@@ -37,7 +37,7 @@ const (
 	// skillVersion is the content version of the bundled skill. Bump it whenever
 	// the skill files change; it is surfaced to the user on install and helps
 	// distinguish "already current" from "needs updating".
-	skillVersion = "1.0.0"
+	skillVersion = "1.1.0"
 
 	// codexBlockBegin / codexBlockEnd delimit the managed section the installer
 	// splices into a Codex AGENTS.md (a file the user may share with their own

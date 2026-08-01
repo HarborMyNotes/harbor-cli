@@ -1,4 +1,4 @@
-<!-- Harbor agent skill — formatting cookbook • v1.0.0 -->
+<!-- Harbor agent skill — formatting cookbook • v1.1.0 -->
 <!-- Copyright (c) 2026 Cloudmanic Labs, LLC. All rights reserved. Date: 2026-06-22 -->
 
 # Formatting Harbor notes — the rich-content cookbook

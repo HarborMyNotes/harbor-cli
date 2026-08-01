@@ -209,6 +209,8 @@ See `harbor search --help`.
 | `harbor profile get/update/change-password/…` | Manage your profile. |
 | `harbor sessions list/revoke/revoke-others/revoke-all` | Manage login sessions. |
 | `harbor settings get/set` | Account preferences. |
+| `harbor usage` | Usage against your plan's limits (notes, notebooks, tags, files, tasks; `∞` = unlimited). |
+| `harbor plan` / `harbor plan list` | Your current plan, and the plans on offer. Upgrading happens in the web app. |
 | `harbor support` | Contact Harbor support (category, subject, message, attachments). |
 | `harbor account export/exports/export-status/export-delete` | Data export: ENEX or HTML, whole account or one notebook, with `--wait` and `--download`. |
 | `harbor account delete/cancel-delete` | Schedule (and cancel) account deletion. |
@@ -272,10 +274,59 @@ the agent to fetch them on demand with `harbor skill show formatting.md` /
 
 ## Exit codes
 
+Every diagnostic goes to **stderr**, so stdout stays data-only and pipes stay
+clean. Two failure classes a script would react to differently get their own
+code; everything else is `1`.
+
 | Code | Meaning |
 |---|---|
 | `0` | Success. |
 | `1` | An error occurred (a human-readable message is printed to stderr). |
+| `3` | The API could not be reached — DNS, refused connection, TLS, or timeout. Nothing was decided by the server, so a retry may work. |
+| `4` | A plan limit blocked the write: either the resource is at your plan's cap, or the account is read-only for being over its limits. Retrying will never help — free up room or upgrade. |
+
+```sh
+harbor notes create --title "Meeting" --stdin < notes.md
+case $? in
+  0) ;;
+  4) echo "Out of room on this plan — see 'harbor usage'." >&2; exit 1 ;;
+  3) echo "Harbor unreachable; will retry." >&2 ;;
+  *) echo "Failed." >&2; exit 1 ;;
+esac
+```
+
+With `--json`, errors are written to stderr as the API's error envelope
+(`{"error": {code, message, details, request_id}}`) rather than prose, so a
+script parses one shape whether the command succeeded or failed.
+
+## Plans & limits
+
+Harbor plans cap how many notes, notebooks, tags, files, and tasks an account
+holds. When a create is refused, the CLI says which limit you hit, what it
+means, and where to upgrade — and exits `4`:
+
+```
+$ harbor notebooks create --name "Q3 Planning"
+Error: You've reached your plan's limit of 3 notebooks. Upgrade to add more.
+  code: plan_limit_reached
+  You are using 3 of 3 notebooks on the starter plan.
+  Only notebooks are blocked — everything else still works.
+  To free a slot, delete notebooks you no longer need with
+  'harbor notebooks delete <id>' — that frees it immediately.
+  Upgrade at https://app.harbor.my/settings/plan — plans are changed in the
+  Harbor web app, not the CLI.
+  Run 'harbor usage' to see every limit on this plan.
+```
+
+The remedy is per resource, because they do not free a slot the same way:
+trashing a **note** frees nothing until it is expunged, and **files** have no
+delete at all — an attachment is released only when the notes holding it are
+permanently deleted.
+
+`harbor usage` shows where you stand before you hit a wall, and `harbor plan`
+shows what you are subscribed to. **Billing is never handled in the CLI** —
+these commands read your plan and point you at the web app (or the App Store /
+Google Play, if that is where you subscribed).
 
 ## Development
 

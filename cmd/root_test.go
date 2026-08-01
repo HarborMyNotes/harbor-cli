@@ -5,6 +5,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -247,5 +248,109 @@ func TestResetCommandStateClearsJSONFlag(t *testing.T) {
 	}
 	if jsonOutput {
 		t.Error("--json leaked into the next run")
+	}
+}
+
+// ===========================================================================
+// Exit codes
+// ===========================================================================
+//
+// A CLI is scripted, so the exit code carries as much as the message: a plan
+// limit will never succeed on retry, an unreachable API very well might, and a
+// script has to tell them apart without reading English. These run through the
+// real command tree and classify the error exactly as Execute() does.
+
+// TestPlanLimitedCreateExitsWithThePlanLimitCode is the scriptable half of the
+// feature: a create refused at a plan cap must be distinguishable by code alone.
+func TestPlanLimitedCreateExitsWithThePlanLimitCode(t *testing.T) {
+	body := `{"error":{"code":"plan_limit_reached","message":"You've reached your plan's limit of 3 notebooks.",
+	  "details":{"resource":"notebook","used":"3","limit":"3","plan_code":"starter","upgrade_url":"/settings/plan","gate":"plan_limit"},
+	  "request_id":"req_test"}}`
+	m := newAPIMock(t, map[string]mockReply{"POST /api/v1/notebooks": {Status: 403, Body: body}})
+
+	_, err := runCLI(t, m, "notebooks", "create", "--name", "Overflow")
+	if err == nil {
+		t.Fatal("a refused create must fail, not print and exit 0")
+	}
+	if got := exitCodeFor(err); got != exitPlanLimit {
+		t.Errorf("exit code = %d, want %d (plan limit)", got, exitPlanLimit)
+	}
+}
+
+// TestReadOnlyAccountExitsWithThePlanLimitCode covers the other gate behind the
+// same error code — the whole-account freeze — which scripts must treat the
+// same way.
+func TestReadOnlyAccountExitsWithThePlanLimitCode(t *testing.T) {
+	body := `{"error":{"code":"plan_limit_reached","message":"Your account is read-only.",
+	  "details":{"gate":"account_read_only","reason":"account_read_only","plan_code":"starter"},"request_id":"req_test"}}`
+	m := newAPIMock(t, map[string]mockReply{"POST /api/v1/notes": {Status: 403, Body: body}})
+
+	_, err := runCLI(t, m, "notes", "create", "--title", "Blocked", "--content", "x")
+	if err == nil {
+		t.Fatal("a frozen account must fail the create")
+	}
+	if got := exitCodeFor(err); got != exitPlanLimit {
+		t.Errorf("exit code = %d, want %d (plan limit)", got, exitPlanLimit)
+	}
+}
+
+// TestUnreachableAPIExitsWithTheNetworkCode pins the retryable class. The port
+// is one nothing listens on, so the transport fails before any HTTP exchange.
+func TestUnreachableAPIExitsWithTheNetworkCode(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("HARBOR_API_URL", "http://127.0.0.1:1/api/v1")
+	t.Setenv("HARBOR_TOKEN", "hbp_test-token-not-a-real-credential")
+	resetCommandState(t)
+
+	rootCmd.SetArgs([]string{"usage"})
+	var err error
+	captureStdout(t, func() { err = rootCmd.Execute() })
+	if err == nil {
+		t.Fatal("an unreachable API must fail")
+	}
+	if got := exitCodeFor(err); got != exitNetwork {
+		t.Errorf("exit code = %d, want %d (network)", got, exitNetwork)
+	}
+}
+
+// TestOrdinaryFailuresKeepTheGenericExitCode is the other side of the contract:
+// only the two carved-out classes get their own code, so existing scripts that
+// test for a plain non-zero keep working.
+func TestOrdinaryFailuresKeepTheGenericExitCode(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"POST /api/v1/notebooks": {Status: 422, Body: apiErrorBody("validation_failed", "name is required")},
+	})
+	_, err := runCLI(t, m, "notebooks", "create", "--name", "x")
+	if err == nil {
+		t.Fatal("a 422 must fail")
+	}
+	if got := exitCodeFor(err); got != exitError {
+		t.Errorf("validation error exit code = %d, want %d", got, exitError)
+	}
+
+	if got := exitCodeFor(errors.New("nothing to update")); got != exitError {
+		t.Errorf("local error exit code = %d, want %d", got, exitError)
+	}
+	if got := exitCodeFor(nil); got != exitOK {
+		t.Errorf("nil exit code = %d, want %d", got, exitOK)
+	}
+}
+
+// TestHTTPErrorIsNotMistakenForANetworkFailure guards the classification seam:
+// an answer from the server — even a 503 — is not a transport failure, and
+// telling a script to retry a rejection would loop it forever.
+func TestHTTPErrorIsNotMistakenForANetworkFailure(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/usage": {Status: 503, Body: apiErrorBody("timeout", "upstream unavailable")},
+	})
+	_, err := runCLI(t, m, "usage")
+	if err == nil {
+		t.Fatal("a 503 must fail")
+	}
+	if isNetworkError(err) {
+		t.Error("an HTTP error response was classified as a network failure")
+	}
+	if got := exitCodeFor(err); got != exitError {
+		t.Errorf("exit code = %d, want %d", got, exitError)
 	}
 }

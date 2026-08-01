@@ -490,6 +490,12 @@ func addTaskFieldFlags(cmd *cobra.Command) {
 // mapTaskError gives friendly messages for task-specific error codes. Codes
 // that carry useful server-side details (validation_failed) fall through
 // untouched so the default renderer can print those details verbatim.
+//
+// plan_limit_reached must NOT be listed here. Rewriting it into a plain error
+// strips the *client.APIError the central handler matches on, which silently
+// costs a task both the readable explanation and exit code 4 — a script cannot
+// then tell "out of room" from any other failure. See planLimitCode and
+// TestNoDomainErrorMapperSwallowsThePlanLimit.
 func mapTaskError(err error) error {
 	var apiErr *client.APIError
 	if errors.As(err, &apiErr) {
@@ -500,8 +506,6 @@ func mapTaskError(err error) error {
 			return errors.New("invalid --priority — use one of none, low, medium, or high")
 		case "invalid_recurrence":
 			return errors.New("invalid --recurrence — use daily, weekly, monthly, yearly, every:N:days|weeks|months|years, or an RRULE such as FREQ=WEEKLY;BYDAY=FR")
-		case "plan_limit_reached":
-			return errors.New("your plan's task limit is reached (or the account is read-only) — upgrade your plan, or delete a task to free room")
 		case "email_unverified_limit":
 			return errors.New("verify your email address to create more tasks — check your inbox, or run 'harbor auth resend-verification'")
 		}
