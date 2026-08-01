@@ -484,3 +484,36 @@ func TestExitCoderDecidesItsOwnCode(t *testing.T) {
 		t.Errorf("wrapped exit code = %d, want %d", got, exitPlanLimit)
 	}
 }
+
+// TestPreparingTheCommandTreeTwiceChangesNothing guards the property the whole
+// contract rests on. The tree is package-level state shared by every run in a
+// process, and prepareCommandTree is called on each one, so a rule that only
+// half-applies on the first pass gives the same command two behaviours
+// depending on what ran before it. That is not hypothetical: while parents were
+// left with a nil Args until a SECOND pass filled it in, the guard below passed
+// only when another test had already run, and the second pass quietly swapped
+// the suggestion-carrying message for cobra's bare one.
+func TestPreparingTheCommandTreeTwiceChangesNothing(t *testing.T) {
+	prepareCommandTree()
+	notes, _, err := rootCmd.Find([]string{"notes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notes.Args == nil {
+		t.Fatal("one pass must leave a parent with an argument contract, not wait for a second")
+	}
+	firstRunnable, firstErr := notes.Runnable(), notes.Args(notes, []string{"lst"})
+
+	prepareCommandTree()
+
+	if notes.Runnable() != firstRunnable {
+		t.Error("a second pass changed whether the parent is runnable")
+	}
+	secondErr := notes.Args(notes, []string{"lst"})
+	if fmt.Sprint(firstErr) != fmt.Sprint(secondErr) {
+		t.Errorf("a second pass changed the rejection:\n first: %v\nsecond: %v", firstErr, secondErr)
+	}
+	if firstErr == nil || !strings.Contains(firstErr.Error(), "Did you mean this?") {
+		t.Errorf("an unknown subcommand should still suggest the real one: %v", firstErr)
+	}
+}

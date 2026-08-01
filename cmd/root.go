@@ -131,7 +131,13 @@ func Execute() {
 // Cobra grows its own `help` and `completion` commands during Execute;
 // materializing them here first means the argument contract covers them too.
 // Both calls are no-ops once the command exists, so cobra's own call inside
-// Execute changes nothing, and calling this twice is harmless.
+// Execute changes nothing.
+//
+// Calling this twice must leave the tree exactly as one call did — every rule
+// below is written to be a no-op once applied. That is not decoration: the
+// tree is package-level state shared by every run in a process, so a
+// second pass that "finished the job differently" would give the same command
+// two different behaviours depending on what ran before it.
 func prepareCommandTree() {
 	rootCmd.InitDefaultHelpCmd()
 	rootCmd.InitDefaultCompletionCmd(os.Args[1:]...)
@@ -142,24 +148,26 @@ func prepareCommandTree() {
 // could be handed input it does not understand and still exit 0 — the worst
 // failure mode a CLI has, because a wrapper script cannot detect it at all.
 //
-//  1. A parent that only groups subcommands (`harbor files`) has no action of
-//     its own, so cobra considers it un-runnable and prints its help the moment
-//     it is reached — including when the subcommand the user asked for does not
-//     exist. `harbor files delete` printed the files help and exited 0, which is
-//     how a shell probe concluded that command existed (#69). Cobra checks
-//     Runnable() BEFORE it validates arguments, so an Args validator alone
-//     cannot fix this; the parent has to become runnable first. Its action
-//     keeps the help for a bare `harbor files` and fails on anything else.
-//
-//  2. A command that never declared an Args validator accepts arbitrary
+//  1. A command that never declared an Args validator accepts arbitrary
 //     positional arguments and silently drops them, so `harbor tags list
-//     receipts` lists every tag and exits 0 as though it had filtered. Every
+//     receipts` lists every tag and exits 0 as though it had filtered — and
+//     `harbor files delete` names a subcommand that does not exist. Every
 //     command that genuinely takes positional arguments declares its own
-//     validator (cobra.ExactArgs and friends), so a nil one means "takes none".
+//     validator (cobra.ExactArgs and friends), so a nil one means "takes none",
+//     and rejectUnknownArgs says so in cobra's own words.
 //
-// Doing it here, once, is what keeps it true: a domain file that forgets either
-// rule still gets both, including commands added long after this was written.
-// The `help` command is the one exception — its arguments are a command path.
+//  2. A parent that only groups subcommands (`harbor files`) has no action of
+//     its own, so cobra considers it un-runnable and returns "print the help"
+//     the moment it is reached — BEFORE it ever validates arguments, which is
+//     why rule 1 alone could not fix `harbor files delete` (#69). Giving the
+//     parent an action makes it runnable, so its arguments are validated like
+//     any other command's and a bare `harbor files` still gets its help.
+//
+// Both rules are idempotent: a second walk finds the RunE and the Args already
+// set and changes nothing. Doing it here, once, is what keeps the contract true
+// for a domain file that forgets either rule, including commands added long
+// after this was written. The `help` command is the one exception — its
+// arguments are a command path.
 func enforceArgContract(cmd *cobra.Command) {
 	for _, sub := range cmd.Commands() {
 		enforceArgContract(sub)
@@ -169,29 +177,35 @@ func enforceArgContract(cmd *cobra.Command) {
 	}
 	if cmd.HasSubCommands() && !cmd.Runnable() {
 		cmd.RunE = runParentCommand
-		// The action exists only to print help or refuse an unknown
-		// subcommand, so keep it out of the usage line: `harbor files` is a
-		// real invocation, `harbor files [flags]` is not.
+		// The action exists only to print the help, so keep it out of the usage
+		// line: `harbor files` is a real invocation, `harbor files [flags]` is
+		// not.
 		cmd.DisableFlagsInUseLine = true
-		return
 	}
 	if cmd.Args == nil {
-		cmd.Args = cobra.NoArgs
+		cmd.Args = rejectUnknownArgs
 	}
 }
 
-// runParentCommand is the action given to every command that exists only to
-// group subcommands. No arguments means the user asked what lives here, so the
-// help is the answer and the command succeeded; anything else names a
-// subcommand that does not exist, which is a usage error like any other bad
-// flag — exit 1, and nothing on stdout for a pipe to mistake for output. The
-// message deliberately matches the one cobra produces for an unknown top-level
-// command, so `harbor bogus` and `harbor files bogus` read identically.
-func runParentCommand(cmd *cobra.Command, args []string) error {
+// rejectUnknownArgs is the Args validator for every command that declared none.
+// It refuses what the command cannot act on — an unknown subcommand under a
+// parent, a stray word after a leaf — in cobra's own wording, so `harbor bogus`,
+// `harbor files bogus` and `harbor tags list bogus` all read identically. A leaf
+// has no subcommands to suggest, which makes this exactly cobra.NoArgs there.
+func rejectUnknownArgs(cmd *cobra.Command, args []string) error {
 	if len(args) == 0 {
-		return cmd.Help()
+		return nil
 	}
 	return errors.New(unknownSubcommandMessage(cmd, args[0]))
+}
+
+// runParentCommand is the action given to every command that exists only to
+// group subcommands: the user asked what lives here, so the help is the answer
+// and the command succeeded. It never sees a stray argument — rejectUnknownArgs
+// runs first and fails — which is the point of making the parent runnable at
+// all: an un-runnable command's arguments are never validated.
+func runParentCommand(cmd *cobra.Command, args []string) error {
+	return cmd.Help()
 }
 
 // unknownSubcommandMessage builds the "unknown command" text for a subcommand

@@ -381,6 +381,16 @@ func accountWaitAndMaybeDownload(cmd *cobra.Command, c *client.Client, id, out s
 		printResult(data, display)
 	}
 	if out == "" {
+		// The poll ran to a TERMINAL state, which is not the same as a good
+		// one: failed/expired/deleted all end the wait. Without this the card
+		// says "Status failed" and the command exits 0, so a script that waited
+		// an hour for an archive carries on as though it had one — the same
+		// defect as a push whose changes were refused. --download reaches the
+		// identical check inside accountDownloadExport; this is the branch that
+		// only asked to wait.
+		if status := str(parseJSON(client.UnwrapData(data)), "status"); status != "completed" {
+			return errors.New(accountExportNotReadyReason(status, id))
+		}
 		return nil
 	}
 	return accountDownloadExport(c, id, out, data)

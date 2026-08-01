@@ -907,3 +907,52 @@ func TestDisplayDeletionScheduled(t *testing.T) {
 		t.Errorf("cancel hint missing:\n%s", out)
 	}
 }
+
+// ===========================================================================
+// A wait that ended badly (#69)
+// ===========================================================================
+
+// TestAccountExportWaitFailsWhenTheExportDidNot is the regression for the
+// fourth instance of #69's defect: --wait polls to a TERMINAL state, which is
+// not the same as a good one. A failed/expired/deleted export printed a card
+// reading "Status failed" and exited 0, so a script that waited an hour for an
+// archive carried on as though it had one — with no diagnosis anywhere, since
+// only the --download path checked the status.
+func TestAccountExportWaitFailsWhenTheExportDidNot(t *testing.T) {
+	for status, want := range map[string]string{
+		"failed":  "the export failed",
+		"expired": "retention window",
+		"deleted": "was deleted",
+	} {
+		t.Run(status, func(t *testing.T) {
+			m := newAPIMock(t, map[string]mockReply{
+				"POST /api/v1/account/export":   {Status: 202, Body: `{"data":{"export_job_id":"e1","status":"queued","format":"enex"}}`},
+				"GET /api/v1/account/export/e1": {Status: 200, Body: fmt.Sprintf(`{"data":{"id":"e1","format":"enex","status":%q}}`, status)},
+			})
+			out, err := runCLI(t, m, "account", "export", "--wait", "--poll-interval", "1ms")
+			if err == nil {
+				t.Fatalf("a %s export must not exit 0", status)
+			}
+			if got := exitCodeFor(err); got != exitError {
+				t.Errorf("exit code = %d, want %d", got, exitError)
+			}
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the error must say what went wrong, got %q", err.Error())
+			}
+			// The card is the answer to "what happened", so it stays on stdout —
+			// the same shape as sync push and import enex.
+			if !strings.Contains(out, status) {
+				t.Errorf("the final status card must still be printed:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestAccountExportWaitSucceedsWhenTheExportCompleted keeps the new check from
+// crying wolf: a completed export with no --download is a plain success.
+func TestAccountExportWaitSucceedsWhenTheExportCompleted(t *testing.T) {
+	m := exportProgressMock(t, "")
+	if _, err := runCLI(t, m, "account", "export", "--wait", "--poll-interval", "1ms"); err != nil {
+		t.Fatalf("a completed export must exit 0: %v", err)
+	}
+}
