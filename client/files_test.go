@@ -141,6 +141,35 @@ func TestFetchURLUnauthenticated(t *testing.T) {
 	resp.Body.Close()
 }
 
+// TestFetchURLSkipsHarborHeaders is the deliberate exception to "every request
+// carries X-Harbor-Platform: cli". A presigned URL points at object storage, not
+// at the Harbor API — nothing there reads the header, and S3-compatible backends
+// can reject a request whose headers were not part of the signature. So this is
+// the one outbound request the CLI makes that must stay bare, and it is the
+// exemption TestEveryRequestBuilderSetsCommonHeaders allows by name.
+func TestFetchURLSkipsHarborHeaders(t *testing.T) {
+	var platform, auth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		platform = r.Header.Get("X-Harbor-Platform")
+		auth = r.Header.Get("Authorization")
+		_, _ = w.Write([]byte("blob-bytes"))
+	}))
+	defer srv.Close()
+
+	resp, err := testClient(srv.URL).FetchURL(srv.URL + "/x?sig=1")
+	if err != nil {
+		t.Fatalf("FetchURL error: %v", err)
+	}
+	resp.Body.Close()
+
+	if platform != "" {
+		t.Errorf("X-Harbor-Platform = %q on a presigned URL, want it absent", platform)
+	}
+	if auth != "" {
+		t.Errorf("Authorization = %q on a presigned URL, want it absent", auth)
+	}
+}
+
 // TestFetchURLDownloadError pins that a non-2xx from a presigned URL comes back
 // as a *DownloadError carrying the status, and that Gone() marks exactly the
 // object-is-missing statuses. An account export reads that distinction to decide
