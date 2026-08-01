@@ -541,12 +541,17 @@ already encrypted are skipped, so it is safe to re-run.
 
 Two things encrypting does NOT do, both worth knowing before you rely on it:
 
-  • It does not reach into the note's VERSION HISTORY. Earlier versions were
-    snapshotted as plaintext and stay that way, so a note that was public before
-    it was encrypted was still public.
+  • It does not clear the plaintext ALREADY ON THE SERVER. The note's earlier
+    versions were snapshotted as plaintext and stay readable ('harbor history
+    list <id>'). The one exception is not one to plan around: the server folds a
+    save into the previous history row when that row is recent enough and from
+    the same client, so encrypting a note you just edited here may overwrite that
+    single row — a coincidence of timing, not a feature, and every older version
+    is untouched. Treat anything that was saved in the clear as having been
+    stored in the clear.
   • It does not encrypt the BYTES of attached files. The note's body — including
     the references to them — becomes ciphertext, but the attachments themselves
-    are stored as they were.
+    are stored as they were, and can still be downloaded and read in full.
 
 While a note is encrypted the server cannot read it: it is excluded from search,
 and its tasks, links and attachment references stop being reconciled until it is
@@ -580,20 +585,25 @@ decrypted again.`,
 			if werr != nil {
 				return false, mapNoteError(werr)
 			}
+			// Counted only once the server has confirmed the note came back
+			// encrypted. A write that landed but did not take is not a sealed note,
+			// and must not be spoken about as one.
+			if verr := verifyConversionLanded(data, true, id); verr != nil {
+				return false, verr
+			}
 			sealed++
-			return true, verifyConversionLanded(data, true, id)
+			return true, nil
 		})
-		if err != nil {
-			return err
-		}
-		// Said after the fact, not before: it is not a reason to hesitate, it is a
-		// thing to go do next if the plaintext ever mattered. And only when
-		// something was actually sealed — on a re-run that converted nothing it
-		// would be a warning about notes this command did not touch.
+		// The caveat goes out BEFORE the error return, because a run that failed
+		// part way is exactly when it matters most: a sweep where one note failed
+		// still left the others genuinely sealed on the server, and returning first
+		// gave the user a partial success with none of the warning that makes it
+		// honest. It is keyed off what was actually sealed, not off whether the run
+		// as a whole succeeded.
 		if sealed > 0 {
-			fmt.Fprintln(os.Stderr, dim("Note: earlier versions of these notes are still in their history as plaintext ('harbor history list <id>')."))
+			printHistoryCaveat()
 		}
-		return nil
+		return err
 	},
 }
 
@@ -603,9 +613,9 @@ decrypted again.`,
 // body is written in the clear it is indexed for search and snapshotted into the
 // note's history on the server, and re-encrypting afterwards does not unsend it.
 var notesDecryptConfirmation = registerConfirmation("harbor notes decrypt", confirmation{
-	Warning: "This writes these notes' contents to the server in the CLEAR. The plaintext is\n" +
-		"then indexed for search and kept in the note's version history — re-encrypting\n" +
-		"afterwards does not undo that.",
+	Warning: "This writes these notes' contents to the server in the CLEAR — indexed for search\n" +
+		"and written into the note's version history. Encrypting them again protects them\n" +
+		"from then on; it does not un-store what the server has already been given.",
 	Prompt:      `Type "yes" to confirm: `,
 	Affirmative: "yes",
 	Unattended:  "refusing to write notes back as plaintext without confirmation — pass --yes",
@@ -684,6 +694,32 @@ func notesConfirmDecrypt(count int, yes bool) error {
 		fmt.Printf("About to decrypt %d %s.\n", count, pluralize(count, "note", "notes"))
 	}
 	return confirmDestructive(notesDecryptConfirmation, jsonOutput, stdinIsInteractive(), yes, askLine)
+}
+
+// printHistoryCaveat says what encrypting does NOT do to the plaintext already on
+// the server, and it is worded around what the user can RELY on rather than
+// around what happens.
+//
+// The first draft said the plain thing — earlier versions stay in history as
+// plaintext — and that is wrong in one case. The server COALESCES history
+// snapshots (internal/history/history.go, coalesceInto): when the latest row came
+// from the same source device and is newer than the configured idle window, the
+// next save folds INTO that row instead of starting a new one. So encrypting a
+// note you edited moments ago through the same client overwrites that row's
+// plaintext with ciphertext, and the version genuinely disappears.
+//
+// That does not make the warning wrong, it makes the flat version of it wrong.
+// Whether the most recent row survives depends on how recently the note was
+// saved, from which client, and on a server-side window this CLI cannot see —
+// which is a coincidence of timing, not a guarantee anyone can lean on, and every
+// older row is untouched either way. So the message covers both cases and lands
+// on the part that is unconditionally true: what was saved in the clear was
+// stored in the clear, and encrypting afterwards does not un-store it.
+func printHistoryCaveat() {
+	fmt.Fprintln(os.Stderr, dim("Note: this does not clear the plaintext already on the server. A version saved\n"+
+		"moments ago may be folded into this write, but older ones stay readable\n"+
+		"('harbor history list <id>') — treat what was saved in the clear as having been\n"+
+		"stored in the clear."))
 }
 
 // verifyConversionLanded checks the server's own answer rather than assuming a

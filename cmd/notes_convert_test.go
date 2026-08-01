@@ -995,3 +995,107 @@ func TestTaskLossRefusalOnlyNamesCommandsThatExist(t *testing.T) {
 		t.Errorf("the refusal does not offer both ways forward:\n%s", msg)
 	}
 }
+
+// ===========================================================================
+// A run that failed part way still sealed the notes it sealed
+// ===========================================================================
+
+// TestEncryptWarnsAboutHistoryEvenWhenAnotherNoteFailed pins the ordering the
+// first version got wrong. runConversion returns an error whenever ANY note
+// failed, and the history caveat used to sit behind that return — so a sweep
+// where one write failed left the other notes genuinely encrypted on the server
+// and said nothing at all about the plaintext still sitting in their history.
+//
+// A partial failure is exactly when the caveat matters most: it is the notebook
+// sweep this command exists for, and the user is walking away believing the run
+// did not really happen.
+func TestEncryptWarnsAboutHistoryEvenWhenAnotherNoteFailed(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	const good = "11111111-1111-1111-1111-111111111111"
+	const bad = "22222222-2222-2222-2222-222222222222"
+
+	sealed := map[string]bool{}
+	m := newAPIMock(t, map[string]mockReply{})
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+		switch {
+		case r.Method == http.MethodGet:
+			writeJSON(w, 200, map[string]any{
+				"id": id, "title": "T", "content": "<p>body</p>",
+				"is_encrypted": false, "usn": float64(5),
+			})
+		case id == bad:
+			writeJSON(w, 500, map[string]any{"error": map[string]any{
+				"code": "internal", "message": "the write did not land",
+			}})
+		default:
+			sealed[id] = true
+			writeJSON(w, 200, map[string]any{
+				"note": map[string]any{"id": id, "is_encrypted": true}, "usn": 6,
+			})
+		}
+	}
+
+	var out string
+	var err error
+	warned := captureStderr(t, func() { out, err = runCLI(t, m, "notes", "encrypt", good, bad) })
+
+	// The run still fails: a script must not read a partial sweep as a clean one.
+	if err == nil {
+		t.Fatal("a run with a failed note reported success")
+	}
+	// ...but the good note really was encrypted...
+	if !sealed[good] {
+		t.Fatal("the note that could be encrypted was not — the test proves nothing")
+	}
+	if !strings.Contains(out, good) || !strings.Contains(out, bad) {
+		t.Errorf("both outcomes should be reported per note:\n%s", out)
+	}
+	// ...so the caveat about its history must have been said.
+	if !strings.Contains(warned, "history") {
+		t.Errorf("a note was sealed and the history caveat was never printed:\n%q", warned)
+	}
+}
+
+// TestHistoryCaveatIsTrueInBothDirections guards the wording against drifting
+// back to either flat version, both of which are wrong.
+//
+// "Earlier versions stay as plaintext" is wrong because the server COALESCES
+// snapshots: a save from the same client, inside the configured idle window,
+// folds into the previous history row rather than starting a new one — so
+// encrypting a note edited moments ago overwrites that row's plaintext and the
+// version really does disappear. "Encrypting cleans up your history" is wrong
+// because that depends on timing, on which client saved last, and on a
+// server-side window this CLI cannot see, and every older row is untouched
+// regardless. The message has to carry both halves and land on the part that
+// holds either way.
+func TestHistoryCaveatIsTrueInBothDirections(t *testing.T) {
+	out := captureStderr(t, printHistoryCaveat)
+
+	for _, want := range []string{
+		"may be folded into this write", // the exception, stated as a maybe
+		"older ones stay readable",      // the rule
+		"stored in the clear",           // what holds either way
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the caveat no longer says %q, so it is only true in one direction:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "harbor history list") == false {
+		t.Errorf("the caveat does not say how to go and look:\n%s", out)
+	}
+}
+
+// TestEncryptDoesNotClaimAnythingAboutAttachmentBytes keeps the other half of the
+// same honesty pair in the help. A note whose body is sealed still has readable
+// attachments, and a user relying on "the note is encrypted" needs to know that
+// before they lean on it, not after.
+func TestEncryptDoesNotClaimAnythingAboutAttachmentBytes(t *testing.T) {
+	if !strings.Contains(notesEncryptCmd.Long, "does not encrypt the BYTES of attached files") {
+		t.Error("the help no longer says attachment bytes are left in the clear")
+	}
+	if !strings.Contains(notesEncryptCmd.Long, "downloaded and read in full") {
+		t.Error("the help states the limitation without saying what it means in practice")
+	}
+}
