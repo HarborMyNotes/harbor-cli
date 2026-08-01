@@ -411,7 +411,11 @@ has copy-paste recipes and the full allowlist.
 - **Exit codes:** `0` success, `1` any error, `3` the API was unreachable (worth
   retrying), `4` a plan limit blocked the write (never worth retrying). Safe to
   branch on `$?`. Errors go to stderr — with `--json` they are the error
-  envelope, so you parse one shape either way.
+  envelope, so you parse one shape either way. `0` always means the work
+  happened: an unknown subcommand is an error rather than a help screen, and the
+  two commands whose failures arrive inside a `200` — `sync push` (refused
+  changes) and `import enex` (a `partial`/`failed` import) — exit non-zero while
+  still printing their per-item results.
 - **Plan limits.** Harbor caps notes/notebooks/tags/files/tasks per plan. On
   exit `4`, stop and tell the user which limit they hit and that upgrading
   happens in the Harbor web app — the CLI cannot take payment. `harbor usage`

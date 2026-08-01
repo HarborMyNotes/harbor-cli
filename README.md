@@ -299,6 +299,26 @@ With `--json`, errors are written to stderr as the API's error envelope
 (`{"error": {code, message, details, request_id}}`) rather than prose, so a
 script parses one shape whether the command succeeded or failed.
 
+**A command never exits `0` for work it did not do.** That includes the cases
+where the server answers `200`:
+
+- **A subcommand that does not exist** is an error (`1`), not a help screen.
+  `harbor files delete` fails, because there is no such command — only a bare
+  `harbor files` prints the help. Stray positional arguments are refused the
+  same way rather than silently ignored.
+- **`harbor sync push`** reports each change's outcome inside a `200`, so it
+  exits `4` when a refusal was a plan limit and `1` for any other refusal. The
+  per-change results are still printed either way — that is how a client learns
+  which USNs landed and which changes to re-resolve. A `conflict` is not a
+  refusal (the server hands back the record you need to resolve it), so that
+  stays `0`.
+- **`harbor import enex`** exits `1` when the import came back `partial` or
+  `failed`, or reported failed notes; the counters are still printed, and
+  `harbor import status <job-id>` has the per-note reasons. An import that was
+  merely *enqueued* has not failed at anything yet, so it stays `0`.
+- **`harbor status`** exits `1` when the server is not ready, after printing the
+  readiness table.
+
 ## Plans & limits
 
 Harbor plans cap how many notes, notebooks, tags, files, and tasks an account

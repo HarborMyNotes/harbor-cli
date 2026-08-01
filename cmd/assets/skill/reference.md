@@ -19,7 +19,11 @@ what you need. The CLI's own help is always authoritative: `harbor <cmd> --help`
   `-updated_at,title`; leading `-` = descending). Check `.paging.has_more`.
 - **Exit codes:** `0` ok, `1` error, `3` API unreachable (retryable), `4` plan
   limit reached (never retryable — free up room or upgrade). Errors always go to
-  stderr; with `--json` they are the error envelope, not prose.
+  stderr; with `--json` they are the error envelope, not prose. Nothing exits
+  `0` without doing the work: an unknown subcommand fails (`1`) instead of
+  printing help, `sync push` exits `4`/`1` when the server refused changes
+  inside its `200` (a `conflict` is not a refusal), and `import enex` exits `1`
+  on a `partial`/`failed` import — both still print their results.
 
 ## Global flags (every command)
 
