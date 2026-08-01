@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -307,14 +308,20 @@ var accountCancelDeleteCmd = &cobra.Command{
 // The one approved deviation for this platform is "close this" in place of
 // "close Harbor", which is meaningless in a terminal.
 //
-// It is TRUE on both halves, which is the only reason it is printed. The export
-// is an ordinary background job: POST /account/export commits an account_jobs row
-// and enqueues the work, and a worker pool claims it from the database — nothing
-// about the build is tied to the HTTP request or to this process, so exiting the
-// CLI does not touch it. On success the server sends the export_ready email
-// (internal/account/export.go for the ENEX archive, htmlexport.go for the HTML
-// one), and a build that fails for good sends export_failed instead, so quitting
-// does not leave a failure unreported either.
+// The first half is unconditionally true, which is why it can be said plainly:
+// the export is an ordinary background job — POST /account/export commits an
+// account_jobs row and enqueues the work, and a worker pool claims it from the
+// database — so nothing about the build is tied to the HTTP request or to this
+// process, and exiting the CLI does not touch it.
+//
+// The SECOND half is a best effort, not a guarantee, which is why it is never the
+// only route offered. The server does send export_ready on success and
+// export_failed on a build that fails for good (internal/account/export.go,
+// htmlexport.go), but the send is fire-and-forget: a delivery error is swallowed
+// and logged, an instance with no mailer wired returns silently, and an export
+// deleted or expired mid-build sends nothing at all. So the line that follows
+// this one leads with the command, which needs no mail to arrive — see
+// accountExportNextStep.
 //
 // It deliberately promises no TIME. Exports run one at a time server-wide, so the
 // wait is however long every export ahead of yours takes; a single very large
@@ -323,16 +330,22 @@ var accountCancelDeleteCmd = &cobra.Command{
 // be right.
 const accountExportKeepsBuilding = "You can close this — the export keeps building on our servers, and we'll email you a link when it's ready."
 
-// accountExportEmailNextStep says what that emailed link actually does and gives
-// the terminal-native alternative.
+// accountExportNextStep is the route back to a finished export, and it leads with
+// the command rather than the email ON PURPOSE.
 //
-// The link is NOT a download: it points back at Harbor, which re-authenticates
-// the reader before minting a fresh short-lived URL (exportDownloadPageURL), so a
-// forwarded email cannot fetch someone's archive. Someone told only "we'll email
-// you a link" would reasonably expect to curl it. And having quit, they no longer
-// have the job id — so the route back into the terminal has to be the command
-// that reads the id off the server, not one that takes it as an argument.
-const accountExportEmailNextStep = "That link opens Harbor in a browser — to download from the terminal instead, run: harbor account exports"
+// The email is the nicer path when it lands, but it is the half of the promise
+// this CLI cannot vouch for (see accountExportKeepsBuilding). 'harbor account
+// exports' depends on none of it: export state lives on the server, so the
+// command reads the job — and its id — straight back off the API. Someone whose
+// plan is "wait for the email" has no move at all when no email comes; someone
+// whose plan is the command is never stuck, and the email just saves them a step.
+//
+// The parenthetical is there because the emailed link is NOT a download either.
+// It points back at Harbor, which re-authenticates the reader before minting a
+// fresh short-lived URL (exportDownloadPageURL), so a forwarded email cannot
+// fetch someone's archive — and anyone told only "we'll email you a link" would
+// reasonably expect to curl it.
+const accountExportNextStep = "Pick it up any time with 'harbor account exports' — that works whether or not the email arrives (the emailed link opens Harbor in a browser)."
 
 // accountExportQueueSlipNote explains a queue position that got WORSE.
 //
@@ -918,7 +931,46 @@ func displayExportList(data []byte) {
 		})
 	}
 	printTable([]string{"FORMAT", "SCOPE", "STATUS", "DETAIL", "ID"}, rows)
-	fmt.Println(dim("Poll one with: harbor account export-status <id>"))
+	for _, line := range accountExportListFooters(items) {
+		fmt.Println(dim(line))
+	}
+}
+
+// accountExportListFooters picks the next step(s) that fit what is actually in
+// the table, rather than always offering to poll.
+//
+// This command is the way back for someone who closed their terminal, so by the
+// time they run it the export they came for has usually FINISHED — and "Poll one
+// with:" tells them to keep watching something that is already done. It reads as
+// though the archive is not there yet, which is precisely the wrong first
+// impression for the one screen that is meant to hand it over.
+//
+// Both lines can appear at once, because both can be true: an account holds one
+// export per format, so a ready HTML archive and a still-building ENEX one is an
+// ordinary pair. When nothing is downloadable and nothing is coming — every row
+// failed, expired or deleted — the only honest next step is to start again.
+func accountExportListFooters(items []json.RawMessage) []string {
+	ready, waiting := false, false
+	for _, raw := range items {
+		switch str(parseJSON(raw), "status") {
+		case "completed":
+			ready = true
+		case "queued", "running":
+			waiting = true
+		}
+	}
+
+	lines := []string{}
+	if ready {
+		lines = append(lines, "Download one with: harbor account export-status <id> --download .")
+	}
+	if waiting {
+		lines = append(lines, "Poll one with: harbor account export-status <id>")
+	}
+	if len(lines) == 0 {
+		lines = append(lines, "Start a new one with: harbor account export")
+	}
+	return lines
 }
 
 // displayExportDeleted confirms a delete, wording it by the status the server
@@ -1007,7 +1059,7 @@ func accountExportProgress(j map[string]any) string {
 func accountExportWaitPreamble() []string {
 	return []string{
 		accountExportKeepsBuilding,
-		accountExportEmailNextStep,
+		accountExportNextStep,
 		"Ctrl-C stops the waiting, not the export.",
 	}
 }
@@ -1057,13 +1109,13 @@ func accountExportHints(j map[string]any, id string, downloading bool) []string 
 		return []string{
 			"Waiting to start — we build one export at a time.",
 			accountExportKeepsBuilding,
-			accountExportEmailNextStep,
+			accountExportNextStep,
 			"Poll it with: harbor account export-status " + id,
 		}
 	case "running":
 		return []string{
 			accountExportKeepsBuilding,
-			accountExportEmailNextStep,
+			accountExportNextStep,
 			"Poll it with: harbor account export-status " + id + " --wait",
 		}
 	case "completed":
