@@ -4,7 +4,9 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -954,5 +956,424 @@ func TestAccountExportWaitSucceedsWhenTheExportCompleted(t *testing.T) {
 	m := exportProgressMock(t, "")
 	if _, err := runCLI(t, m, "account", "export", "--wait", "--poll-interval", "1ms"); err != nil {
 		t.Fatalf("a completed export must exit 0: %v", err)
+	}
+}
+
+// ===========================================================================
+// "You can close this" — issue #64
+// ===========================================================================
+
+// TestAccountExportContractStringIsVerbatim pins the sentence itself. It is a
+// cross-client contract (epic app.harbor.my#1216): every Harbor client shows the
+// same words, and this CLI's only agreed deviation is "close this" in place of
+// "close Harbor". A well-meant rewording here is a silent divergence from five
+// other clients, so the literal — em dash, curly apostrophe and all — is the test.
+func TestAccountExportContractStringIsVerbatim(t *testing.T) {
+	const want = "You can close this — the export keeps building on our servers, and we'll email you a link when it's ready."
+	if accountExportKeepsBuilding != want {
+		t.Errorf("the contract string was reworded:\n got %q\nwant %q", accountExportKeepsBuilding, want)
+	}
+}
+
+// TestAccountExportWaitCopyPromisesNoTime is the no-estimate guard, and it covers
+// EVERY string a waiting export can print — not just the reassurance.
+//
+// Exports run one at a time server-wide and one 60 GB account has held the slot
+// for ten hours (app.harbor.my#1242), so any duration printed here is wrong for
+// exactly the people who most need it to be right. The progress line is the most
+// tempting place to add one ("done in a minute") and the least obvious place to
+// look for one, so it is enumerated here alongside the copy that is fixed.
+func TestAccountExportWaitCopyPromisesNoTime(t *testing.T) {
+	lines := append(accountExportWaitPreamble(), accountExportNextStep, accountExportQueueSlipNote)
+
+	// The progress line is generated, not constant, so it is exercised across
+	// every shape it takes rather than trusted.
+	for _, job := range []map[string]any{
+		{"status": "queued"},
+		{"status": "queued", "queue_position": float64(1)},
+		{"status": "queued", "queue_position": float64(12)},
+		{"status": "running"},
+		{"status": "running", "total_units": float64(36500), "done_units": float64(4120)},
+	} {
+		lines = append(lines, accountExportProgressLine(job))
+	}
+
+	// Every hint an unfinished export shows is part of the same screen, so it is
+	// held to the same rule.
+	for _, status := range []string{"queued", "running"} {
+		lines = append(lines, accountExportHints(map[string]any{"status": status}, "e1", false)...)
+	}
+
+	// "moment" catches "in a moment"; "eta" is spelled with word boundaries by the
+	// caller below so it does not fire on "estimated" or on an id that contains it.
+	for _, banned := range []string{"minute", "hour", "second", "soon", "shortly", "moment", "quick", "fast", "eta", "estimate", "remaining"} {
+		for _, line := range lines {
+			if line == "" {
+				continue
+			}
+			for _, word := range strings.Fields(strings.ToLower(line)) {
+				if strings.Trim(word, ".,;:!?()'\"—") == banned {
+					t.Errorf("the wait copy promises a time (%q): %q", banned, line)
+				}
+			}
+		}
+	}
+}
+
+// TestAccountExportHintsTellPeopleTheyCanQuit is the acceptance criterion: the
+// two unfinished states say the wait is optional and how to pick the export back
+// up, and the four terminal states say neither.
+//
+// The terminal half matters as much as the other: "we'll email you a link when
+// it's ready" under a completed export describes an email that has already been
+// sent, and under a failed or expired one describes an email that is never coming.
+func TestAccountExportHintsTellPeopleTheyCanQuit(t *testing.T) {
+	for _, status := range []string{"queued", "running"} {
+		t.Run(status, func(t *testing.T) {
+			hints := accountExportHints(map[string]any{"status": status}, "e1", false)
+			if !slicesContain(hints, accountExportKeepsBuilding) {
+				t.Errorf("a %s export must say the wait is optional:\n%v", status, hints)
+			}
+			if !slicesContain(hints, accountExportNextStep) {
+				t.Errorf("a %s export must say how to pick it back up:\n%v", status, hints)
+			}
+		})
+	}
+	for _, status := range []string{"completed", "failed", "expired", "deleted"} {
+		t.Run(status, func(t *testing.T) {
+			for _, line := range accountExportHints(map[string]any{"status": status}, "e1", false) {
+				if line == accountExportKeepsBuilding || line == accountExportNextStep {
+					t.Errorf("a %s export has nothing left to wait for, but printed %q", status, line)
+				}
+			}
+		})
+	}
+	// A run that is saving the archive is not a run anybody is being told to walk
+	// away from — it is already finishing the job here.
+	if hints := accountExportHints(map[string]any{"status": "running"}, "e1", true); len(hints) != 0 {
+		t.Errorf("a downloading run takes no hints, got %v", hints)
+	}
+}
+
+// slicesContain reports whether want appears in lines.
+func slicesContain(lines []string, want string) bool {
+	for _, line := range lines {
+		if line == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestAccountExportReassuranceIsDimmed pins the styling: the new lines go through
+// the same dim() the download hint already uses, so they read as guidance rather
+// than as output. Colour is forced on so the escape sequences are actually there
+// to compare.
+func TestAccountExportReassuranceIsDimmed(t *testing.T) {
+	t.Setenv("CLICOLOR_FORCE", "1")
+	os.Unsetenv("NO_COLOR")
+	noColorFlag, colorReady = false, false
+	defer func() { noColorFlag, colorReady = false, false }()
+
+	if dim(accountExportKeepsBuilding) == accountExportKeepsBuilding {
+		t.Fatal("colour is not forced on; this test proves nothing")
+	}
+	// The card renders every hint through one loop, so proving the styling on the
+	// long-standing "Poll it with" line proves it for the new ones beside it.
+	out := captureStdoutRaw(t, func() {
+		displayExportJob([]byte(`{"data":{"id":"e1","format":"enex","status":"queued","queue_position":2}}`))
+	})
+	for _, line := range []string{accountExportKeepsBuilding, accountExportNextStep, "Poll it with: harbor account export-status e1"} {
+		if !strings.Contains(out, dim(line)) {
+			t.Errorf("not rendered with dim(): %q\n%q", line, out)
+		}
+	}
+}
+
+// captureStdoutRaw captures stdout WITHOUT disabling colour, which captureStdout
+// does. A test about ANSI styling cannot use a helper that turns ANSI off.
+func captureStdoutRaw(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = w
+	fn()
+	_ = w.Close()
+	os.Stdout = old
+	out, _ := io.ReadAll(r)
+	return string(out)
+}
+
+// TestAccountExportJSONIsUntouched is the diff the acceptance criteria asked for:
+// --json exists so the output can be piped, and a human sentence has no business
+// in it. Every export command that can render an unfinished job is checked
+// against the server's own body, byte for byte.
+func TestAccountExportJSONIsUntouched(t *testing.T) {
+	const queued = `{"data":{"export_job_id":"e1","status":"queued","format":"enex","queue_position":3}}`
+	const running = `{"data":{"id":"e1","status":"running","format":"enex","total_units":10,"done_units":4}}`
+
+	cases := []struct {
+		name string
+		body string
+		args []string
+	}{
+		{"export", queued, []string{"account", "export", "--json"}},
+		{"export-status", running, []string{"account", "export-status", "e1", "--json"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newAPIMock(t, map[string]mockReply{
+				"POST /api/v1/account/export":   {Status: 202, Body: tc.body},
+				"GET /api/v1/account/export/e1": {Status: 200, Body: tc.body},
+			})
+			out, err := runCLI(t, m, tc.args...)
+			if err != nil {
+				t.Fatalf("%v: %v", tc.args, err)
+			}
+			pretty, perr := client.PrettyJSON([]byte(tc.body))
+			if perr != nil {
+				t.Fatalf("PrettyJSON: %v", perr)
+			}
+			if out != pretty+"\n" {
+				t.Errorf("--json output is no longer the server's body verbatim.\n got %q\nwant %q", out, pretty+"\n")
+			}
+		})
+	}
+}
+
+// TestAccountPollExportSaysTheWaitIsOptional covers the case issue #64 exists
+// for: the long-running --wait that someone sits in front of. It must say, once,
+// that the server finishes without them.
+func TestAccountPollExportSaysTheWaitIsOptional(t *testing.T) {
+	noColorFlag, colorReady = true, false
+	defer func() { noColorFlag, colorReady = false, false }()
+
+	replies := []string{
+		`{"data":{"id":"e1","status":"queued","queue_position":2}}`,
+		`{"data":{"id":"e1","status":"running","total_units":10,"done_units":3}}`,
+		`{"data":{"id":"e1","status":"running","total_units":10,"done_units":7}}`,
+		`{"data":{"id":"e1","status":"completed","total_units":10,"done_units":10}}`,
+	}
+	calls := 0
+	c := exportStub(t, func(w http.ResponseWriter, r *http.Request) {
+		i := calls
+		if i >= len(replies) {
+			i = len(replies) - 1
+		}
+		calls++
+		_, _ = w.Write([]byte(replies[i]))
+	})
+
+	errOut := captureStderr(t, func() {
+		if _, err := accountPollExport(c, "e1", time.Millisecond, 0, true); err != nil {
+			t.Errorf("accountPollExport: %v", err)
+		}
+	})
+
+	if n := strings.Count(errOut, accountExportKeepsBuilding); n != 1 {
+		t.Errorf("the reassurance must appear exactly once per wait, got %d:\n%s", n, errOut)
+	}
+	if !strings.Contains(errOut, "Ctrl-C stops the waiting, not the export.") {
+		t.Errorf("a wait must say how to leave it:\n%s", errOut)
+	}
+	if !strings.Contains(errOut, "harbor account exports") {
+		t.Errorf("someone who quits no longer has the job id, so the way back must not need one:\n%s", errOut)
+	}
+	// Progress still works. The preamble is an addition, not a replacement.
+	if !strings.Contains(errOut, "2nd in line") || !strings.Contains(errOut, "7 / 10 notes") {
+		t.Errorf("progress reporting regressed:\n%s", errOut)
+	}
+}
+
+// TestAccountPollExportKeepsJSONClean re-pins the rule the preamble could most
+// easily break: 'export --wait --json | jq' must receive nothing but the final
+// JSON, so none of the new copy may be printed in --json mode.
+func TestAccountPollExportKeepsJSONClean(t *testing.T) {
+	jsonOutput = true
+	noColorFlag, colorReady = true, false
+	defer func() { jsonOutput = false; noColorFlag, colorReady = false, false }()
+
+	replies := []string{
+		`{"data":{"id":"e1","status":"queued","queue_position":2}}`,
+		`{"data":{"id":"e1","status":"completed","total_units":1,"done_units":1}}`,
+	}
+	calls := 0
+	c := exportStub(t, func(w http.ResponseWriter, r *http.Request) {
+		i := calls
+		if i >= len(replies) {
+			i = len(replies) - 1
+		}
+		calls++
+		_, _ = w.Write([]byte(replies[i]))
+	})
+	errOut := captureStderr(t, func() {
+		if _, err := accountPollExport(c, "e1", time.Millisecond, 0, true); err != nil {
+			t.Errorf("accountPollExport: %v", err)
+		}
+	})
+	if errOut != "" {
+		t.Errorf("--json mode must print no prose at all, got:\n%s", errOut)
+	}
+}
+
+// TestAccountPollExportExplainsAQueuePositionThatSlips covers the number that
+// goes the wrong way. The queue is server-wide and priority-ordered — a queued
+// ENEX export outranks a queued HTML one however late it arrives — so a position
+// really does walk 3 → 4, and unexplained that reads as a bug in this CLI.
+func TestAccountPollExportExplainsAQueuePositionThatSlips(t *testing.T) {
+	noColorFlag, colorReady = true, false
+	defer func() { noColorFlag, colorReady = false, false }()
+
+	run := func(t *testing.T, replies []string) string {
+		t.Helper()
+		calls := 0
+		c := exportStub(t, func(w http.ResponseWriter, r *http.Request) {
+			i := calls
+			if i >= len(replies) {
+				i = len(replies) - 1
+			}
+			calls++
+			_, _ = w.Write([]byte(replies[i]))
+		})
+		return captureStderr(t, func() {
+			if _, err := accountPollExport(c, "e1", time.Millisecond, 0, true); err != nil {
+				t.Errorf("accountPollExport: %v", err)
+			}
+		})
+	}
+
+	t.Run("a position that gets worse is explained once", func(t *testing.T) {
+		out := run(t, []string{
+			`{"data":{"id":"e1","status":"queued","queue_position":3}}`,
+			`{"data":{"id":"e1","status":"queued","queue_position":4}}`,
+			`{"data":{"id":"e1","status":"queued","queue_position":5}}`,
+			`{"data":{"id":"e1","status":"completed","total_units":1,"done_units":1}}`,
+		})
+		if n := strings.Count(out, accountExportQueueSlipNote); n != 1 {
+			t.Errorf("the slip must be explained exactly once, got %d:\n%s", n, out)
+		}
+		if !strings.Contains(out, "4th in line") || !strings.Contains(out, "5th in line") {
+			t.Errorf("every position change should still be reported:\n%s", out)
+		}
+	})
+
+	t.Run("a position that only improves is not explained", func(t *testing.T) {
+		out := run(t, []string{
+			`{"data":{"id":"e1","status":"queued","queue_position":3}}`,
+			`{"data":{"id":"e1","status":"queued","queue_position":2}}`,
+			`{"data":{"id":"e1","status":"queued","queue_position":1}}`,
+			`{"data":{"id":"e1","status":"completed","total_units":1,"done_units":1}}`,
+		})
+		if strings.Contains(out, accountExportQueueSlipNote) {
+			t.Errorf("nothing moved ahead of this export:\n%s", out)
+		}
+	})
+
+	t.Run("a position that holds still is reported once", func(t *testing.T) {
+		out := run(t, []string{
+			`{"data":{"id":"e1","status":"queued","queue_position":2}}`,
+			`{"data":{"id":"e1","status":"queued","queue_position":2}}`,
+			`{"data":{"id":"e1","status":"completed","total_units":1,"done_units":1}}`,
+		})
+		if n := strings.Count(out, "2nd in line"); n != 1 {
+			t.Errorf("an unchanged queue position must not scroll, got %d:\n%s", n, out)
+		}
+		if strings.Contains(out, accountExportQueueSlipNote) {
+			t.Errorf("nothing slipped:\n%s", out)
+		}
+	})
+}
+
+// TestAccountExportListFooters covers the verb the list ends on. This command is
+// the way back for someone who closed their terminal, so by the time they run it
+// the export they came for has usually finished — and telling them to POLL a
+// ready archive reads as though it is not there yet, on the one screen whose job
+// is to hand it over.
+func TestAccountExportListFooters(t *testing.T) {
+	rows := func(statuses ...string) []json.RawMessage {
+		out := make([]json.RawMessage, 0, len(statuses))
+		for i, s := range statuses {
+			out = append(out, json.RawMessage(fmt.Sprintf(`{"id":"e%d","status":%q}`, i, s)))
+		}
+		return out
+	}
+
+	cases := []struct {
+		name string
+		in   []json.RawMessage
+		want []string
+	}{
+		{
+			name: "a ready archive is downloaded, not polled",
+			in:   rows("completed"),
+			want: []string{"Download one with: harbor account export-status <id> --download ."},
+		},
+		{
+			name: "an unfinished export is still polled",
+			in:   rows("queued"),
+			want: []string{"Poll one with: harbor account export-status <id>"},
+		},
+		{
+			name: "one of each gets both, download first",
+			in:   rows("completed", "running"),
+			want: []string{
+				"Download one with: harbor account export-status <id> --download .",
+				"Poll one with: harbor account export-status <id>",
+			},
+		},
+		{
+			name: "nothing to download and nothing coming",
+			in:   rows("failed", "expired", "deleted"),
+			want: []string{"Start a new one with: harbor account export"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := accountExportListFooters(tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("footers = %q, want %q", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("footer %d = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+
+	// And the wiring: the rendered table must actually end on the chosen line.
+	out := captureStdout(t, func() {
+		displayExportList([]byte(`{"data":[{"id":"e1","format":"enex","status":"completed","completed_at":1749744400000,"result_expires_at":1750003600000}]}`))
+	})
+	if !strings.Contains(out, "Download one with") {
+		t.Errorf("a list holding only a ready archive must offer the download:\n%s", out)
+	}
+	if strings.Contains(out, "Poll one with") {
+		t.Errorf("nothing in this list is still building:\n%s", out)
+	}
+}
+
+// TestAccountExportNextStepLeadsWithTheCommand pins the ORDER inside the line, not
+// just its content. The email is the half of the promise this CLI cannot vouch
+// for — a delivery failure is swallowed and logged server-side, an instance with
+// no mailer wired sends nothing, and an export deleted mid-build sends nothing —
+// so a reader whose plan is "wait for the email" can be left with no move at all.
+// The command has to come first, and has to be the thing described as reliable.
+func TestAccountExportNextStepLeadsWithTheCommand(t *testing.T) {
+	cmdAt := strings.Index(accountExportNextStep, "harbor account exports")
+	mailAt := strings.Index(strings.ToLower(accountExportNextStep), "email")
+	if cmdAt < 0 || mailAt < 0 {
+		t.Fatalf("the next-step line must name both routes: %q", accountExportNextStep)
+	}
+	if cmdAt > mailAt {
+		t.Errorf("the reliable route must come first, got: %q", accountExportNextStep)
+	}
+	// The point of the line is that the command does not depend on the mail.
+	if !strings.Contains(accountExportNextStep, "whether or not the email arrives") {
+		t.Errorf("the line must not leave the reader's plan resting on the email: %q", accountExportNextStep)
 	}
 }
