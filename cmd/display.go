@@ -364,6 +364,15 @@ func stripHTML(s string) string {
 	return strings.TrimSpace(out)
 }
 
+// pluralize returns singular when n == 1, otherwise plural — so a count and its
+// noun agree in a message the user reads ("1 note" / "2 notes").
+func pluralize(n int, singular, plural string) string {
+	if n == 1 {
+		return singular
+	}
+	return plural
+}
+
 // boolMark renders a boolean as a compact check/dot glyph (green/dim).
 func boolMark(b bool) string {
 	if b {

@@ -65,8 +65,11 @@ the file — use --notebook to force them into an existing (non-encrypted) one.`
 		// table renderer can print the right follow-up hint. printResult passes
 		// only the body, so the status rides along in a package-level var.
 		importEnexAsync = status == http.StatusAccepted
+		// Counters first, then fail if notes were lost: what imported and what
+		// did not is the answer the user came for, and it stays on stdout on
+		// both paths (same shape as 'harbor sync push' and 'harbor status').
 		printResult(data, displayImportJob)
-		return nil
+		return importJobFailure(data)
 	},
 }
 
@@ -178,7 +181,7 @@ GDPR archive, also includes notes sitting in the TRASH.
 			fmt.Printf("Wrote %s to %s\n", bytesHuman(float64(n)), out)
 			if skip := importExportSkipCount(skipped); skip > 0 {
 				fmt.Printf("%s %d encrypted %s skipped (no key on the server)\n",
-					dim("note:"), skip, importExportPluralize(skip, "note", "notes"))
+					dim("note:"), skip, pluralize(skip, "note", "notes"))
 			}
 		}
 		return nil
@@ -210,6 +213,47 @@ func mapImportExportError(err error) error {
 // follow-up hint. printResult only forwards the response body, so the status is
 // threaded through this package-level var.
 var importEnexAsync bool
+
+// importJobFailure reports an inline import that did not import everything, so
+// the exit code says so.
+//
+// An import answers 201/202 whether it imported every note or none of them —
+// the outcome lives in the body's counters — so without this, an import that
+// dropped every note on the floor exits 0 and a script moves on believing the
+// data is in Harbor. The API's own vocabulary decides: `failed` (including a
+// truncated read) and `partial` (the file was read, some notes failed) both
+// mean notes were lost, and failed_notes catches a server that reports the
+// count without moving off `completed`.
+//
+// An ENQUEUED import (202, `queued`/`running`/`awaiting_upload`) has not failed
+// at anything yet — it has not run — so it stays a success; the job id is
+// printed and 'harbor import status' is where its outcome is judged.
+func importJobFailure(data []byte) error {
+	j := parseJSON(client.UnwrapData(data))
+	if j == nil {
+		return nil
+	}
+	status := str(j, "status")
+	failed := int(num(j, "failed_notes"))
+	if status != "failed" && status != "partial" && failed <= 0 {
+		return nil
+	}
+
+	total, imported := int(num(j, "total_notes")), int(num(j, "imported_notes"))
+	msg := fmt.Sprintf("the import did not finish cleanly (status %s): %d of %d %s imported",
+		status, imported, total, pluralize(total, "note", "notes"))
+	details := map[string]any{}
+	if failed > 0 {
+		details["failed_notes"] = failed
+	}
+	if skipped := int(num(j, "skipped_notes")); skipped > 0 {
+		details["skipped_notes"] = skipped
+	}
+	if id := str(j, "import_job_id"); id != "" {
+		details["per-note reasons"] = "harbor import status " + id
+	}
+	return &client.APIError{Code: "import_incomplete", Message: msg, Details: details}
+}
 
 // filepathBase returns the final element of a path. It is a thin wrapper kept
 // local to this domain so the file does not depend on importing path/filepath
@@ -259,14 +303,6 @@ func importExportSkipCount(header string) int {
 		return 0
 	}
 	return n
-}
-
-// importExportPluralize returns singular when n == 1, otherwise plural.
-func importExportPluralize(n int, singular, plural string) string {
-	if n == 1 {
-		return singular
-	}
-	return plural
 }
 
 // ===========================================================================

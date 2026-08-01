@@ -117,10 +117,110 @@ const (
 // API errors) to stderr and exits with the matching code, without calling
 // os.Exit inside RunE.
 func Execute() {
+	prepareCommandTree()
 	if err := rootCmd.Execute(); err != nil {
 		renderError(err)
 		os.Exit(exitCodeFor(err))
 	}
+}
+
+// prepareCommandTree finishes assembling the command tree just before it runs.
+// It is separate from Execute so a test can drive the identical tree, rather
+// than a slightly different one that happens to pass.
+//
+// Cobra grows its own `help` and `completion` commands during Execute;
+// materializing them here first means the argument contract covers them too.
+// Both calls are no-ops once the command exists, so cobra's own call inside
+// Execute changes nothing, and calling this twice is harmless.
+func prepareCommandTree() {
+	rootCmd.InitDefaultHelpCmd()
+	rootCmd.InitDefaultCompletionCmd(os.Args[1:]...)
+	enforceArgContract(rootCmd)
+}
+
+// enforceArgContract walks the command tree and closes the two ways a command
+// could be handed input it does not understand and still exit 0 — the worst
+// failure mode a CLI has, because a wrapper script cannot detect it at all.
+//
+//  1. A parent that only groups subcommands (`harbor files`) has no action of
+//     its own, so cobra considers it un-runnable and prints its help the moment
+//     it is reached — including when the subcommand the user asked for does not
+//     exist. `harbor files delete` printed the files help and exited 0, which is
+//     how a shell probe concluded that command existed (#69). Cobra checks
+//     Runnable() BEFORE it validates arguments, so an Args validator alone
+//     cannot fix this; the parent has to become runnable first. Its action
+//     keeps the help for a bare `harbor files` and fails on anything else.
+//
+//  2. A command that never declared an Args validator accepts arbitrary
+//     positional arguments and silently drops them, so `harbor tags list
+//     receipts` lists every tag and exits 0 as though it had filtered. Every
+//     command that genuinely takes positional arguments declares its own
+//     validator (cobra.ExactArgs and friends), so a nil one means "takes none".
+//
+// Doing it here, once, is what keeps it true: a domain file that forgets either
+// rule still gets both, including commands added long after this was written.
+// The `help` command is the one exception — its arguments are a command path.
+func enforceArgContract(cmd *cobra.Command) {
+	for _, sub := range cmd.Commands() {
+		enforceArgContract(sub)
+	}
+	if cmd.Name() == "help" {
+		return
+	}
+	if cmd.HasSubCommands() && !cmd.Runnable() {
+		cmd.RunE = runParentCommand
+		// The action exists only to print help or refuse an unknown
+		// subcommand, so keep it out of the usage line: `harbor files` is a
+		// real invocation, `harbor files [flags]` is not.
+		cmd.DisableFlagsInUseLine = true
+		return
+	}
+	if cmd.Args == nil {
+		cmd.Args = cobra.NoArgs
+	}
+}
+
+// runParentCommand is the action given to every command that exists only to
+// group subcommands. No arguments means the user asked what lives here, so the
+// help is the answer and the command succeeded; anything else names a
+// subcommand that does not exist, which is a usage error like any other bad
+// flag — exit 1, and nothing on stdout for a pipe to mistake for output. The
+// message deliberately matches the one cobra produces for an unknown top-level
+// command, so `harbor bogus` and `harbor files bogus` read identically.
+func runParentCommand(cmd *cobra.Command, args []string) error {
+	if len(args) == 0 {
+		return cmd.Help()
+	}
+	return errors.New(unknownSubcommandMessage(cmd, args[0]))
+}
+
+// unknownSubcommandMessage builds the "unknown command" text for a subcommand
+// that does not exist, character-for-character like cobra's own — including the
+// "Did you mean this?" block, whose Levenshtein threshold cobra only defaults
+// lazily on the path this one replaces.
+func unknownSubcommandMessage(cmd *cobra.Command, name string) string {
+	msg := fmt.Sprintf("unknown command %q for %q", name, cmd.CommandPath())
+	if cmd.DisableSuggestions {
+		return msg
+	}
+	if cmd.SuggestionsMinimumDistance <= 0 {
+		cmd.SuggestionsMinimumDistance = 2
+	}
+	suggestions := cmd.SuggestionsFor(name)
+	if len(suggestions) == 0 {
+		return msg
+	}
+	return msg + "\n\nDid you mean this?\n\t" + strings.Join(suggestions, "\n\t") + "\n"
+}
+
+// exitCoder is an error that has already decided which exit code it deserves.
+// Almost nothing implements it — exitCodeFor classifies from the error itself,
+// which is what keeps the codes consistent — but a failure the server reported
+// INSIDE a 200 (sync push refusing individual changes) knows something no error
+// envelope can express on its own.
+type exitCoder interface {
+	error
+	ExitCode() int
 }
 
 // exitCodeFor classifies an error into one of the documented exit codes. It
@@ -129,6 +229,10 @@ func Execute() {
 func exitCodeFor(err error) int {
 	if err == nil {
 		return exitOK
+	}
+	var coded exitCoder
+	if errors.As(err, &coded) {
+		return coded.ExitCode()
 	}
 	if isPlanLimitError(err) {
 		return exitPlanLimit

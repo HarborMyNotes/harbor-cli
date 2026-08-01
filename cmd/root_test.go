@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/HarborMyNotes/harbor-cli/client"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -164,6 +165,7 @@ func runCLI(t *testing.T, m *apiMock, args ...string) (string, error) {
 	t.Setenv("HARBOR_API_URL", m.baseURL())
 	t.Setenv("HARBOR_TOKEN", "hbp_test-token-not-a-real-credential")
 	resetCommandState(t)
+	prepareCommandTree()
 
 	rootCmd.SetArgs(args)
 	var err error
@@ -352,5 +354,133 @@ func TestHTTPErrorIsNotMistakenForANetworkFailure(t *testing.T) {
 	}
 	if got := exitCodeFor(err); got != exitError {
 		t.Errorf("exit code = %d, want %d", got, exitError)
+	}
+}
+
+// ===========================================================================
+// The argument contract (#69 F4)
+// ===========================================================================
+//
+// A command that accepts input it does not understand and still exits 0 is the
+// worst failure a CLI has: a wrapper script cannot detect it at all. These pin
+// both halves — a subcommand that does not exist must fail, and a bare parent
+// must still answer with its help.
+
+// TestUnknownSubcommandFailsInsteadOfPrintingHelp is the regression for the
+// reported bug: `harbor files delete` printed the files help and exited 0, so a
+// shell probe concluded the command existed.
+func TestUnknownSubcommandFailsInsteadOfPrintingHelp(t *testing.T) {
+	for _, args := range [][]string{
+		{"files", "delete"},
+		{"notes", "bogus"},
+		{"profile", "inbound-email", "bogus"},
+	} {
+		m := newAPIMock(t, map[string]mockReply{})
+		out, err := runCLI(t, m, args...)
+		if err == nil {
+			t.Fatalf("%v: an unknown subcommand must not exit 0", args)
+		}
+		if got := exitCodeFor(err); got != exitError {
+			t.Errorf("%v: exit code = %d, want %d (same as any other bad usage)", args, got, exitError)
+		}
+		if !strings.Contains(err.Error(), "unknown command") {
+			t.Errorf("%v: message = %q, want an unknown-command error", args, err.Error())
+		}
+		if out != "" {
+			t.Errorf("%v: a failure must print nothing on stdout, got:\n%s", args, out)
+		}
+		if len(m.calls()) != 0 {
+			t.Errorf("%v: nothing should have been sent to the API, got %v", args, m.calls())
+		}
+	}
+}
+
+// TestBareParentCommandStillPrintsItsHelp guards the other direction: asking
+// what lives under a parent is a legitimate question with a successful answer.
+func TestBareParentCommandStillPrintsItsHelp(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{})
+	out, err := runCLI(t, m, "files")
+	if err != nil {
+		t.Fatalf("`harbor files` must still succeed: %v", err)
+	}
+	if !strings.Contains(out, "Available Commands:") || !strings.Contains(out, "upload") {
+		t.Errorf("`harbor files` should print its help:\n%s", out)
+	}
+}
+
+// TestStrayPositionalArgumentIsRefused covers the quieter half of the same bug:
+// a command that never declared an Args validator silently dropped positional
+// arguments, so `harbor tags list receipts` listed every tag and exited 0 as
+// though it had filtered.
+func TestStrayPositionalArgumentIsRefused(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{})
+	out, err := runCLI(t, m, "tags", "list", "receipts")
+	if err == nil {
+		t.Fatal("a stray positional argument must not be silently ignored")
+	}
+	if out != "" {
+		t.Errorf("nothing should reach stdout, got:\n%s", out)
+	}
+	if len(m.calls()) != 0 {
+		t.Errorf("the request must not be sent at all, got %v", m.calls())
+	}
+}
+
+// TestEveryCommandDeclaresItsArgumentContract is the rule rather than the
+// instances: after the tree is prepared, no command is left in the state that
+// caused this bug — un-runnable with subcommands, or silently accepting any
+// positional argument. It is what keeps a command added next year covered.
+func TestEveryCommandDeclaresItsArgumentContract(t *testing.T) {
+	prepareCommandTree()
+	var walk func(c *cobra.Command)
+	walk = func(c *cobra.Command) {
+		for _, sub := range c.Commands() {
+			walk(sub)
+		}
+		// `help` takes a command path, which is exactly why it is exempt.
+		if c.Name() == "help" {
+			return
+		}
+		if c.HasSubCommands() && !c.Runnable() {
+			t.Errorf("%s groups subcommands but has no action, so an unknown subcommand exits 0", c.CommandPath())
+		}
+		if c.Args == nil {
+			t.Errorf("%s accepts arbitrary positional arguments and ignores them", c.CommandPath())
+		}
+	}
+	walk(rootCmd)
+}
+
+// TestUnknownSubcommandMessageMatchesCobra keeps one voice for one mistake: the
+// text for `harbor files bogus` is the text cobra prints for `harbor bogus`,
+// suggestion block included, so a person (or a script reading stderr) sees the
+// same thing whichever level the typo was on.
+func TestUnknownSubcommandMessageMatchesCobra(t *testing.T) {
+	prepareCommandTree()
+	notes, _, err := rootCmd.Find([]string{"notes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := unknownSubcommandMessage(notes, "lst")
+	if !strings.HasPrefix(msg, `unknown command "lst" for "harbor notes"`) {
+		t.Errorf("message = %q", msg)
+	}
+	if !strings.Contains(msg, "Did you mean this?") || !strings.Contains(msg, "\tlist") {
+		t.Errorf("a near-miss should suggest the real command: %q", msg)
+	}
+	if got := unknownSubcommandMessage(notes, "zzzzzzzz"); strings.Contains(got, "Did you mean") {
+		t.Errorf("nothing is close to %q, so no suggestion block: %q", "zzzzzzzz", got)
+	}
+}
+
+// TestExitCoderDecidesItsOwnCode pins the seam sync push relies on: an error
+// that knows its own code outranks the generic classification.
+func TestExitCoderDecidesItsOwnCode(t *testing.T) {
+	err := &syncPushRejectedError{APIError: &client.APIError{Code: "sync_push_rejected", Message: "refused"}, planLimit: true}
+	if got := exitCodeFor(err); got != exitPlanLimit {
+		t.Errorf("exit code = %d, want %d", got, exitPlanLimit)
+	}
+	if got := exitCodeFor(fmt.Errorf("wrapped: %w", err)); got != exitPlanLimit {
+		t.Errorf("wrapped exit code = %d, want %d", got, exitPlanLimit)
 	}
 }

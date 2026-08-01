@@ -309,3 +309,13 @@ func TestRenderErrorRoutesPlanLimitsToTheirOwnExplanation(t *testing.T) {
 		t.Errorf("the gate's internals were dumped at the user:\n%s", errOut)
 	}
 }
+
+// TestPluralize verifies singular/plural selection.
+func TestPluralize(t *testing.T) {
+	if pluralize(1, "note", "notes") != "note" {
+		t.Error("n=1 should be singular")
+	}
+	if pluralize(2, "note", "notes") != "notes" {
+		t.Error("n=2 should be plural")
+	}
+}

@@ -5,6 +5,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -139,32 +140,126 @@ func TestMapSyncError(t *testing.T) {
 	}
 }
 
-// TestDisplaySyncPushExplainsPlanLimitRejections covers the one create path
-// that cannot fail loudly: push answers 200 even when the server refused
-// individual changes, so without this the rejection is just a raw error code in
-// one row's NOTE column and the push reads as a success.
-func TestDisplaySyncPushExplainsPlanLimitRejections(t *testing.T) {
+// ===========================================================================
+// A push the server refused (#69 F3)
+// ===========================================================================
+//
+// sync push is the only write in the CLI that cannot fail loudly: the endpoint
+// answers 200 and reports each change's outcome inside the body, so before this
+// a push where every change was refused exited 0 and a wrapper script could not
+// tell it apart from a clean push.
+
+// TestSyncPushRejectionFlagsAPlanLimit pins both halves of a plan-limit
+// refusal: it is an error at all, and it carries the code that tells a script
+// retrying will never help.
+func TestSyncPushRejectionFlagsAPlanLimit(t *testing.T) {
 	t.Setenv("HARBOR_API_URL", "https://harbor.example/api/v1")
-	body := `{"results":[
+	body := []byte(`{"results":[
 	  {"change_id":"c1","type":"note","id":"n1","status":"applied","new_usn":11},
 	  {"change_id":"c2","type":"note","id":"n2","status":"rejected","error":"plan_limit_reached"}
-	],"scope_max_usn":11}`
+	],"scope_max_usn":11}`)
 
-	out := captureStdout(t, func() { displaySyncPush([]byte(body)) })
-	if !strings.Contains(out, "plan limit") {
-		t.Errorf("a plan-limit rejection was not explained:\n%s", out)
+	err := syncPushRejection(body)
+	if err == nil {
+		t.Fatal("a refused change must be an error, not a silent success")
 	}
-	if !strings.Contains(out, "https://harbor.example/settings/plan") {
-		t.Errorf("no upgrade pointer after a refused push:\n%s", out)
+	if got := exitCodeFor(err); got != exitPlanLimit {
+		t.Errorf("exit code = %d, want %d (plan limit)", got, exitPlanLimit)
+	}
+	msg := err.Error()
+	for _, want := range []string{"refused 1 of the 2 changes", "plan limit", "harbor usage", "https://harbor.example/settings/plan"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message %q missing %q", msg, want)
+		}
+	}
+
+	// It has to render and JSON-encode like every other failure, which is what
+	// the wrapped envelope buys.
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatal("the error must unwrap to an *client.APIError so it renders like any other")
+	}
+	if apiErr.Code != syncPushRejectedCode {
+		t.Errorf("code = %q, want %q", apiErr.Code, syncPushRejectedCode)
+	}
+	if got := apiErr.Details["c2"]; got != "plan_limit_reached" {
+		t.Errorf("details must name the refused change by its change_id: %v", apiErr.Details)
 	}
 }
 
-// TestDisplaySyncPushStaysQuietWhenNothingWasRefused keeps the notice honest:
-// a clean push must not print a limit warning.
-func TestDisplaySyncPushStaysQuietWhenNothingWasRefused(t *testing.T) {
-	body := `{"results":[{"change_id":"c1","type":"note","id":"n1","status":"applied","new_usn":11}],"scope_max_usn":11}`
-	out := captureStdout(t, func() { displaySyncPush([]byte(body)) })
-	if strings.Contains(out, "plan limit") {
-		t.Errorf("a clean push warned about plan limits:\n%s", out)
+// TestSyncPushRejectionWithoutAPlanLimitIsAnOrdinaryFailure keeps the dedicated
+// code honest: 4 means "your account said no", so any other refusal is a 1.
+func TestSyncPushRejectionWithoutAPlanLimitIsAnOrdinaryFailure(t *testing.T) {
+	body := []byte(`{"results":[{"change_id":"c1","type":"note","id":"n1","status":"rejected","error":"note_too_large"}]}`)
+	err := syncPushRejection(body)
+	if err == nil {
+		t.Fatal("a refused change must be an error")
+	}
+	if got := exitCodeFor(err); got != exitError {
+		t.Errorf("exit code = %d, want %d", got, exitError)
+	}
+	if !strings.Contains(err.Error(), "refused 1 of the 1 change") {
+		t.Errorf("message should count the refusals: %q", err.Error())
+	}
+}
+
+// TestSyncPushRejectionIgnoresAppliedAndConflicted is the other half of the
+// contract. A conflict is not a refusal: the change did not apply, but the
+// server handed back the record needed to resolve it, which is a routine step
+// of the sync protocol rather than a failed command.
+func TestSyncPushRejectionIgnoresAppliedAndConflicted(t *testing.T) {
+	cases := map[string]string{
+		"all applied": `{"results":[{"change_id":"c1","status":"applied","new_usn":11}]}`,
+		"a conflict":  `{"results":[{"change_id":"c1","status":"conflict","server_record":{"id":"n1"}}]}`,
+		"no results":  `{"results":[],"scope_max_usn":11}`,
+		"not JSON":    `<html>nope</html>`,
+	}
+	for name, body := range cases {
+		if err := syncPushRejection([]byte(body)); err != nil {
+			t.Errorf("%s: want no error, got %v", name, err)
+		}
+	}
+}
+
+// TestSyncPushCommandExitsNonZeroAndStillPrintsResults is the end-to-end
+// regression: the whole command, not the helper. The results have to stay on
+// stdout — they are how a client learns which USNs landed and which changes to
+// re-resolve — while the exit code says the push did not fully succeed.
+func TestSyncPushCommandExitsNonZeroAndStillPrintsResults(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"POST /api/v1/sync/push": {Status: 200, Body: `{"scope_max_usn":11,"results":[
+		  {"change_id":"c1","type":"note","id":"n1","status":"applied","new_usn":11},
+		  {"change_id":"c2","type":"note","id":"n2","status":"rejected","error":"plan_limit_reached"}
+		]}`},
+	})
+	file := t.TempDir() + "/changes.json"
+	if err := os.WriteFile(file, []byte(`[{"type":"note","id":"n2","change_id":"c2","record":{"id":"n2"}}]`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runCLI(t, m, "sync", "push", "--file", file, "--device-id", "cli-test", "--scope-id", "u1")
+	if err == nil {
+		t.Fatal("a push the server refused must not exit 0")
+	}
+	if got := exitCodeFor(err); got != exitPlanLimit {
+		t.Errorf("exit code = %d, want %d", got, exitPlanLimit)
+	}
+	if !strings.Contains(out, "rejected") || !strings.Contains(out, "c2") {
+		t.Errorf("the per-change results must still be printed — a client reconciles from them:\n%s", out)
+	}
+}
+
+// TestSyncPushCommandExitsZeroWhenEverythingApplied guards the other direction:
+// the new exit code must not turn a clean push into a failure.
+func TestSyncPushCommandExitsZeroWhenEverythingApplied(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"POST /api/v1/sync/push": {Status: 200, Body: `{"scope_max_usn":11,"results":[{"change_id":"c1","type":"note","id":"n1","status":"applied","new_usn":11}]}`},
+	})
+	file := t.TempDir() + "/changes.json"
+	if err := os.WriteFile(file, []byte(`[{"type":"note","id":"n1","change_id":"c1","record":{"id":"n1"}}]`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runCLI(t, m, "sync", "push", "--file", file, "--device-id", "cli-test", "--scope-id", "u1"); err != nil {
+		t.Fatalf("a clean push must exit 0: %v", err)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
 	"github.com/HarborMyNotes/harbor-cli/config"
@@ -61,7 +62,13 @@ var syncPullCmd = &cobra.Command{
 var syncPushCmd = &cobra.Command{
 	Use:   "push",
 	Short: "Push local change envelopes from a JSON file or stdin",
-	Long:  "Upload a batch of change envelopes. --file is a JSON array of envelopes (or an object with a \"changes\" array). Use --file - to read stdin.",
+	Long: `Upload a batch of change envelopes. --file is a JSON array of envelopes (or an object with a "changes" array). Use --file - to read stdin.
+
+The server answers 200 and reports each change's outcome individually, so the
+results are printed either way and the exit code says whether they all landed:
+0 when none were refused, 4 when a refusal was a plan limit, and 1 for any other
+refusal. A conflict is not a refusal — the change is not applied, but the
+server_record you need to resolve it comes back in the results, so that stays 0.`,
 	Example: `  harbor sync push --file changes.json
   cat changes.json | harbor sync push --file -`,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -85,8 +92,12 @@ var syncPushCmd = &cobra.Command{
 		if err != nil {
 			return mapSyncError(err)
 		}
+		// Print the results first, then fail on any refusal: the per-change
+		// results are how a client reconciles (which USNs landed, which changes
+		// to re-resolve), so they are output even on the failing path — exactly
+		// as 'harbor status' prints its readiness table before exiting non-zero.
 		printResult(data, displaySyncPush)
-		return nil
+		return syncPushRejection(data)
 	},
 }
 
@@ -324,6 +335,102 @@ func mapSyncError(err error) error {
 	return err
 }
 
+// syncPushRejectedCode is the CLI-side error code for a push the server
+// answered 200 to but refused changes inside. It is not an API code — no such
+// envelope exists on the wire — so it is named for what it describes and kept
+// stable, because a script branching on it has nothing else to branch on.
+const syncPushRejectedCode = "sync_push_rejected"
+
+// syncPushRejectedError is a push whose changes the server refused. It wraps a
+// normal error envelope (so it renders and JSON-encodes like every other
+// failure) and adds the one thing the envelope cannot carry: whether an
+// entitlement gate was the cause, which decides between exit 4 and exit 1.
+type syncPushRejectedError struct {
+	*client.APIError
+	// planLimit is true when at least one refusal was plan_limit_reached.
+	planLimit bool
+}
+
+// Unwrap exposes the wrapped envelope so errors.As finds it — that is what
+// gives this error the standard rendering and the --json error shape.
+func (e *syncPushRejectedError) Unwrap() error { return e.APIError }
+
+// ExitCode reports which documented code this failure deserves. A refusal by an
+// entitlement gate is the same wall as a REST plan_limit_reached — the account
+// said no and retrying will never help — so it gets the same 4 no matter which
+// endpoint hit it. Any other refusal is an ordinary failure: 1.
+func (e *syncPushRejectedError) ExitCode() int {
+	if e.planLimit {
+		return exitPlanLimit
+	}
+	return exitError
+}
+
+// syncPushRejection turns the refusals a push reports inside a 200 into a real
+// error, so the exit code matches what actually happened.
+//
+// Push is the only write in the CLI that cannot fail loudly: the endpoint
+// applies each change in its own transaction and reports the outcome per
+// change, so a batch where the server refused EVERY change still comes back
+// 200. Exiting 0 there is the worst answer available — a wrapper script cannot
+// tell "pushed everything" from "pushed nothing" and carries on as if the work
+// happened.
+//
+// Only status "rejected" counts. A "conflict" is not a refusal: the change did
+// not apply, but that is a defined, routine outcome of the sync protocol whose
+// resolution (take server_record, write a conflict copy, push again) is handed
+// to the client in the same response. Failing on it would make an ordinary sync
+// loop look broken.
+func syncPushRejection(data []byte) error {
+	results := toSlice(parseJSON(data)["results"])
+	details := map[string]any{}
+	planLimit := false
+	for _, r := range results {
+		if str(r, "status") != "rejected" {
+			continue
+		}
+		reason := str(r, "error")
+		if reason == "" {
+			reason = "rejected"
+		}
+		if reason == planLimitCode {
+			planLimit = true
+		}
+		details[syncPushChangeLabel(r)] = reason
+	}
+	if len(details) == 0 {
+		return nil
+	}
+
+	msg := fmt.Sprintf("the server refused %d of the %d %s in this push",
+		len(details), len(results), pluralize(len(results), "change", "changes"))
+	if planLimit {
+		// The refusal carries the bare wire code and nothing else — no
+		// resource, no counts — so this says only what is true. 'harbor usage'
+		// is where the numbers actually are.
+		msg += " — your account is at a plan limit, so those creates were rejected. " +
+			"Run 'harbor usage' to see which limit, or upgrade at " + upgradeURL("")
+	}
+	return &syncPushRejectedError{
+		APIError:  &client.APIError{Code: syncPushRejectedCode, Message: msg, Details: details},
+		planLimit: planLimit,
+	}
+}
+
+// syncPushChangeLabel names a refused change for the error details. The
+// change_id is the client's own handle on it — the thing it can look up in the
+// batch it just sent — so that is the key, falling back to type/id for a
+// server that omitted it.
+func syncPushChangeLabel(r map[string]any) string {
+	if id := str(r, "change_id"); id != "" {
+		return id
+	}
+	if t, id := str(r, "type"), str(r, "id"); t != "" || id != "" {
+		return strings.TrimSpace(t + " " + id)
+	}
+	return "change"
+}
+
 // ===========================================================================
 // Display
 // ===========================================================================
@@ -382,25 +489,6 @@ func displaySyncPush(data []byte) {
 	}
 	printTable(headers, rows)
 	fmt.Printf("%s scope_max_usn: %s\n", dim("→"), trimFloat(num(root, "scope_max_usn")))
-	// A push answers 200 even when the server refused individual changes, so a
-	// plan limit here shows up as a code buried in one row's NOTE column. Say
-	// what it means, or the push looks like it worked.
-	if syncPushHitPlanLimit(results) {
-		fmt.Println(redWarn("Some changes were refused: ") + "your account is at a plan limit, so those creates were rejected (the rest went through).")
-		fmt.Println("Run 'harbor usage' to see which limit, or upgrade at " + bold(upgradeURL("")) + ".")
-	}
-}
-
-// syncPushHitPlanLimit reports whether any pushed change was rejected by an
-// entitlement gate. The push endpoint reports per-change failures inside a 200,
-// so this is the only place the CLI can notice.
-func syncPushHitPlanLimit(results []map[string]any) bool {
-	for _, r := range results {
-		if str(r, "error") == planLimitCode {
-			return true
-		}
-	}
-	return false
 }
 
 // displaySyncDevices prints the device list plus scope/GC info.
