@@ -10,7 +10,7 @@ class Harbor < Formula
   desc "Command-line client for the Harbor notes API"
   homepage "https://github.com/HarborMyNotes/harbor-cli"
   license "MIT"
-  version "0.1.14"
+  version "0.1.15"
 
   if OS.mac? && Hardware::CPU.arm?
     url "https://github.com/HarborMyNotes/harbor-cli/releases/latest/download/harbor-darwin-arm64"
