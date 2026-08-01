@@ -314,6 +314,10 @@ export HARBOR_PASSPHRASE=$(op read "op://Vault/Harbor/passphrase")   # 1Password
 Write flags on `harbor notes create`: `--encrypt` (force, needs the passphrase),
 `--plaintext` (force off). Notes:
 
+- **Creating in a `default_encrypt` notebook requires `HARBOR_PASSPHRASE`.** Without
+  it the create **fails and writes nothing**, rather than quietly landing a plaintext
+  note there. This covers the account default notebook when it carries the flag.
+  `--plaintext` is the sanctioned way to create an unencrypted note there anyway.
 - Decryption is automatic on `notes get/list`, `trash list`, `reminders list`.
   A wrong/absent passphrase shows ciphertext (`[encrypted]`), never an error.
 - `notes update` re-seals an already-encrypted note; it refuses to write plaintext

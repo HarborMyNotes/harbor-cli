@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 
@@ -18,6 +19,19 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
+
+// TestMain clears the environment the CLI reads before any test runs. `go test`
+// inherits the developer's shell, and the documented way to use this CLI is to
+// export HARBOR_PASSPHRASE from a secret manager — so on a working machine the
+// suite would otherwise run with encryption quietly switched ON, and take
+// different branches than it takes in CI. Tests that want any of these set them
+// with t.Setenv, which still wins.
+func TestMain(m *testing.M) {
+	for _, key := range []string{"HARBOR_PASSPHRASE", "HARBOR_NEW_PASSPHRASE", "HARBOR_TOKEN", "HARBOR_API_URL"} {
+		_ = os.Unsetenv(key)
+	}
+	os.Exit(m.Run())
+}
 
 // ===========================================================================
 // RunE execution harness
@@ -285,7 +299,13 @@ func TestPlanLimitedCreateExitsWithThePlanLimitCode(t *testing.T) {
 func TestReadOnlyAccountExitsWithThePlanLimitCode(t *testing.T) {
 	body := `{"error":{"code":"plan_limit_reached","message":"Your account is read-only.",
 	  "details":{"gate":"account_read_only","reason":"account_read_only","plan_code":"starter"},"request_id":"req_test"}}`
-	m := newAPIMock(t, map[string]mockReply{"POST /api/v1/notes": {Status: 403, Body: body}})
+	// Every create now reads the destination notebook's default_encrypt first, so the
+	// account's notebooks have to be answerable even for a create that never lands.
+	m := newAPIMock(t, map[string]mockReply{
+		"POST /api/v1/notes": {Status: 403, Body: body},
+		"GET /api/v1/notebooks": {Status: 200, Body: `{"data":[{"id":"nb1","is_default":true,"default_encrypt":false}],` +
+			`"paging":{"limit":500,"offset":0,"total":1,"has_more":false}}`},
+	})
 
 	_, err := runCLI(t, m, "notes", "create", "--title", "Blocked", "--content", "x")
 	if err == nil {

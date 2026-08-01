@@ -203,13 +203,16 @@ func notebookPageMock(t *testing.T) *apiMock {
 func TestNotebookWantsEncryptionFindsADefaultPastTheFirstPage(t *testing.T) {
 	m := notebookPageMock(t)
 
-	wants, known := notebookWantsEncryption(client.NewClient(m.baseURL(), "tok"), "")
+	wants, known, name := notebookWantsEncryption(client.NewClient(m.baseURL(), "tok"), "")
 
 	if !known {
 		t.Fatal("the walk reached the default notebook but reported the answer as unknown")
 	}
 	if !wants {
 		t.Error("the default notebook asks for encryption and the lookup said no — it only read page 1")
+	}
+	if name != "Zed" {
+		t.Errorf("the notebook's name did not come back for the refusal message: %q", name)
 	}
 }
 
@@ -222,7 +225,7 @@ func TestNotebookWantsEncryptionStopsAtTheDefault(t *testing.T) {
 			`"paging":{"limit":500,"offset":0,"total":900,"has_more":true}}`},
 	})
 
-	if wants, known := notebookWantsEncryption(client.NewClient(m.baseURL(), "tok"), ""); !wants || !known {
+	if wants, known, _ := notebookWantsEncryption(client.NewClient(m.baseURL(), "tok"), ""); !wants || !known {
 		t.Fatalf("the default notebook on page 1 was not found: wants=%v known=%v", wants, known)
 	}
 	if len(m.calls()) != 1 {
@@ -242,27 +245,42 @@ func TestNotebookWantsEncryptionStopsAtTheDefault(t *testing.T) {
 // named-notebook one needs no unusual account at all, just a --notebook flag.
 
 // encryptDecisionCmd builds the flag set shouldEncryptCreate reads, so the decision
-// point can be exercised without the whole `notes create` command around it.
-func encryptDecisionCmd() *cobra.Command {
+// point can be exercised without the whole `notes create` command around it. Any
+// flag named in set is turned on.
+func encryptDecisionCmd(set ...string) *cobra.Command {
 	cmd := &cobra.Command{}
 	cmd.Flags().Bool("plaintext", false, "")
 	cmd.Flags().Bool("encrypt", false, "")
+	for _, name := range set {
+		_ = cmd.Flags().Set(name, "true")
+	}
 	return cmd
 }
 
-// decideEncrypt runs the real decision with encryption enabled, returning what it
-// chose and whatever it said about it.
-func decideEncrypt(t *testing.T, m *apiMock, notebookID string) (bool, string) {
+// runEncryptDecision runs the real decision with HARBOR_PASSPHRASE set to pass — an
+// empty pass being the "no passphrase" case, which is what passphraseFromEnv already
+// treats an empty value as. It returns the choice, the refusal (if any), and
+// whatever was said on stderr, and it never fails the test itself: half these cases
+// exist precisely to assert that an error WAS returned.
+func runEncryptDecision(t *testing.T, m *apiMock, notebookID, pass string, flags ...string) (bool, error, string) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
-	t.Setenv("HARBOR_PASSPHRASE", "pw")
+	t.Setenv("HARBOR_PASSPHRASE", pass)
 	resetSession()
 
 	var enc bool
 	var err error
 	warned := captureStderr(t, func() {
-		enc, err = shouldEncryptCreate(encryptDecisionCmd(), client.NewClient(m.baseURL(), "tok"), notebookID)
+		enc, err = shouldEncryptCreate(encryptDecisionCmd(flags...), client.NewClient(m.baseURL(), "tok"), notebookID)
 	})
+	return enc, err, warned
+}
+
+// decideEncrypt is runEncryptDecision for the cases that must not refuse: encryption
+// enabled, and a returned error is the test failing.
+func decideEncrypt(t *testing.T, m *apiMock, notebookID string) (bool, string) {
+	t.Helper()
+	enc, err, warned := runEncryptDecision(t, m, notebookID, "pw")
 	if err != nil {
 		t.Fatalf("shouldEncryptCreate: %v", err)
 	}
@@ -348,5 +366,294 @@ func TestNamedNotebookThatWantsEncryptionStillEncrypts(t *testing.T) {
 
 	if enc, _ := decideEncrypt(t, m, "nb1"); !enc {
 		t.Error("a notebook marked default_encrypt did not encrypt the note")
+	}
+}
+
+// ===========================================================================
+// No passphrase is not permission to ignore the notebook (#78)
+// ===========================================================================
+//
+// The notebook says every note in it is encrypted. HARBOR_PASSPHRASE is unset, so
+// this run CANNOT do that. The old answer was to write the note in the clear anyway
+// and say nothing — the notebook's setting spent as a "no" because the environment
+// could not honour it. The answer now is the same one --encrypt and the conversion
+// commands already give: stop, write nothing, and name both ways forward.
+
+// encryptingNotebookRoutes serves one named notebook that encrypts by default.
+func encryptingNotebookRoutes() map[string]mockReply {
+	return map[string]mockReply{
+		"GET /api/v1/notebooks/nb1": {Status: 200, Body: `{"id":"nb1","name":"Encrypted Testing","default_encrypt":true}`},
+	}
+}
+
+// The bug itself, on the branch anyone can reach with a --notebook flag.
+func TestCreateIntoAnEncryptingNotebookIsRefusedWithoutAPassphrase(t *testing.T) {
+	m := newAPIMock(t, encryptingNotebookRoutes())
+
+	enc, err, _ := runEncryptDecision(t, m, "nb1", "")
+
+	if err == nil {
+		t.Fatalf("a note went into an encrypt-by-default notebook with no passphrase and no complaint (encrypt=%v)", enc)
+	}
+	if enc {
+		t.Error("the refusal still asked for encryption it cannot perform")
+	}
+	// The message has to carry the user out of this, not just report it: the key to
+	// supply, and the flag that says "no, I meant plaintext".
+	for _, want := range []string{"Encrypted Testing", "encrypted by default", "HARBOR_PASSPHRASE", "--plaintext"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal never mentions %q:\n%v", want, err)
+		}
+	}
+}
+
+// The same rule when nobody named a notebook at all. The note still lands somewhere
+// — the account's default — and that notebook has the setting like any other. This
+// mock puts the default on the SECOND page, so it also proves the guard is reached
+// through the paged walk rather than only through a --notebook flag.
+func TestCreateIntoTheEncryptingDefaultNotebookIsRefusedWithoutAPassphrase(t *testing.T) {
+	m := notebookPageMock(t)
+
+	enc, err, _ := runEncryptDecision(t, m, "", "")
+
+	if err == nil {
+		t.Fatalf("the default notebook encrypts by default and took a plaintext note silently (encrypt=%v)", enc)
+	}
+	if !strings.Contains(err.Error(), "Zed") {
+		t.Errorf("the refusal does not name the default notebook it is talking about:\n%v", err)
+	}
+	if !strings.Contains(err.Error(), "--plaintext") {
+		t.Errorf("the refusal does not offer the escape hatch:\n%v", err)
+	}
+}
+
+// The other half of the pair: with the passphrase set, the very same notebook is
+// sealed exactly as before. The fix is a new refusal, not a new behaviour.
+func TestCreateIntoAnEncryptingNotebookStillSealsWithAPassphrase(t *testing.T) {
+	m := newAPIMock(t, encryptingNotebookRoutes())
+
+	enc, err, warned := runEncryptDecision(t, m, "nb1", "pw")
+
+	if err != nil {
+		t.Fatalf("a passphrase was set and the create was refused anyway: %v", err)
+	}
+	if !enc {
+		t.Error("a notebook marked default_encrypt did not encrypt the note")
+	}
+	if warned != "" {
+		t.Errorf("the ordinary encrypted create is not supposed to say anything:\n%q", warned)
+	}
+}
+
+// --plaintext remains the sanctioned way to put an unencrypted note in an
+// encrypting notebook — that is what makes the refusal above a fork in the road
+// rather than a dead end. It is also read before the lookup, so it costs no request.
+func TestPlaintextStillCreatesInAnEncryptingNotebook(t *testing.T) {
+	m := newAPIMock(t, encryptingNotebookRoutes())
+
+	enc, err, warned := runEncryptDecision(t, m, "nb1", "", "plaintext")
+
+	if err != nil {
+		t.Fatalf("--plaintext is the documented escape hatch and it was refused: %v", err)
+	}
+	if enc {
+		t.Error("--plaintext encrypted the note")
+	}
+	if warned != "" {
+		t.Errorf("--plaintext is an explicit choice and needs no warning:\n%q", warned)
+	}
+	if len(m.calls()) != 0 {
+		t.Errorf("--plaintext asked the server a question whose answer it does not use: %v", m.calls())
+	}
+}
+
+// The guard is not a tax on everyone else: a notebook that does not encrypt takes a
+// plaintext note with no passphrase, no error and nothing said, exactly as before.
+func TestAnOrdinaryNotebookIsUnaffectedWithoutAPassphrase(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/notebooks/nb1": {Status: 200, Body: `{"id":"nb1","name":"Inbox","default_encrypt":false}`},
+	})
+
+	enc, err, warned := runEncryptDecision(t, m, "nb1", "")
+
+	if err != nil {
+		t.Fatalf("an ordinary notebook refused an ordinary note: %v", err)
+	}
+	if enc {
+		t.Error("a notebook that does not encrypt asked for encryption")
+	}
+	if warned != "" {
+		t.Errorf("nothing was in doubt and something was said anyway:\n%q", warned)
+	}
+}
+
+// The decision is only worth anything if `notes create` actually consults it, and
+// "writes nothing" is a claim about the wire, not about a return value. This runs
+// the real command tree: the mock routes the notebook read and NOTHING else, so a
+// POST that got through would be an unrouted request and fail the test by itself.
+func TestNotesCreateWritesNothingWhenItRefuses(t *testing.T) {
+	m := newAPIMock(t, encryptingNotebookRoutes())
+	t.Setenv("HARBOR_PASSPHRASE", "")
+	resetSession()
+
+	out, err := runCLI(t, m, "notes", "create", "--notebook", "nb1", "--title", "Blocked", "--content", "x")
+
+	if err == nil {
+		t.Fatal("notes create did not consult the guard — it exited 0 into an encrypt-by-default notebook")
+	}
+	if !strings.Contains(err.Error(), "--plaintext") {
+		t.Errorf("the command surfaced some other failure, not the refusal:\n%v", err)
+	}
+	if out != "" {
+		t.Errorf("a refused create printed a note anyway:\n%q", out)
+	}
+	for _, call := range m.calls() {
+		if strings.HasPrefix(call, "POST") {
+			t.Errorf("a refused create still wrote to the server: %v", m.calls())
+		}
+	}
+}
+
+// --encrypt is the guard the new one was built to match, and until now nothing held
+// it: its whole body could be deleted and the suite stayed green. That is the
+// sibling of the bug this PR fixes, in the function this PR rewrote, so it gets an
+// assertion of its own rather than an assumption that it still works.
+//
+// Removing it does not currently leak plaintext — encryptCreateBody's unlock fails
+// before CreateNote — but it degrades a precise refusal into a generic one, and the
+// next person to move this code would have no warning that they had.
+func TestEncryptFlagIsRefusedWithoutAPassphrase(t *testing.T) {
+	// No routes: the flag is answered from the flags alone, so a notebook read here
+	// would itself be a failure (the mock treats an unrouted request as an error).
+	m := newAPIMock(t, map[string]mockReply{})
+
+	enc, err, _ := runEncryptDecision(t, m, "nb1", "", "encrypt")
+
+	if err == nil {
+		t.Fatalf("--encrypt with no passphrase promised encryption it has no key for (encrypt=%v)", enc)
+	}
+	if enc {
+		t.Error("the refusal still asked for encryption it cannot perform")
+	}
+	for _, want := range []string{"--encrypt", "HARBOR_PASSPHRASE"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal never mentions %q:\n%v", want, err)
+		}
+	}
+}
+
+// Naming the destination is part of what makes the refusal actionable, and every
+// other fixture here hands back a notebook with a name — so the two FALLBACKS in
+// notebookLabel were never executed by a test and could have been anything at all.
+// A notebook is not guaranteed to have a name, and the account default was never
+// named by the user in the first place.
+func TestARefusalNamesTheNotebookEvenWithoutAName(t *testing.T) {
+	cases := map[string]struct {
+		notebookID string
+		routes     map[string]mockReply
+		want       string
+	}{
+		// No name came back, so the id the user typed is the only handle either side
+		// of the screen shares.
+		"named notebook with no name falls back to its id": {
+			notebookID: "nbnoname",
+			routes: map[string]mockReply{
+				"GET /api/v1/notebooks/nbnoname": {Status: 200, Body: `{"id":"nbnoname","default_encrypt":true}`},
+			},
+			want: "notebook nbnoname",
+		},
+		// Nothing was typed and nothing came back: the message has to describe the
+		// destination rather than identify it.
+		"unnamed default notebook is described, not identified": {
+			notebookID: "",
+			routes: map[string]mockReply{
+				"GET /api/v1/notebooks": {Status: 200, Body: `{"data":[{"id":"nbd","is_default":true,"default_encrypt":true}],` +
+					`"paging":{"limit":500,"offset":0,"total":1,"has_more":false}}`},
+			},
+			want: "your default notebook",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err, _ := runEncryptDecision(t, newAPIMock(t, tc.routes), tc.notebookID, "")
+			if err == nil {
+				t.Fatal("an encrypt-by-default notebook took a plaintext note without complaint")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("the refusal does not say %q, so it does not say where the note was going:\n%v", tc.want, err)
+			}
+		})
+	}
+}
+
+// A LIST THAT NEVER SHOWS A DEFAULT NOTEBOOK IS AN UNANSWERED QUESTION. It used to
+// be reported as known=true — the walk ran to completion, so the answer was taken to
+// be "the default notebook does not encrypt", even though no default notebook was
+// ever seen. That is a silent plaintext write on a notebook nobody read, which is
+// this issue's bug wearing a different hat. It was unreachable before, because a run
+// with no passphrase never got as far as the lookup; every create walks it now.
+//
+// The fixture makes the difference impossible to miss: BOTH notebooks encrypt by
+// default, so a "no" here is not merely unproven, it is the opposite of everything
+// the account has said.
+func TestANotebookListWithNoDefaultIsUnknownNotANo(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/notebooks": {Status: 200, Body: `{"data":[` +
+			`{"id":"nb1","name":"Work","is_default":false,"default_encrypt":true},` +
+			`{"id":"nb2","name":"Personal","is_default":false,"default_encrypt":true}],` +
+			`"paging":{"limit":500,"offset":0,"total":2,"has_more":false}}`},
+	})
+
+	wants, known, _ := notebookWantsEncryption(client.NewClient(m.baseURL(), "tok"), "")
+
+	if known {
+		t.Error("no default notebook was ever read, and the lookup answered as though one had been")
+	}
+	if wants {
+		t.Error("nothing established that the destination encrypts, so the answer cannot be yes")
+	}
+
+	// And the call site has to treat it as the unknown it is: said out loud, then
+	// proceeds — not refused (nothing was established) and above all not silent.
+	enc, err, warned := runEncryptDecision(t, m, "", "")
+	if err != nil {
+		t.Fatalf("an unanswered lookup is not a notebook that said 'encrypted' — it must not refuse: %v", err)
+	}
+	if enc {
+		t.Error("a notebook that was never found encrypted the note on a guess")
+	}
+	if !strings.Contains(warned, "UNENCRYPTED") {
+		t.Errorf("the note was written in the clear on a question nobody answered, silently:\n%q", warned)
+	}
+}
+
+// The UNKNOWN case is deliberately NOT the refusal above, and this pins that apart
+// so a later reader does not "finish the job" by mistake. Nothing established that
+// this notebook encrypts; the likeliest reason to be here is an account with no
+// encryption at all whose notebook read failed, and refusing every create over that
+// would break plain note-taking. It warns and proceeds — and the warning points at
+// the passphrase rather than at --encrypt, which without a key would only trade this
+// warning for a different error.
+func TestAnUnreadableNotebookStillProceedsWithoutAPassphrase(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/notebooks/nb1": {Status: 500, Body: apiErrorBody("internal", "boom")},
+	})
+
+	enc, err, warned := runEncryptDecision(t, m, "nb1", "")
+
+	if err != nil {
+		t.Fatalf("an unanswered lookup is not a notebook that said 'encrypted' — it must not refuse: %v", err)
+	}
+	if enc {
+		t.Error("a failed notebook lookup encrypted the note on a guess")
+	}
+	if !strings.Contains(warned, "UNENCRYPTED") {
+		t.Errorf("the note was written in the clear on an unanswered question, silently:\n%q", warned)
+	}
+	if !strings.Contains(warned, "HARBOR_PASSPHRASE") {
+		t.Errorf("with no passphrase set, the advice has to name the passphrase:\n%q", warned)
+	}
+	if strings.Contains(warned, "--encrypt") {
+		t.Errorf("--encrypt is useless advice with no key to encrypt with:\n%q", warned)
 	}
 }
