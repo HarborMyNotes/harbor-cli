@@ -146,13 +146,27 @@ var notesCreateCmd = &cobra.Command{
 	},
 }
 
-// notesUpdateCmd partially updates a note.
+// notesUpdateCmd partially updates a note. A content flag replaces the whole
+// body, which is where the note's tasks live — see guardNoteTaskLoss.
 var notesUpdateCmd = &cobra.Command{
 	Use:   "update <id>",
 	Short: "Update a note (only the flags you pass are changed)",
 	Args:  cobra.ExactArgs(1),
+	Long: `Update a note. Only the fields you pass are changed.
+
+The content flags (--content / --file / --stdin) REPLACE the note's body — they
+do not merge into it. That matters more than it sounds, because the body is
+where a note's TASKS live: each task is a <harbor-task> block, and saving a body
+that drops the block DELETES that task (it is tombstoned, not detached). Inline
+attachments and note-to-note links are derived from the body the same way.
+
+So an update that would drop tasks is REFUSED and nothing is written. Re-run it
+with --keep-tasks to carry those blocks into the new body, or with
+--allow-task-loss to delete them on purpose. To add to a body without replacing
+it, use 'harbor notes append'.`,
 	Example: `  harbor notes update 9c2e... --title "Plan (final)"
-  harbor notes update 9c2e... --file updated.md`,
+  harbor notes update 9c2e... --file updated.md
+  harbor notes update 9c2e... --content "# Rewritten" --keep-tasks`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c, creds, err := loadClientFromConfig()
 		if err != nil {
@@ -173,6 +187,14 @@ var notesUpdateCmd = &cobra.Command{
 		}
 		if len(body) == 0 {
 			return errors.New("nothing to update — pass --title, content, or another field")
+		}
+		// Replacing the body releases every task the new body does not carry, and
+		// the server deletes a released task. Refuse rather than do that silently
+		// (issue #62); only a content-carrying update can trigger it.
+		if hasContent {
+			if err := guardNoteTaskLoss(cmd, c, args[0], format, body); err != nil {
+				return err
+			}
 		}
 		// If the note is encrypted, re-seal any title/content we are sending.
 		// Refuse to overwrite ciphertext with plaintext when no passphrase is set.
@@ -254,6 +276,10 @@ func mapNoteError(err error) error {
 			return errors.New("the note body is too large (max 5 MiB)")
 		case "append_not_supported_encrypted":
 			return errors.New("cannot append to an encrypted note")
+		case "note_usn_stale":
+			// The base_usn precondition guardNoteTaskLoss sends. Retrying the same
+			// body is exactly the clobber the server just refused, so say to merge.
+			return errors.New("the note changed after this command read it, and nothing was written — something else edited it in between. Re-read it ('harbor notes get <id> --format html'), merge your change into the current body, and update again; re-running this command as-is would overwrite whatever landed in between")
 		}
 	}
 	return err
@@ -377,6 +403,7 @@ func init() {
 	notesUpdateCmd.Flags().String("source-url", "", "Source URL attribute")
 	notesUpdateCmd.Flags().String("author", "", "Author attribute")
 	addContentFlags(notesUpdateCmd)
+	addTaskLossFlags(notesUpdateCmd)
 
 	addContentFlags(notesAppendCmd)
 
