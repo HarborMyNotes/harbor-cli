@@ -190,15 +190,18 @@ it, use 'harbor notes append'.`,
 		}
 		// Replacing the body releases every task the new body does not carry, and
 		// the server deletes a released task. Refuse rather than do that silently
-		// (issue #62); only a content-carrying update can trigger it.
+		// (issue #62); only a content-carrying update can trigger it. The note it
+		// read is handed to the encryption step so the note is not fetched twice.
+		var note map[string]any
 		if hasContent {
-			if err := guardNoteTaskLoss(cmd, c, args[0], format, body); err != nil {
+			note, err = guardNoteTaskLoss(cmd, c, args[0], format, body)
+			if err != nil {
 				return err
 			}
 		}
 		// If the note is encrypted, re-seal any title/content we are sending.
 		// Refuse to overwrite ciphertext with plaintext when no passphrase is set.
-		if err := encryptUpdateBody(c, creds, args[0], body); err != nil {
+		if err := encryptUpdateBody(c, creds, args[0], body, note); err != nil {
 			return err
 		}
 		data, err := c.UpdateNote(args[0], body)

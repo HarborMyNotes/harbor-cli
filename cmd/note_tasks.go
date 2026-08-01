@@ -44,9 +44,9 @@ var (
 	taskBlockAttrRe = regexp.MustCompile(`(?is)<harbor-task\b[^>]*?\sid\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>]+))`)
 
 	// taskBlockIDRe is the server's own rule for a block id worth anything: the
-	// canonical 36-character hyphenated UUID. A block whose id is spelled any other
-	// way (braced, urn-prefixed, bare 32-hex) references no task the reconciler can
-	// resolve, so it neither saves a task nor endangers one.
+	// canonical 36-character hyphenated UUID (notes.taskIDRe). A block whose id is
+	// spelled any other way (braced, urn-prefixed, bare 32-hex) references no task
+	// the reconciler can resolve, so it neither saves a task nor endangers one.
 	taskBlockIDRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 	// htmlCommentRe matches an HTML comment, which the server's sanitizer strips —
@@ -155,6 +155,73 @@ func taskBlockHTML(taskID string) string {
 	return `<harbor-task id="` + taskID + `"></harbor-task>`
 }
 
+// noteTask is one task a body replacement could destroy: its id, and its title
+// when we know it (a title is what makes "is this the one I meant to drop?"
+// answerable, where a bare UUID is not).
+type noteTask struct {
+	ID    string
+	Title string
+}
+
+// noteTasksAtRisk returns every task a whole-body write of noteID could delete,
+// in a stable order, given the note's CURRENT body.
+//
+// It is the UNION of two sources, because neither alone is the server's release
+// set and each covers the other's blind spot:
+//
+//   - GET /notes/:id/tasks — the authoritative one. It selects
+//     `deleted = 0 AND note_id = :id`, which is character-for-character the query
+//     SyncNoteTasks walks to decide what to tombstone, so it also catches a task
+//     LINKED to the note but no longer referenced by it (the app.harbor.my#1094
+//     orphan being healed by #1098) — a task the body cannot tell us about and
+//     that this write would silently take with it.
+//   - The <harbor-task> blocks in the current body — the fallback. A read of the
+//     task list that fails (an older server, a hiccup) must not silently downgrade
+//     a data guard to nothing, and this source needs no second endpoint because
+//     the note has already been read.
+//
+// Over-counting is the safe direction: an id in the body that owns no task row
+// costs at most a refusal the user did not need, where under-counting costs the
+// task. Ids are lower-cased, matching the server's canonicalization.
+func noteTasksAtRisk(c *client.Client, noteID, currentBody string) []noteTask {
+	out := []noteTask{}
+	seen := map[string]bool{}
+	for _, t := range listNoteTasks(c, noteID) {
+		if t.ID == "" || seen[t.ID] {
+			continue
+		}
+		seen[t.ID] = true
+		out = append(out, t)
+	}
+	for _, id := range noteTaskBlockIDs(currentBody, "html") {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, noteTask{ID: id})
+	}
+	return out
+}
+
+// listNoteTasks reads a note's tasks, in their in-note order. Any error yields an
+// empty slice rather than a failure: this feeds a union whose other half needs no
+// network at all, so degrading here costs precision, not protection.
+func listNoteTasks(c *client.Client, noteID string) []noteTask {
+	data, err := c.ListNoteTasks(noteID, map[string]string{"limit": "500"})
+	if err != nil {
+		return nil
+	}
+	items := client.CollectionItems(data)
+	out := make([]noteTask, 0, len(items))
+	for _, raw := range items {
+		t := parseJSON(raw)
+		if id := strings.ToLower(strings.TrimSpace(str(t, "id"))); id != "" {
+			out = append(out, noteTask{ID: id, Title: str(t, "title")})
+		}
+	}
+	return out
+}
+
 // guardNoteTaskLoss protects the tasks stored in a note's body from a content
 // update that would replace it. It runs only for a content-carrying `notes
 // update`; a metadata-only update cannot release anything and never pays for the
@@ -169,105 +236,101 @@ func taskBlockHTML(taskID string) string {
 //     the precondition ignore the field.
 //  2. Skips out for an encrypted note: the server cannot parse ciphertext, so it
 //     never reconciles task blocks out of one and this write releases nothing.
-//  3. Compares the blocks in the current body against the blocks in the new
+//  3. Compares the tasks at risk (noteTasksAtRisk) against the blocks in the new
 //     content and, when the new content drops any, applies the user's choice:
 //     --keep-tasks re-appends the dropped blocks, --allow-task-loss proceeds, and
 //     neither refuses the update with nothing written.
 //
-// body is mutated in place (base_usn, and content when keeping).
-func guardNoteTaskLoss(cmd *cobra.Command, c *client.Client, noteID, format string, body map[string]any) error {
+// body is mutated in place (base_usn, and content when keeping). The parsed note is
+// returned so the caller's encryption step reuses this read instead of repeating it.
+func guardNoteTaskLoss(cmd *cobra.Command, c *client.Client, noteID, format string, body map[string]any) (map[string]any, error) {
 	keep, allowLoss := boolFlag(cmd, "keep-tasks"), boolFlag(cmd, "allow-task-loss")
 	if keep && allowLoss {
-		return errors.New("--keep-tasks and --allow-task-loss cannot be used together — they ask for opposite things")
+		return nil, errors.New("--keep-tasks and --allow-task-loss cannot be used together — they ask for opposite things")
 	}
 
 	raw, err := c.GetNote(noteID, map[string]string{"format": "html"})
 	if err != nil {
-		return mapNoteError(err)
+		return nil, mapNoteError(err)
 	}
 	note := parseJSON(client.UnwrapData(raw))
 	if note == nil {
 		// Fail closed. Proceeding here would be running the write with the guard
 		// silently switched off, which is the bug this function exists to stop.
-		return errors.New("could not read the note before replacing its body — refusing to overwrite it (a whole-body update deletes any task the new body omits)")
+		return nil, errors.New("could not read the note before replacing its body — refusing to overwrite it (a whole-body update deletes any task the new body omits)")
 	}
 	if usn := int64(num(note, "usn")); usn > 0 {
 		body["base_usn"] = usn
 	}
 	if boolean(note, "is_encrypted") {
-		return nil
+		return note, nil
 	}
 
-	current := noteTaskBlockIDs(str(note, "content"), "html")
-	if len(current) == 0 {
-		return nil
+	atRisk := noteTasksAtRisk(c, noteID, str(note, "content"))
+	if len(atRisk) == 0 {
+		return note, nil
 	}
 	newContent, _ := body["content"].(string)
 	carried := map[string]bool{}
 	for _, id := range noteTaskBlockIDs(newContent, format) {
 		carried[id] = true
 	}
-	lost := make([]string, 0, len(current))
-	for _, id := range current {
-		if !carried[id] {
-			lost = append(lost, id)
+	lost := make([]noteTask, 0, len(atRisk))
+	for _, t := range atRisk {
+		if !carried[t.ID] {
+			lost = append(lost, t)
 		}
 	}
 	if len(lost) == 0 {
-		return nil
+		return note, nil
 	}
 
 	switch {
 	case keep:
 		body["content"] = appendTaskBlocks(newContent, lost)
 		fmt.Fprintf(os.Stderr, "Kept %s: their blocks were re-appended to the end of the new body.\n", countTasks(len(lost)))
-		return nil
+		return note, nil
 	case allowLoss:
 		fmt.Fprintf(os.Stderr, "%s Deleting %s that the new body no longer carries.\n",
 			redWarn("Warning:"), countTasks(len(lost)))
-		return nil
+		return note, nil
 	}
-	return errors.New(taskLossRefusal(c, noteID, lost))
+	return nil, errors.New(taskLossRefusal(lost))
 }
 
 // appendTaskBlocks puts the given task blocks at the end of a body, separated from
 // whatever precedes them by a blank line. That separation is what keeps the blocks
 // out of a trailing Markdown paragraph or list item; the raw HTML itself survives
-// the Markdown converter, which runs with raw-HTML passthrough enabled and whose
-// sanitizer allowlists <harbor-task id>.
+// the Markdown converter, which runs with raw-HTML passthrough enabled
+// (goldmark WithUnsafe) and whose sanitizer allowlists <harbor-task id>.
 //
 // The blocks land at the END rather than in their original positions: their old
 // offsets are meaningless against a body the user just rewrote, and a task's order
 // within a note is carried by its own position field, not by where the block sits.
-func appendTaskBlocks(content string, ids []string) string {
+func appendTaskBlocks(content string, tasks []noteTask) string {
 	var b strings.Builder
 	b.WriteString(strings.TrimRight(content, "\n"))
 	b.WriteString("\n\n")
-	for _, id := range ids {
-		b.WriteString(taskBlockHTML(id))
+	for _, t := range tasks {
+		b.WriteString(taskBlockHTML(t.ID))
 		b.WriteString("\n")
 	}
 	return b.String()
 }
 
 // taskLossRefusal builds the message for a refused update: what would be deleted,
-// why replacing the body deletes it, and the two ways to proceed on purpose.
-//
-// Task titles come from a best-effort read of the note's task list — a name is
-// what makes "is this the one I meant to drop?" answerable, where a bare UUID is
-// not. A failed or partial read degrades to the id rather than failing the
-// command: this is the error path already, and a less informative refusal still
+// why replacing the body deletes it, and the two ways to proceed on purpose. A task
+// whose title we could not read is named by id — a less informative refusal still
 // protects the data.
-func taskLossRefusal(c *client.Client, noteID string, lost []string) string {
-	titles := noteTaskTitles(c, noteID)
+func taskLossRefusal(lost []noteTask) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "this update would delete %s stored in the note's body:\n", countTasks(len(lost)))
-	for _, id := range lost {
-		if title := titles[id]; title != "" {
-			fmt.Fprintf(&b, "  • %s (%s)\n", title, id)
+	for _, t := range lost {
+		if t.Title != "" {
+			fmt.Fprintf(&b, "  • %s (%s)\n", t.Title, t.ID)
 			continue
 		}
-		fmt.Fprintf(&b, "  • %s\n", id)
+		fmt.Fprintf(&b, "  • %s\n", t.ID)
 	}
 	b.WriteString("\n--content/--file/--stdin REPLACE the note's body, and a task lives in that body\n")
 	b.WriteString("as a <harbor-task> block — dropping the block deletes the task, it is not\n")
@@ -276,24 +339,6 @@ func taskLossRefusal(c *client.Client, noteID string, lost []string) string {
 	b.WriteString("  --allow-task-loss  delete them; that is what you meant\n\n")
 	b.WriteString("Or use 'harbor notes append' to add to the body without replacing it.")
 	return b.String()
-}
-
-// noteTaskTitles maps a note's task ids to their titles, keyed lower-case to match
-// the ids parsed out of the body. Any error yields an empty map so callers degrade
-// to ids instead of failing.
-func noteTaskTitles(c *client.Client, noteID string) map[string]string {
-	out := map[string]string{}
-	data, err := c.ListNoteTasks(noteID, map[string]string{"limit": "500"})
-	if err != nil {
-		return out
-	}
-	for _, raw := range client.CollectionItems(data) {
-		t := parseJSON(raw)
-		if id := strings.ToLower(str(t, "id")); id != "" {
-			out[id] = str(t, "title")
-		}
-	}
-	return out
 }
 
 // countTasks renders a task count with the right plural, for messages that read
