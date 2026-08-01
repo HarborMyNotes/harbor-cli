@@ -300,6 +300,14 @@ func shouldEncryptCreate(cmd *cobra.Command, c *client.Client, notebookID string
 // notebookWantsEncryption best-effort reports whether the target notebook (or the
 // default notebook, when none is given) has default_encrypt set. On any lookup
 // error it returns false so a transient failure never silently encrypts.
+//
+// The default-notebook lookup WALKS THE PAGES. GET /notebooks is paged and has no
+// "just the default one" filter, so the default notebook can sit on any page —
+// reading only the first would answer "no" for an account with more notebooks than
+// fit in it, and write a note in the clear that its notebook asked to be encrypted.
+// That is the same one-page assumption as issue #67, found while looking for its
+// siblings; it is the only other internal collection read in the command tree. The
+// walk stops at the default, so an ordinary account still pays one request.
 func notebookWantsEncryption(c *client.Client, notebookID string) bool {
 	if notebookID != "" {
 		data, err := c.GetNotebook(notebookID, false)
@@ -308,17 +316,20 @@ func notebookWantsEncryption(c *client.Client, notebookID string) bool {
 		}
 		return boolean(parseJSON(client.UnwrapData(data)), "default_encrypt")
 	}
-	data, err := c.ListNotebooks(map[string]string{})
-	if err != nil {
+	wants := false
+	if _, err := walkCollection(
+		func(params map[string]string) ([]byte, error) { return c.ListNotebooks(params) },
+		func(raw json.RawMessage) bool {
+			n := parseJSON(raw)
+			if !boolean(n, "is_default") {
+				return true
+			}
+			wants = boolean(n, "default_encrypt")
+			return false
+		}); err != nil {
 		return false
 	}
-	for _, raw := range client.CollectionItems(data) {
-		n := parseJSON(raw)
-		if boolean(n, "is_default") {
-			return boolean(n, "default_encrypt")
-		}
-	}
-	return false
+	return wants
 }
 
 // encryptCreateBody seals a create body's title and content into HRBC2 envelopes

@@ -5,9 +5,12 @@ package cmd
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 
+	"github.com/HarborMyNotes/harbor-cli/client"
 	"github.com/HarborMyNotes/harbor-cli/config"
 	"github.com/HarborMyNotes/harbor-cli/crypto"
 )
@@ -153,5 +156,69 @@ func TestEncryptCreateBody_EmptyTitleStaysEmpty(t *testing.T) {
 	}
 	if !crypto.IsEnvelope(body["content"].(string)) {
 		t.Fatal("content should be sealed")
+	}
+}
+
+// ===========================================================================
+// The default notebook can be on any page (issue #67's sibling)
+// ===========================================================================
+//
+// GET /notebooks is paged and carries no "just the default" filter, so which page
+// the default notebook lands on is decided by its NAME. Reading only the first
+// page answers "the default does not want encryption" for any account with more
+// notebooks than fit in it — and the caller then writes the note in the clear.
+// This is the same one-page assumption as the task guard, with a quieter failure:
+// nothing refuses, nothing warns, the note is just not encrypted.
+
+// notebookPageMock serves a notebooks list where the default notebook — the only
+// one with default_encrypt set — sits on the SECOND page.
+func notebookPageMock(t *testing.T) *apiMock {
+	t.Helper()
+	rows := make([]string, 0, collectionPageSize)
+	for i := 0; i < collectionPageSize; i++ {
+		rows = append(rows, fmt.Sprintf(`{"id":"nb%d","name":"Notebook %d","is_default":false,"default_encrypt":false}`, i, i))
+	}
+	first := fmt.Sprintf(`{"data":[%s],"paging":{"limit":500,"offset":0,"total":%d,"has_more":true}}`,
+		strings.Join(rows, ","), collectionPageSize+1)
+	second := fmt.Sprintf(`{"data":[{"id":"nbdefault","name":"Zed","is_default":true,"default_encrypt":true}],`+
+		`"paging":{"limit":500,"offset":500,"total":%d,"has_more":false}}`, collectionPageSize+1)
+
+	m := newAPIMock(t, map[string]mockReply{})
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("offset") == "500" {
+			_, _ = w.Write([]byte(second))
+			return
+		}
+		_, _ = w.Write([]byte(first))
+	}
+	return m
+}
+
+// TestNotebookWantsEncryptionFindsADefaultPastTheFirstPage proves the lookup walks
+// the pages. Against a single-page read this returns false and the note is written
+// unencrypted, against the user's own stated default.
+func TestNotebookWantsEncryptionFindsADefaultPastTheFirstPage(t *testing.T) {
+	m := notebookPageMock(t)
+
+	if !notebookWantsEncryption(client.NewClient(m.baseURL(), "tok"), "") {
+		t.Error("the default notebook asks for encryption and the lookup said no — it only read page 1")
+	}
+}
+
+// TestNotebookWantsEncryptionStopsAtTheDefault proves the walk is not a tax on the
+// ordinary account: it stops as soon as the default is in hand, so a default on the
+// first page costs the one request it always cost.
+func TestNotebookWantsEncryptionStopsAtTheDefault(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/notebooks": {Status: 200, Body: `{"data":[{"id":"nb1","is_default":true,"default_encrypt":true}],` +
+			`"paging":{"limit":500,"offset":0,"total":900,"has_more":true}}`},
+	})
+
+	if !notebookWantsEncryption(client.NewClient(m.baseURL(), "tok"), "") {
+		t.Fatal("the default notebook on page 1 was not found")
+	}
+	if len(m.calls()) != 1 {
+		t.Errorf("kept paging after finding the default: %v", m.calls())
 	}
 }
