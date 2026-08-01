@@ -16,7 +16,6 @@ import (
 	"github.com/HarborMyNotes/harbor-cli/client"
 	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/spf13/cobra"
-	"golang.org/x/term"
 )
 
 // accountDeleteConfirmPhrase is the exact phrase a user must type (verbatim — not
@@ -632,26 +631,21 @@ func accountExportOutputPath(out, filename string) string {
 	return filepath.Join(out, filename)
 }
 
-// accountConfirmExportDelete gates the export delete. With --yes it returns nil
-// immediately. In --json mode or when stdin is not a terminal (scripts, CI, AI
-// agents) it refuses rather than prompting; on an interactive terminal it
-// requires the user to type exactly "yes".
+// accountExportDeleteConfirmation is what `harbor account export-delete` asks
+// before it removes an archive.
+var accountExportDeleteConfirmation = confirmation{
+	Warning:     "This deletes the export archive and any emailed link to it. Your notes are not affected, but you would have to export again.",
+	Prompt:      `Type "yes" to confirm: `,
+	Affirmative: "yes",
+	Unattended:  "refusing to delete an export without confirmation — pass --yes",
+	Aborted:     "aborted — the export was not deleted",
+}
+
+// accountConfirmExportDelete gates the export delete, resolving the ambient
+// state and handing the decision to the shared confirmDestructive so this gate
+// is tested by the same cases as every other one.
 func accountConfirmExportDelete(yes bool) error {
-	if yes {
-		return nil
-	}
-	if jsonOutput || !accountIsInteractive() {
-		return errors.New("refusing to delete an export without confirmation — pass --yes")
-	}
-	fmt.Println("This deletes the export archive and any emailed link to it. Your notes are not affected, but you would have to export again.")
-	answer, err := promptLine(`Type "yes" to confirm: `)
-	if err != nil {
-		return err
-	}
-	if answer != "yes" {
-		return errors.New("aborted — the export was not deleted")
-	}
-	return nil
+	return confirmDestructive(accountExportDeleteConfirmation, jsonOutput, accountIsInteractive(), yes, askLine)
 }
 
 // ===========================================================================
@@ -675,8 +669,11 @@ func accountResolveConfirm(cmd *cobra.Command) (string, error) {
 		// Phrase was pre-supplied and validated by the guard.
 		return phrase, nil
 	}
-	// Interactive path: prompt for the phrase and check it verbatim.
-	typed, perr := promptLine(fmt.Sprintf("This is destructive. Type %q to confirm: ", accountDeleteConfirmPhrase))
+	// Interactive path: prompt for the phrase and check it verbatim. The prompt
+	// goes through the shared seam so the mistyped-phrase branch below — the one
+	// standing between a user and a scheduled account deletion — is reachable
+	// from a test rather than only from a keyboard.
+	typed, perr := askLine(fmt.Sprintf("This is destructive. Type %q to confirm: ", accountDeleteConfirmPhrase))
 	if perr != nil {
 		return "", perr
 	}
@@ -720,9 +717,11 @@ func accountDeleteGuard(jsonMode, interactive bool, suppliedConfirm string, yes 
 }
 
 // accountIsInteractive reports whether stdin is an interactive terminal (so we
-// can safely prompt the user). Scripts and CI pipe stdin, which reads false.
+// can safely prompt the user). Scripts and CI pipe stdin, which reads false. It
+// defers to the shared seam so a test can drive the account commands' prompts
+// too, rather than only the ones that ask through confirmDestructive.
 func accountIsInteractive() bool {
-	return term.IsTerminal(int(os.Stdin.Fd()))
+	return stdinIsInteractive()
 }
 
 // ===========================================================================

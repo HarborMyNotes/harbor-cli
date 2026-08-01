@@ -6,11 +6,9 @@ package cmd
 import (
 	"errors"
 	"fmt"
-	"os"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
 	"github.com/spf13/cobra"
-	"golang.org/x/term"
 )
 
 // trashCmd is the parent for the recycle bin — list, restore, expunge, and
@@ -120,26 +118,23 @@ cannot be undone. You will be asked to confirm by typing "yes" unless you pass
 	},
 }
 
-// trashConfirmEmpty gates the destructive empty operation. With --yes it
-// returns nil immediately. Otherwise, in --json mode or when stdin is not a
-// terminal (scripts, CI, AI agents), it refuses rather than prompting; on an
-// interactive terminal it requires the user to type exactly "yes".
+// trashEmptyConfirmation is what `harbor trash empty` asks before it destroys
+// anything. It is a value so the wording — and the fact that only the exact
+// word "yes" proceeds — can be asserted without a terminal.
+var trashEmptyConfirmation = confirmation{
+	Warning:     "This permanently deletes every note in the trash. This cannot be undone.",
+	Prompt:      `Type "yes" to confirm: `,
+	Affirmative: "yes",
+	Unattended:  "refusing to empty the trash without confirmation — pass --yes",
+	Aborted:     "aborted — the trash was not emptied",
+}
+
+// trashConfirmEmpty gates the destructive empty operation. It resolves the
+// ambient state — is --json set, is stdin a terminal, how do we read a line —
+// and hands the decision to confirmDestructive, which is where every branch
+// (including the typed-wrong-answer one) is pinned by tests.
 func trashConfirmEmpty(yes bool) error {
-	if yes {
-		return nil
-	}
-	if jsonOutput || !term.IsTerminal(int(os.Stdin.Fd())) {
-		return errors.New("refusing to empty the trash without confirmation — pass --yes")
-	}
-	fmt.Println("This permanently deletes every note in the trash. This cannot be undone.")
-	answer, err := promptLine(`Type "yes" to confirm: `)
-	if err != nil {
-		return err
-	}
-	if answer != "yes" {
-		return errors.New("aborted — the trash was not emptied")
-	}
-	return nil
+	return confirmDestructive(trashEmptyConfirmation, jsonOutput, stdinIsInteractive(), yes, askLine)
 }
 
 // mapTrashError gives friendly messages for the trash-specific codes.
