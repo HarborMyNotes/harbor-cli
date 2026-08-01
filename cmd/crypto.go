@@ -34,6 +34,11 @@ var (
 	sessionErr     error
 	sessionUnlockd bool
 	decryptWarned  bool
+
+	// defaultNotebookWarned tracks the "could not read the notebook list" warning
+	// separately from decryptWarned. They are different facts, and sharing one flag
+	// would let whichever fired first silence the other.
+	defaultNotebookWarned bool
 )
 
 // Sentinel errors for the encryption session.
@@ -317,7 +322,7 @@ func notebookWantsEncryption(c *client.Client, notebookID string) bool {
 		return boolean(parseJSON(client.UnwrapData(data)), "default_encrypt")
 	}
 	wants := false
-	if _, err := walkCollection(
+	complete, err := walkCollection(
 		func(params map[string]string) ([]byte, error) { return c.ListNotebooks(params) },
 		func(raw json.RawMessage) bool {
 			n := parseJSON(raw)
@@ -326,7 +331,26 @@ func notebookWantsEncryption(c *client.Client, notebookID string) bool {
 			}
 			wants = boolean(n, "default_encrypt")
 			return false
-		}); err != nil {
+		})
+
+	// "We could not read the whole notebook list" is not the same fact as "this
+	// notebook does not want encryption", and only one of them is true here. The
+	// answer is still false — this function fails OPEN by design, because failing
+	// closed would mean encrypting on a guess, and a note encrypted under a
+	// passphrase the user did not mean to use is unrecoverable, where a note
+	// written in the clear can be re-saved. But that is a decision, not a
+	// discarded return value, so it is made out loud: the user is told which
+	// question went unanswered and can re-run, or pass --encrypt to settle it.
+	if err != nil || !complete {
+		if wants {
+			return true // the default was found before the read went wrong
+		}
+		if !defaultNotebookWarned {
+			defaultNotebookWarned = true
+			fmt.Fprintln(os.Stderr, dim("⚠ could not read the notebook list in full, so the default "+
+				"notebook's encryption setting is unknown — writing this note unencrypted "+
+				"(pass --encrypt to force it)"))
+		}
 		return false
 	}
 	return wants

@@ -713,3 +713,42 @@ func TestCountTasks(t *testing.T) {
 		t.Errorf("countTasks(3) = %q", got)
 	}
 }
+
+// Every refusal in this file used to offer `harbor notes append` as the safe way
+// out. It is not one: append keeps the body, so it saves a task the body still
+// REFERENCES — and releases one it has stopped referencing exactly like the update
+// just refused (measured against a local server: the referenced task survived the
+// append, the stranded one was gone). The stranded task is the whole reason the
+// task-list read exists, so unqualified append advice at the moment of a refusal
+// walks the user into the loss they were spared a line earlier. If a message names
+// append, it has to name the limit too.
+func TestNoRefusalOffersAppendAsUnconditionallySafe(t *testing.T) {
+	lost := []noteTask{{ID: fixtureTaskID, Title: "Buy milk"}}
+	for name, msg := range map[string]string{
+		"taskLossRefusal":           taskLossRefusal(lost),
+		"keepFailedRefusal/md":      keepFailedRefusal(lost, "markdown"),
+		"keepFailedRefusal/html":    keepFailedRefusal(lost, "html"),
+		"taskListIncompleteRefusal": taskListIncompleteRefusal(500),
+	} {
+		if !strings.Contains(msg, "notes append") {
+			continue
+		}
+		if !strings.Contains(msg, "stopped referencing") {
+			t.Errorf("%s offers 'notes append' with no mention of what it still deletes:\n%s", name, msg)
+		}
+	}
+}
+
+// The short-read refusal must not send the user to --keep-tasks: it can only carry
+// the blocks it was told about, so on a list that would not read whole it reports
+// success and deletes the rest.
+func TestTaskListIncompleteRefusalDoesNotOfferKeepTasks(t *testing.T) {
+	msg := taskListIncompleteRefusal(500)
+
+	if strings.Contains(msg, "--keep-tasks") {
+		t.Errorf("the short-read refusal offers --keep-tasks, which cannot cover the tasks it could not read:\n%s", msg)
+	}
+	if !strings.Contains(msg, "--allow-task-loss") {
+		t.Errorf("the short-read refusal leaves the user with no way through:\n%s", msg)
+	}
+}

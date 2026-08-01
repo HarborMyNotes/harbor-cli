@@ -439,10 +439,24 @@ func keepFailedRefusal(missing []noteTask, format string) string {
 		b.WriteString("anyway. Fix it with one of:\n\n")
 		b.WriteString("  close the element   so the body does not end inside it\n")
 	}
-	b.WriteString("  harbor notes append add to the body instead of replacing it\n")
-	b.WriteString("  --allow-task-loss   delete them; that is what you meant\n")
+	b.WriteString("  --allow-task-loss   delete them; that is what you meant\n\n")
+	b.WriteString(appendCaveat)
 	return b.String()
 }
+
+// appendCaveat is the honest version of "just use notes append instead".
+//
+// Every refusal in this file used to offer `harbor notes append` as the safe
+// alternative, full stop. It is not one. Append keeps the existing body, so every
+// task the body still REFERENCES survives it — but a task the body has stopped
+// referencing is released by ANY save (app.harbor.my#461's delete-on-release), and
+// append is a save. For the STRANDED task — the class this guard exists for, the
+// one only the task list can see (issue #67) — append is exactly as destructive as
+// the update just refused. Offering it unqualified at the moment of a refusal
+// walks the user straight into the loss they were spared a line earlier.
+const appendCaveat = "'harbor notes append' adds to the body instead of replacing it, which saves\n" +
+	"every task the body still references — but NOT one it has stopped referencing:\n" +
+	"any save releases that, append included."
 
 // taskLossRefusal builds the message for a refused update: what would be deleted,
 // why replacing the body deletes it, and the two ways to proceed on purpose. A task
@@ -463,7 +477,7 @@ func taskLossRefusal(lost []noteTask) string {
 	b.WriteString("detached. Nothing has been written. Re-run with one of:\n\n")
 	b.WriteString("  --keep-tasks       carry those blocks into the new body (appended at the end)\n")
 	b.WriteString("  --allow-task-loss  delete them; that is what you meant\n\n")
-	b.WriteString("Or use 'harbor notes append' to add to the body without replacing it.")
+	b.WriteString(appendCaveat)
 	return b.String()
 }
 
@@ -475,6 +489,18 @@ func taskLossRefusal(lost []noteTask) string {
 // --keep-tasks is not offered as a way forward. It can only carry the blocks it
 // was told about, so on a short read it would report success while deleting the
 // rest — the failure mode this refusal exists to stop.
+//
+// NOT AN OVERSIGHT: --allow-task-loss is the only way through, so "keep the ones
+// you did read and accept losing the rest" cannot be asked for. Combining the two
+// flags is rejected earlier as contradictory, and it would be — the half that says
+// keep cannot cover a task nobody enumerated, so the pair would promise a safety
+// it cannot deliver. Re-running (the list usually reads fine the second time) is
+// the way to get everything; --allow-task-loss is the way to stop caring.
+//
+// The append caveat matters more here than anywhere else in this file: elsewhere
+// the user can at least see which tasks are at stake, and here the whole problem
+// is the ones that could not be named. None of them can be shown to be safe under
+// an append, so it is offered with the same qualification and no more.
 func taskListIncompleteRefusal(read int) string {
 	var b strings.Builder
 	b.WriteString("could not read this note's task list in full, so nothing has been written.\n\n")
@@ -482,8 +508,10 @@ func taskListIncompleteRefusal(read int) string {
 	b.WriteString("and a task it cannot see is a task it cannot protect: --content/--file/--stdin\n")
 	b.WriteString("REPLACE the body, and a task whose <harbor-task> block the new body omits is\n")
 	b.WriteString("deleted, not detached. Re-run to try again, or:\n\n")
-	b.WriteString("  harbor notes append  add to the body instead of replacing it\n")
-	b.WriteString("  --allow-task-loss    proceed anyway, deleting whatever the new body omits\n")
+	b.WriteString("  --allow-task-loss    proceed anyway, deleting whatever the new body omits\n\n")
+	b.WriteString(appendCaveat)
+	b.WriteString("\nThe tasks that could not be read cannot be sorted into those two groups, so\n")
+	b.WriteString("append is not a safe way around this particular refusal either.\n")
 	return b.String()
 }
 

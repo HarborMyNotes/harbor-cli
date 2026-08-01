@@ -25,6 +25,7 @@ func resetSession() {
 	sessionKey = nil
 	sessionErr = nil
 	decryptWarned = false
+	defaultNotebookWarned = false
 }
 
 // setupEncryption isolates HOME, writes a cached keystore, and sets the
@@ -220,5 +221,49 @@ func TestNotebookWantsEncryptionStopsAtTheDefault(t *testing.T) {
 	}
 	if len(m.calls()) != 1 {
 		t.Errorf("kept paging after finding the default: %v", m.calls())
+	}
+}
+
+// TestNotebookWantsEncryptionSaysSoWhenItCannotTell proves the fail-open is
+// AUDIBLE. A walk that cannot finish still answers "no" — encrypting on a guess is
+// the worse failure, since a note sealed under the wrong passphrase is
+// unrecoverable where an unencrypted one can be re-saved — but the user is told
+// which question went unanswered instead of the answer being fabricated silently.
+func TestNotebookWantsEncryptionSaysSoWhenItCannotTell(t *testing.T) {
+	resetSession()
+	// A list that claims more and hands back nothing: the walk cannot advance, so
+	// the default notebook is never reached and its setting stays unknown.
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/notebooks": {Status: 200, Body: `{"data":[],"paging":{"limit":500,"offset":0,"total":900,"has_more":true}}`},
+	})
+
+	var got bool
+	warned := captureStderr(t, func() {
+		got = notebookWantsEncryption(client.NewClient(m.baseURL(), "tok"), "")
+	})
+
+	if got {
+		t.Error("an unreadable notebook list encrypted the note on a guess")
+	}
+	if !strings.Contains(warned, "unencrypted") {
+		t.Errorf("the note was written in the clear on an unanswered question, silently:\n%s", warned)
+	}
+}
+
+// TestNotebookWantsEncryptionIsQuietWhenItCanTell proves the warning is not noise
+// on the ordinary path: a list that reads whole says nothing, whatever the answer.
+func TestNotebookWantsEncryptionIsQuietWhenItCanTell(t *testing.T) {
+	resetSession()
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/notebooks": {Status: 200, Body: `{"data":[{"id":"nb1","is_default":true,"default_encrypt":false}],` +
+			`"paging":{"limit":500,"offset":0,"total":1,"has_more":false}}`},
+	})
+
+	warned := captureStderr(t, func() {
+		notebookWantsEncryption(client.NewClient(m.baseURL(), "tok"), "")
+	})
+
+	if warned != "" {
+		t.Errorf("a clean lookup warned anyway:\n%s", warned)
 	}
 }
