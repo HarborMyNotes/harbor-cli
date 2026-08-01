@@ -586,6 +586,47 @@ func TestARefusalNamesTheNotebookEvenWithoutAName(t *testing.T) {
 	}
 }
 
+// A LIST THAT NEVER SHOWS A DEFAULT NOTEBOOK IS AN UNANSWERED QUESTION. It used to
+// be reported as known=true — the walk ran to completion, so the answer was taken to
+// be "the default notebook does not encrypt", even though no default notebook was
+// ever seen. That is a silent plaintext write on a notebook nobody read, which is
+// this issue's bug wearing a different hat. It was unreachable before, because a run
+// with no passphrase never got as far as the lookup; every create walks it now.
+//
+// The fixture makes the difference impossible to miss: BOTH notebooks encrypt by
+// default, so a "no" here is not merely unproven, it is the opposite of everything
+// the account has said.
+func TestANotebookListWithNoDefaultIsUnknownNotANo(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/notebooks": {Status: 200, Body: `{"data":[` +
+			`{"id":"nb1","name":"Work","is_default":false,"default_encrypt":true},` +
+			`{"id":"nb2","name":"Personal","is_default":false,"default_encrypt":true}],` +
+			`"paging":{"limit":500,"offset":0,"total":2,"has_more":false}}`},
+	})
+
+	wants, known, _ := notebookWantsEncryption(client.NewClient(m.baseURL(), "tok"), "")
+
+	if known {
+		t.Error("no default notebook was ever read, and the lookup answered as though one had been")
+	}
+	if wants {
+		t.Error("nothing established that the destination encrypts, so the answer cannot be yes")
+	}
+
+	// And the call site has to treat it as the unknown it is: said out loud, then
+	// proceeds — not refused (nothing was established) and above all not silent.
+	enc, err, warned := runEncryptDecision(t, m, "", "")
+	if err != nil {
+		t.Fatalf("an unanswered lookup is not a notebook that said 'encrypted' — it must not refuse: %v", err)
+	}
+	if enc {
+		t.Error("a notebook that was never found encrypted the note on a guess")
+	}
+	if !strings.Contains(warned, "UNENCRYPTED") {
+		t.Errorf("the note was written in the clear on a question nobody answered, silently:\n%q", warned)
+	}
+}
+
 // The UNKNOWN case is deliberately NOT the refusal above, and this pins that apart
 // so a later reader does not "finish the job" by mistake. Nothing established that
 // this notebook encrypts; the likeliest reason to be here is an account with no

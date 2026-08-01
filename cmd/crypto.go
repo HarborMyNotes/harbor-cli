@@ -413,7 +413,8 @@ func warnEncryptionUnknown(notebookID string) {
 // reading only the first would answer "no" for an account with more notebooks than
 // fit in it. That is the same one-page assumption as issue #67, found while looking
 // for its siblings; it is the only other internal collection read in the command
-// tree. The walk stops at the default, so an ordinary account still pays one request.
+// tree. The walk stops at the default, so an ordinary account still pays one request
+// — and a walk that never reaches a default answers UNKNOWN, not "no" (see below).
 func notebookWantsEncryption(c *client.Client, notebookID string) (wants, known bool, name string) {
 	// A NAMED notebook is the common path — it needs no big account to reach, just a
 	// --notebook flag — and it is a plain GET, so "known" is simply "the read worked".
@@ -426,7 +427,20 @@ func notebookWantsEncryption(c *client.Client, notebookID string) (wants, known 
 		return boolean(nb, "default_encrypt"), true, str(nb, "name")
 	}
 
-	complete, err := walkCollection(
+	// known is set inside the visit callback and NOWHERE else, so it is true exactly
+	// when a notebook flagged is_default was actually read — which is the only thing
+	// that can answer the question. Once it is set, whatever the walk did afterwards
+	// cannot unmake that answer, so the walk's own result is deliberately discarded.
+	//
+	// A COMPLETED WALK THAT NEVER FOUND A DEFAULT IS "UNKNOWN", NOT "NO". It used to
+	// report known=true, which read back at the call site as "the default notebook
+	// does not encrypt" even though no default notebook had been seen at all — the
+	// same silent plaintext write this guard exists to stop, arriving through a
+	// different door. It was unreachable before, because a run with no passphrase
+	// never got this far; now every create walks it, so it has to be right. Unknown
+	// already has defined behaviour at the call site (say so, then proceed), and that
+	// is where this belongs rather than in a third state of its own.
+	_, _ = walkCollection(
 		func(params map[string]string) ([]byte, error) { return c.ListNotebooks(params) },
 		func(raw json.RawMessage) bool {
 			n := parseJSON(raw)
@@ -438,12 +452,7 @@ func notebookWantsEncryption(c *client.Client, notebookID string) (wants, known 
 			known = true
 			return false
 		})
-	if known {
-		// The default was found and read before anything went wrong; whatever the walk
-		// did afterwards cannot unmake that answer.
-		return wants, true, name
-	}
-	return false, err == nil && complete, ""
+	return wants, known, name
 }
 
 // encryptCreateBody seals a create body's title and content into HRBC2 envelopes
