@@ -6,7 +6,10 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"strings"
 
@@ -89,14 +92,66 @@ func init() {
 	)
 }
 
+// Exit codes. A script has to decide what to do about a failure without
+// reading English, so the two classes worth reacting to differently get their
+// own code: a plan limit is the user's account saying "no" (retrying will never
+// help — free up room or upgrade), and an unreachable API is transient (retry
+// with backoff). Everything else stays exitError, so existing scripts that only
+// test for non-zero keep working, and 2 is left alone because too much of the
+// world already reads it as "bad usage".
+const (
+	// exitOK is a successful run.
+	exitOK = 0
+	// exitError is any failure without a more specific code.
+	exitError = 1
+	// exitNetwork means the API could not be reached at all (DNS, connection
+	// refused, TLS, or a client-side timeout) — nothing was decided by the
+	// server, so the same command may well succeed later.
+	exitNetwork = 3
+	// exitPlanLimit means an entitlement gate blocked the write: a plan cap for
+	// that resource, or the whole-account read-only freeze.
+	exitPlanLimit = 4
+)
+
 // Execute runs the root command. It renders any error (with rich treatment for
-// API errors) to stderr and exits non-zero, giving stable, scriptable exit
-// codes (0 ok, 1 error) without calling os.Exit inside RunE.
+// API errors) to stderr and exits with the matching code, without calling
+// os.Exit inside RunE.
 func Execute() {
 	if err := rootCmd.Execute(); err != nil {
 		renderError(err)
-		os.Exit(1)
+		os.Exit(exitCodeFor(err))
 	}
+}
+
+// exitCodeFor classifies an error into one of the documented exit codes. It
+// runs centrally in Execute, so every command — every create path in the CLI —
+// gets the same classification without opting in.
+func exitCodeFor(err error) int {
+	if err == nil {
+		return exitOK
+	}
+	if isPlanLimitError(err) {
+		return exitPlanLimit
+	}
+	if isNetworkError(err) {
+		return exitNetwork
+	}
+	return exitError
+}
+
+// isNetworkError reports whether err is a transport failure rather than an
+// answer from the server. Every request goes through http.Client.Do, which
+// wraps transport failures in *url.Error, so that one check covers a refused
+// connection, an unresolvable host, a TLS failure, and a client-side timeout.
+// An HTTP error response is a *client.APIError instead and is deliberately NOT
+// caught here — the server did answer.
+func isNetworkError(err error) bool {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
 }
 
 // resolveBaseURL picks the API base URL with this precedence: --api-url flag,

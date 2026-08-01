@@ -500,12 +500,26 @@ func displayKVData(data []byte) {
 	printKV(pairs)
 }
 
-// renderError prints an error to stderr. *client.APIError gets rich treatment:
-// a red "code: message" line, bulleted validation details, and (in verbose
-// mode) a dim request id and HTTP status.
+// renderError prints an error to stderr — never stdout, so a failure can never
+// be mistaken for data by whatever the command was piped into. *client.APIError
+// gets rich treatment: a red "code: message" line, bulleted validation details,
+// and (in verbose mode) a dim request id and HTTP status. In --json mode the
+// error is emitted as JSON instead, so a script parsing this CLI gets the same
+// shape whether the command succeeded or failed.
 func renderError(err error) {
 	var apiErr *client.APIError
 	if errors.As(err, &apiErr) {
+		if jsonOutput {
+			renderErrorJSON(apiErr)
+			return
+		}
+		// A plan limit is not a normal API failure — it is a wall the user has
+		// hit and needs walked through, so it gets its own explanation rather
+		// than a dump of the gate's internals.
+		if apiErr.Code == planLimitCode {
+			renderPlanLimitError(apiErr)
+			return
+		}
 		header := apiErr.Message
 		if header == "" {
 			header = apiErr.Error()
@@ -527,5 +541,23 @@ func renderError(err error) {
 		}
 		return
 	}
+	if jsonOutput {
+		renderErrorJSON(&client.APIError{Code: "cli_error", Message: err.Error()})
+		return
+	}
 	fmt.Fprintln(os.Stderr, colorize("Error: ", text.FgRed, text.Bold)+err.Error())
+}
+
+// renderErrorJSON writes the API's error envelope to stderr as JSON, for
+// --json mode. It goes to stderr like every other diagnostic — stdout stays
+// data-only, so `harbor ... --json | jq` never has to filter out an error
+// object it did not ask for. A failure to marshal falls back to the one-line
+// text form rather than printing nothing at all.
+func renderErrorJSON(apiErr *client.APIError) {
+	out, err := json.MarshalIndent(map[string]any{"error": apiErr}, "", "  ")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, colorize("Error: ", text.FgRed, text.Bold)+apiErr.Error())
+		return
+	}
+	fmt.Fprintln(os.Stderr, string(out))
 }

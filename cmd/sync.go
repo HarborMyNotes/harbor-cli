@@ -382,6 +382,25 @@ func displaySyncPush(data []byte) {
 	}
 	printTable(headers, rows)
 	fmt.Printf("%s scope_max_usn: %s\n", dim("→"), trimFloat(num(root, "scope_max_usn")))
+	// A push answers 200 even when the server refused individual changes, so a
+	// plan limit here shows up as a code buried in one row's NOTE column. Say
+	// what it means, or the push looks like it worked.
+	if syncPushHitPlanLimit(results) {
+		fmt.Println(redWarn("Some changes were refused: ") + "your account is at a plan limit, so those creates were rejected (the rest went through).")
+		fmt.Println("Run 'harbor usage' to see which limit, or upgrade at " + bold(upgradeURL("")) + ".")
+	}
+}
+
+// syncPushHitPlanLimit reports whether any pushed change was rejected by an
+// entitlement gate. The push endpoint reports per-change failures inside a 200,
+// so this is the only place the CLI can notice.
+func syncPushHitPlanLimit(results []map[string]any) bool {
+	for _, r := range results {
+		if str(r, "error") == planLimitCode {
+			return true
+		}
+	}
+	return false
 }
 
 // displaySyncDevices prints the device list plus scope/GC info.
