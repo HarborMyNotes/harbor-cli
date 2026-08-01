@@ -6,11 +6,9 @@ package cmd
 import (
 	"errors"
 	"fmt"
-	"os"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
 	"github.com/spf13/cobra"
-	"golang.org/x/term"
 )
 
 // profileCmd is the parent for account profile self-management.
@@ -348,42 +346,31 @@ func inboundEmailProfile(data []byte) (map[string]any, error) {
 	return p, nil
 }
 
+// inboundEmailResetConfirmation is what `harbor profile inbound-email reset`
+// asks before it rotates the address out from under whoever was mailing it.
+var inboundEmailResetConfirmation = registerConfirmation("harbor profile inbound-email reset", confirmation{
+	Warning:     "This rotates your email-to-note address. The old address stops working IMMEDIATELY and mail sent to it will be dropped.",
+	Prompt:      `Type "yes" to confirm: `,
+	Affirmative: "yes",
+	Unattended:  "refusing to rotate your email-to-note address without confirmation — pass --yes",
+	Aborted:     "aborted — your email-to-note address was not changed",
+})
+
 // inboundEmailConfirmReset gates the destructive rotation for the command,
 // resolving how the user should be asked (is this a terminal we can prompt on?)
 // and delegating the decision to inboundEmailResetGuard.
 func inboundEmailConfirmReset(yes bool) error {
-	return inboundEmailResetGuard(jsonOutput, term.IsTerminal(int(os.Stdin.Fd())), yes, promptLine)
+	return inboundEmailResetGuard(jsonOutput, stdinIsInteractive(), yes, askLine)
 }
 
 // inboundEmailResetGuard decides whether a rotation may proceed. Interactivity
 // and the prompt are parameters rather than ambient state so every branch —
 // including the typed-wrong-answer one — is reachable in a test; a destructive,
 // non-undoable gate that only real hands can exercise is a gate that silently
-// rots.
-//
-// Rules:
-//   - --yes proceeds without asking (that is its whole job).
-//   - Otherwise, in --json mode or when stdin is not a terminal (scripts, CI, AI
-//     agents), refuse rather than prompt: nobody is there to answer, and the
-//     rotation cannot be undone.
-//   - On a terminal, require the word "yes" exactly, after saying plainly that
-//     the old address dies immediately.
+// rots. The rules themselves live in confirmDestructive, shared with every other
+// irreversible command.
 func inboundEmailResetGuard(jsonMode, interactive, yes bool, ask func(string) (string, error)) error {
-	if yes {
-		return nil
-	}
-	if jsonMode || !interactive {
-		return errors.New("refusing to rotate your email-to-note address without confirmation — pass --yes")
-	}
-	fmt.Println("This rotates your email-to-note address. The old address stops working IMMEDIATELY and mail sent to it will be dropped.")
-	answer, err := ask(`Type "yes" to confirm: `)
-	if err != nil {
-		return err
-	}
-	if answer != "yes" {
-		return errors.New("aborted — your email-to-note address was not changed")
-	}
-	return nil
+	return confirmDestructive(inboundEmailResetConfirmation, jsonMode, interactive, yes, ask)
 }
 
 // inboundEmailAddress pulls the email-to-note address out of a profile object,

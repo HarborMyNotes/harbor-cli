@@ -92,3 +92,104 @@ func TestMapNoteError(t *testing.T) {
 		t.Errorf("the stale-usn message never says to merge: %q", got)
 	}
 }
+
+// ===========================================================================
+// `notes delete --permanent` — the second route to a permanent expunge
+// ===========================================================================
+//
+// `notes delete` is the safe, everyday command; the one flag that makes it
+// irreversible is easy to miss when skimming a script. It reaches the same
+// expunge `trash expunge` does, so it asks the same question — and, like every
+// other gate, the wrong-answer branch is pinned at the call site rather than
+// only in the helper.
+
+// TestNotesDeletePermanentRunEStopsOnAWrongAnswer proves nothing reaches the
+// server when the user declines.
+func TestNotesDeletePermanentRunEStopsOnAWrongAnswer(t *testing.T) {
+	for _, answer := range []string{"no", "n", "", "y", "YES"} {
+		t.Run(answer, func(t *testing.T) {
+			answerPrompt(t, answer)
+			m := newAPIMock(t, map[string]mockReply{})
+
+			out, err := runCLI(t, m, "notes", "delete", "n1", "--permanent")
+			if err == nil {
+				t.Fatalf("answering %q permanently deleted the note", answer)
+			}
+			if len(m.calls()) != 0 {
+				t.Fatalf("the note was deleted anyway: %v", m.calls())
+			}
+			if strings.Contains(out, "permanently deleted") {
+				t.Errorf("stdout claimed success after an abort:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestNotesDeletePermanentRunERefusesUnattended covers scripts and agents: no
+// terminal to ask at means refuse, not proceed.
+func TestNotesDeletePermanentRunERefusesUnattended(t *testing.T) {
+	pipedStdin(t)
+	m := newAPIMock(t, map[string]mockReply{})
+
+	_, err := runCLI(t, m, "notes", "delete", "n1", "--permanent")
+	if err == nil {
+		t.Fatal("an unattended --permanent delete without --yes must refuse")
+	}
+	if !strings.Contains(err.Error(), "--yes") {
+		t.Errorf("err = %q, want it to name the flag that would have worked", err.Error())
+	}
+	if len(m.calls()) != 0 {
+		t.Errorf("nothing should have been sent, got %v", m.calls())
+	}
+}
+
+// TestNotesDeletePermanentRunEProceedsWhenConfirmed keeps both confirmed routes
+// working, and pins that --permanent really reaches the wire as permanent — a
+// gate that quietly downgraded the delete to a trash would also "pass" the
+// aborts above.
+func TestNotesDeletePermanentRunEProceedsWhenConfirmed(t *testing.T) {
+	const route = "DELETE /api/v1/notes/n1"
+
+	answerPrompt(t, "yes")
+	m := newAPIMock(t, map[string]mockReply{route: {Status: 204, Body: ""}})
+	out, err := runCLI(t, m, "notes", "delete", "n1", "--permanent")
+	if err != nil {
+		t.Fatalf("typed yes: %v", err)
+	}
+	if got := m.queryOf(t, route).Get("permanent"); got != "true" {
+		t.Errorf("permanent=%q on the wire, want \"true\"", got)
+	}
+	if !strings.Contains(out, "permanently deleted") {
+		t.Errorf("output = %q", out)
+	}
+
+	pipedStdin(t) // --yes must not prompt
+	m2 := newAPIMock(t, map[string]mockReply{route: {Status: 204, Body: ""}})
+	if _, err := runCLI(t, m2, "notes", "delete", "n1", "--permanent", "--yes"); err != nil {
+		t.Fatalf("--yes: %v", err)
+	}
+	if len(m2.calls()) != 1 {
+		t.Errorf("calls = %v", m2.calls())
+	}
+}
+
+// TestNotesDeleteWithoutPermanentNeverAsks is the other half of the rule. The
+// ordinary delete is recoverable, and making it prompt would train people to
+// type "yes" without reading — which is how the prompt that matters stops being
+// read at all.
+func TestNotesDeleteWithoutPermanentNeverAsks(t *testing.T) {
+	const route = "DELETE /api/v1/notes/n1"
+	pipedStdin(t) // any prompt fails the test
+	m := newAPIMock(t, map[string]mockReply{route: {Status: 204, Body: ""}})
+
+	out, err := runCLI(t, m, "notes", "delete", "n1")
+	if err != nil {
+		t.Fatalf("trashing a note must not need confirmation: %v", err)
+	}
+	if !strings.Contains(out, "moved to trash") {
+		t.Errorf("output = %q", out)
+	}
+	if got := m.queryOf(t, route).Get("permanent"); got == "true" {
+		t.Errorf("a plain delete must not send permanent=true")
+	}
+}

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
+	"github.com/spf13/cobra"
 )
 
 // TestAccountDeleteGuard exercises the non-interactive / confirmation-phrase
@@ -509,6 +510,100 @@ func TestAccountConfirmExportDelete(t *testing.T) {
 	// Tests never run on a TTY, so this exercises the non-interactive branch.
 	if err := accountConfirmExportDelete(false); err == nil {
 		t.Error("a non-interactive delete without --yes must refuse")
+	}
+}
+
+// TestAccountConfirmExportDeleteAbortsOnAnyAnswerButYes drives the interactive
+// wrong-answer branch, which is unreachable off a real terminal without the
+// prompt seam.
+func TestAccountConfirmExportDeleteAbortsOnAnyAnswerButYes(t *testing.T) {
+	for _, answer := range []string{"no", "", "y", "YES"} {
+		t.Run(answer, func(t *testing.T) {
+			answerPrompt(t, answer)
+			var err error
+			captureStdout(t, func() { err = accountConfirmExportDelete(false) })
+			if err == nil {
+				t.Fatalf("answering %q deleted the export", answer)
+			}
+			if !strings.Contains(err.Error(), "the export was not deleted") {
+				t.Errorf("err = %q", err.Error())
+			}
+		})
+	}
+	answerPrompt(t, "yes")
+	var err error
+	captureStdout(t, func() { err = accountConfirmExportDelete(false) })
+	if err != nil {
+		t.Errorf("typing yes must proceed, got %v", err)
+	}
+}
+
+// TestAccountExportDeleteRunEStopsOnAWrongAnswer is the call-site half: the
+// command must actually honour the guard and send nothing.
+func TestAccountExportDeleteRunEStopsOnAWrongAnswer(t *testing.T) {
+	answerPrompt(t, "no")
+	m := newAPIMock(t, map[string]mockReply{})
+
+	out, err := runCLI(t, m, "account", "export-delete", "e1")
+	if err == nil {
+		t.Fatal("answering no must fail the command")
+	}
+	if len(m.calls()) != 0 {
+		t.Fatalf("the export was deleted anyway: %v", m.calls())
+	}
+	if strings.Contains(out, "deleted") {
+		t.Errorf("stdout claimed a delete after an abort:\n%s", out)
+	}
+}
+
+// TestAccountExportDeleteRunEProceedsOnTypedYes keeps the gate passable.
+func TestAccountExportDeleteRunEProceedsOnTypedYes(t *testing.T) {
+	answerPrompt(t, "yes")
+	m := newAPIMock(t, map[string]mockReply{
+		"DELETE /api/v1/account/export/e1": {Status: 200, Body: `{"data":{"export_job_id":"e1","status":"deleted","format":"enex"}}`},
+	})
+
+	if _, err := runCLI(t, m, "account", "export-delete", "e1"); err != nil {
+		t.Fatalf("account export-delete after typing yes: %v", err)
+	}
+	if len(m.calls()) != 1 || m.calls()[0] != "DELETE /api/v1/account/export/e1" {
+		t.Errorf("calls = %v", m.calls())
+	}
+}
+
+// TestAccountResolveConfirmRejectsAMistypedPhrase pins the most expensive
+// wrong-answer branch in the CLI. accountDeleteGuard is already covered, but the
+// INTERACTIVE path does its own verbatim check afterwards, and until the prompt
+// became injectable nothing proved a near-miss stopped the deletion.
+func TestAccountResolveConfirmRejectsAMistypedPhrase(t *testing.T) {
+	// A bare command carrying only the two flags accountResolveConfirm reads.
+	newCmd := func() *cobra.Command {
+		c := &cobra.Command{Use: "delete"}
+		c.Flags().String("confirm", "", "")
+		c.Flags().Bool("yes", false, "")
+		return c
+	}
+
+	for _, typed := range []string{"delete my account", "DELETE MY ACCOUNT ", "DELETE", "", "yes"} {
+		t.Run(typed, func(t *testing.T) {
+			answerPrompt(t, typed)
+			var err error
+			captureStdout(t, func() { _, err = accountResolveConfirm(newCmd()) })
+			if err == nil {
+				t.Fatalf("typing %q scheduled an account deletion", typed)
+			}
+			if !strings.Contains(err.Error(), "did not match") {
+				t.Errorf("err = %q, want it to say the phrase did not match", err.Error())
+			}
+		})
+	}
+
+	answerPrompt(t, accountDeleteConfirmPhrase)
+	var phrase string
+	var err error
+	captureStdout(t, func() { phrase, err = accountResolveConfirm(newCmd()) })
+	if err != nil || phrase != accountDeleteConfirmPhrase {
+		t.Errorf("the exact phrase must proceed: (%q, %v)", phrase, err)
 	}
 }
 
