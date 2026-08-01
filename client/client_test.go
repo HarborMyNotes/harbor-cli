@@ -6,15 +6,17 @@ package client
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/printer"
 	"go/token"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -272,10 +274,17 @@ func TestPlatformHeaderSurvivesRefreshRetry(t *testing.T) {
 
 // TestEveryRequestBuilderSetsCommonHeaders is the structural half of the proof.
 // The table tests above cover the transports that exist today; this one covers
-// the transport somebody adds next year. It parses this package's own source and
-// requires that any function calling http.NewRequest also calls
-// setCommonHeaders, so a fourth request builder that quietly bypasses the shared
-// headers fails here rather than silently shipping as untagged traffic.
+// the transport somebody adds next year. It walks the WHOLE repository's source
+// and enforces two rules:
+//
+//   - Inside this package, a function that builds an *http.Request must also call
+//     setCommonHeaders, so a new transport cannot quietly ship as untagged traffic.
+//   - Outside this package, nothing may build an *http.Request at all. Every
+//     Harbor API call belongs behind this client; a request built in cmd/ would
+//     bypass setCommonHeaders by construction and no amount of checking in here
+//     would see it. (cmd/auth.go runs an http.Server for the OAuth loopback
+//     callback — that is an inbound listener, not a request, and does not trip
+//     this.)
 //
 // exemptRequestBuilders is the deliberate, documented exception list — adding to
 // it should be a conscious decision made in review, which is the point.
@@ -285,16 +294,15 @@ func TestEveryRequestBuilderSetsCommonHeaders(t *testing.T) {
 	// bearer token nor the platform header.
 	exemptRequestBuilders := map[string]bool{"FetchURL": true}
 
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("failed to read the client package directory: %v", err)
-	}
-
 	fset := token.NewFileSet()
 
-	// calls reports whether a function body contains a call whose callee renders
-	// as the given source text (e.g. "http.NewRequest").
-	calls := func(fn *ast.FuncDecl, want string) bool {
+	// callsPrefixed reports whether a function body contains a call whose callee
+	// renders with the given source prefix. The match is a PREFIX, not equality,
+	// so that "http.NewRequest" also catches http.NewRequestWithContext — the
+	// spelling a new transport is most likely to reach for, and the one an exact
+	// comparison would wave straight through the guard whose whole job is to
+	// catch it. Nothing else in the standard library starts with that text.
+	callsPrefixed := func(fn *ast.FuncDecl, prefix string) bool {
 		found := false
 		ast.Inspect(fn, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
@@ -302,7 +310,7 @@ func TestEveryRequestBuilderSetsCommonHeaders(t *testing.T) {
 				return true
 			}
 			var buf bytes.Buffer
-			if err := printer.Fprint(&buf, fset, call.Fun); err == nil && buf.String() == want {
+			if err := printer.Fprint(&buf, fset, call.Fun); err == nil && strings.HasPrefix(buf.String(), prefix) {
 				found = true
 			}
 			return true
@@ -310,33 +318,57 @@ func TestEveryRequestBuilderSetsCommonHeaders(t *testing.T) {
 		return found
 	}
 
+	// The test runs with the client package as its working directory, so ".."
+	// is the repository root.
 	var builders int
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-			continue
-		}
-		file, err := parser.ParseFile(fset, name, nil, 0)
+	err := filepath.WalkDir("..", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			t.Fatalf("failed to parse %s: %v", name, err)
+			return err
 		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", "build", "dist", "vendor", "node_modules":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		file, parseErr := parser.ParseFile(fset, path, nil, 0)
+		if parseErr != nil {
+			return fmt.Errorf("failed to parse %s: %w", path, parseErr)
+		}
+		inClientPkg := file.Name.Name == "client"
+
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil || !calls(fn, "http.NewRequest") {
+			if !ok || fn.Body == nil || !callsPrefixed(fn, "http.NewRequest") {
 				continue
 			}
 			builders++
+			if !inClientPkg {
+				t.Errorf("%s: %s builds an *http.Request outside the client package — "+
+					"it cannot reach setCommonHeaders, so it would send Harbor API traffic "+
+					"without X-Harbor-Platform: cli. Move the call behind a client method.",
+					path, fn.Name.Name)
+				continue
+			}
 			if exemptRequestBuilders[fn.Name.Name] {
 				continue
 			}
-			if !calls(fn, "c.setCommonHeaders") {
+			if !callsPrefixed(fn, "c.setCommonHeaders") {
 				t.Errorf("%s: %s builds an *http.Request but never calls setCommonHeaders — "+
 					"it would send Harbor API traffic without X-Harbor-Platform: cli. "+
 					"Route it through setCommonHeaders, or add it to exemptRequestBuilders "+
 					"with a comment saying why it is not a Harbor API request.",
-					name, fn.Name.Name)
+					path, fn.Name.Name)
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("failed to walk the repository source: %v", err)
 	}
 
 	// A sanity floor: if a refactor moved request building out of this package
