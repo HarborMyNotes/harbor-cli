@@ -4,10 +4,17 @@
 package client
 
 import (
+	"bytes"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/printer"
+	"go/token"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"strings"
 	"testing"
 )
@@ -107,6 +114,237 @@ func TestDoGetSetsHeadersAndQuery(t *testing.T) {
 	}
 	if rec.RequestID == "" || !strings.HasPrefix(rec.RequestID, "req_") {
 		t.Errorf("X-Request-Id = %q, want req_ prefix", rec.RequestID)
+	}
+	if rec.Platform != "cli" {
+		t.Errorf("X-Harbor-Platform = %q, want cli", rec.Platform)
+	}
+}
+
+// TestPlatformHeaderOnEveryTransport is the proof behind the claim that EVERY
+// Harbor API request carries X-Harbor-Platform: cli. Asserting the header merely
+// exists would pass against the bug worth preventing — a value that is right for
+// whichever transport someone happened to test and wrong (or absent) on the
+// others — so each case asserts the exact string, written out literally rather
+// than read from clientPlatform, so a typo in the source cannot make the test
+// agree with it.
+//
+// The three request-building sites in this package are covered: requestWithStatus
+// (every doGet/doPost/doPatch/doPut/doDelete/doJSON/doMultipart), rawRequest
+// (doGetRaw and the file downloads), and rawPostWithRefresh (the ENEX export
+// stream). The fourth site, FetchURL, hits a presigned non-Harbor URL and must
+// NOT carry the header — that is pinned by TestFetchURLSkipsHarborHeaders.
+func TestPlatformHeaderOnEveryTransport(t *testing.T) {
+	// enex is the streaming ENEX export body; it is not a JSON envelope, so it
+	// stands in for any raw response the client streams back.
+	const enex = `<?xml version="1.0"?><en-export></en-export>`
+
+	cases := []struct {
+		name string
+		call func(c *Client) error
+	}{
+		{"doGet", func(c *Client) error { _, e := c.doGet("/notes", nil); return e }},
+		{"doGetQuery", func(c *Client) error {
+			_, e := c.doGetQuery("/notebooks", url.Values{"parent_id": {""}})
+			return e
+		}},
+		{"doPost", func(c *Client) error { _, e := c.doPost("/notes", map[string]any{"title": "x"}); return e }},
+		{"doPatch", func(c *Client) error { _, e := c.doPatch("/notes/n1", map[string]any{"title": "x"}); return e }},
+		{"doPut", func(c *Client) error { _, e := c.doPut("/notes/n1/tags/t1", nil); return e }},
+		{"doDelete", func(c *Client) error { _, e := c.doDelete("/notes/n1", nil); return e }},
+		{"doMultipart", func(c *Client) error {
+			_, e := c.doMultipart("/files/upload", map[string]string{"mime": "text/plain"},
+				"file", "hello.txt", strings.NewReader("hello bytes"))
+			return e
+		}},
+		{"doGetRaw", func(c *Client) error {
+			resp, e := c.doGetRaw("/files/abc/raw", nil)
+			if e == nil {
+				resp.Body.Close()
+			}
+			return e
+		}},
+		{"rawPost (ENEX export)", func(c *Client) error {
+			resp, e := c.ExportENEX("nb1", nil, false)
+			if e == nil {
+				resp.Body.Close()
+			}
+			return e
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var rec recordedRequest
+			srv := newTestServer(t, &rec, 200, enex)
+			defer srv.Close()
+
+			if err := tc.call(testClient(srv.URL)); err != nil {
+				t.Fatalf("%s error: %v", tc.name, err)
+			}
+			if rec.Platform != "cli" {
+				t.Errorf("X-Harbor-Platform = %q, want cli", rec.Platform)
+			}
+		})
+	}
+}
+
+// TestPlatformHeaderWithoutToken proves the header does not ride on the bearer
+// token. The public endpoints — login, register, password reset, public share,
+// the /health and /version probes — run through an anonymous client, and the
+// server's PlatformMiddleware is global, so those requests are exactly as much a
+// "CLI request" as an authenticated one.
+func TestPlatformHeaderWithoutToken(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 200, `{"data":{}}`)
+	defer srv.Close()
+
+	if _, err := NewClient(srv.URL, "").doPost("/oauth/token", map[string]any{"grant_type": "password"}); err != nil {
+		t.Fatalf("anonymous doPost error: %v", err)
+	}
+	if rec.Auth != "" {
+		t.Errorf("Authorization = %q, want empty on an anonymous client", rec.Auth)
+	}
+	if rec.Platform != "cli" {
+		t.Errorf("X-Harbor-Platform = %q, want cli", rec.Platform)
+	}
+}
+
+// TestPlatformHeaderSurvivesRefreshRetry covers the one request the CLI builds
+// that no command calls directly: the retry issued after a transparent token
+// refresh. Each of the three transports rebuilds the request from scratch on
+// retry, so a header set only on the first attempt would vanish on exactly the
+// requests a long-running session makes most.
+func TestPlatformHeaderSurvivesRefreshRetry(t *testing.T) {
+	cases := []struct {
+		name string
+		call func(c *Client) error
+	}{
+		{"requestWithStatus", func(c *Client) error { _, e := c.doGet("/notes", nil); return e }},
+		{"rawRequest", func(c *Client) error {
+			resp, e := c.doGetRaw("/files/abc/raw", nil)
+			if e == nil {
+				resp.Body.Close()
+			}
+			return e
+		}},
+		{"rawPostWithRefresh", func(c *Client) error {
+			resp, e := c.ExportENEX("nb1", nil, false)
+			if e == nil {
+				resp.Body.Close()
+			}
+			return e
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// platforms records the header from every attempt, so a header
+			// present on the first request and dropped on the retry still fails.
+			var platforms []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				platforms = append(platforms, r.Header.Get("X-Harbor-Platform"))
+				if r.Header.Get("Authorization") == "Bearer at_old" {
+					w.WriteHeader(401)
+					_, _ = w.Write([]byte(`{"error":{"code":"invalid_token","message":"expired"}}`))
+					return
+				}
+				w.WriteHeader(200)
+				_, _ = w.Write([]byte(`{"data":{"ok":true}}`))
+			}))
+			defer srv.Close()
+
+			c := NewClient(srv.URL, "at_old")
+			c.OnUnauthorized = func() (string, bool) { return "at_new", true }
+			if err := tc.call(c); err != nil {
+				t.Fatalf("%s error: %v", tc.name, err)
+			}
+			if len(platforms) != 2 {
+				t.Fatalf("attempts = %d, want 2 (original + retry)", len(platforms))
+			}
+			for i, got := range platforms {
+				if got != "cli" {
+					t.Errorf("attempt %d: X-Harbor-Platform = %q, want cli", i+1, got)
+				}
+			}
+		})
+	}
+}
+
+// TestEveryRequestBuilderSetsCommonHeaders is the structural half of the proof.
+// The table tests above cover the transports that exist today; this one covers
+// the transport somebody adds next year. It parses this package's own source and
+// requires that any function calling http.NewRequest also calls
+// setCommonHeaders, so a fourth request builder that quietly bypasses the shared
+// headers fails here rather than silently shipping as untagged traffic.
+//
+// exemptRequestBuilders is the deliberate, documented exception list — adding to
+// it should be a conscious decision made in review, which is the point.
+func TestEveryRequestBuilderSetsCommonHeaders(t *testing.T) {
+	// FetchURL targets a presigned storage URL whose credentials live in the
+	// query string. It is not a Harbor API endpoint, so it must send neither the
+	// bearer token nor the platform header.
+	exemptRequestBuilders := map[string]bool{"FetchURL": true}
+
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("failed to read the client package directory: %v", err)
+	}
+
+	fset := token.NewFileSet()
+
+	// calls reports whether a function body contains a call whose callee renders
+	// as the given source text (e.g. "http.NewRequest").
+	calls := func(fn *ast.FuncDecl, want string) bool {
+		found := false
+		ast.Inspect(fn, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			var buf bytes.Buffer
+			if err := printer.Fprint(&buf, fset, call.Fun); err == nil && buf.String() == want {
+				found = true
+			}
+			return true
+		})
+		return found
+	}
+
+	var builders int
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("failed to parse %s: %v", name, err)
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil || !calls(fn, "http.NewRequest") {
+				continue
+			}
+			builders++
+			if exemptRequestBuilders[fn.Name.Name] {
+				continue
+			}
+			if !calls(fn, "c.setCommonHeaders") {
+				t.Errorf("%s: %s builds an *http.Request but never calls setCommonHeaders — "+
+					"it would send Harbor API traffic without X-Harbor-Platform: cli. "+
+					"Route it through setCommonHeaders, or add it to exemptRequestBuilders "+
+					"with a comment saying why it is not a Harbor API request.",
+					name, fn.Name.Name)
+			}
+		}
+	}
+
+	// A sanity floor: if a refactor moved request building out of this package
+	// the scan would find nothing and pass vacuously, which is the one way this
+	// guard could rot without anyone noticing.
+	if builders < 4 {
+		t.Errorf("found %d http.NewRequest sites, want at least 4 — the scan is no longer finding "+
+			"the request builders it is meant to guard", builders)
 	}
 }
 

@@ -57,6 +57,18 @@ type Client struct {
 // clientPlatform identifies this client to the API via the X-Harbor-Platform
 // header on every request. The backend uses it to attribute in-app Contact
 // Support requests (and analytics) to the platform they originated from.
+//
+// The exact string matters. The server's supportedPlatforms allowlist
+// (internal/analytics/analytics.go) is CLOSED: it maps "cli" → "cli", and
+// silently drops anything else to the "api" fallback rather than rejecting the
+// request. So a plausible-looking near-miss like "harbor-cli" would leave every
+// CLI request indistinguishable from a generic API call while looking correct
+// from this side. TestPlatformHeaderOnEveryTransport asserts the literal value
+// for that reason.
+//
+// There is deliberately no version alongside it: no Harbor client sends one, and
+// the server defines no version header. Client version reaches the server in the
+// support request body as app_version (see cmd/support.go), not on the wire.
 const clientPlatform = "cli"
 
 // NewClient creates a Harbor API client for the given base URL and access
