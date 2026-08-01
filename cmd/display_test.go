@@ -4,8 +4,11 @@
 package cmd
 
 import (
+	"encoding/json"
+	"errors"
 	"io"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -208,5 +211,101 @@ func TestShortID(t *testing.T) {
 	}
 	if got := shortID("abc", 6); got != "abc" {
 		t.Errorf("shortID short = %q", got)
+	}
+}
+
+// ===========================================================================
+// Error rendering
+// ===========================================================================
+
+// TestRenderErrorJSONModeEmitsTheEnvelopeOnStderr covers the --json contract on
+// the failure path: a script that parses this CLI should not have to switch to
+// scraping English the moment something goes wrong. stdout stays empty either
+// way, so a pipeline never sees the error as data.
+func TestRenderErrorJSONModeEmitsTheEnvelopeOnStderr(t *testing.T) {
+	jsonOutput = true
+	defer func() { jsonOutput = false }()
+
+	failure := &client.APIError{
+		Code:      "plan_limit_reached",
+		Message:   "You've reached your plan's limit of 3 notebooks.",
+		Details:   map[string]any{"resource": "notebook", "used": "3", "limit": "3"},
+		RequestID: "req_test",
+		Status:    403,
+	}
+
+	var errOut string
+	out := captureStdout(t, func() {
+		errOut = captureStderr(t, func() { renderError(failure) })
+	})
+	if out != "" {
+		t.Errorf("error leaked onto stdout: %q", out)
+	}
+
+	var decoded struct {
+		Error struct {
+			Code      string            `json:"code"`
+			Message   string            `json:"message"`
+			Details   map[string]string `json:"details"`
+			RequestID string            `json:"request_id"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(errOut), &decoded); err != nil {
+		t.Fatalf("stderr is not JSON in --json mode: %v\n%s", err, errOut)
+	}
+	if decoded.Error.Code != "plan_limit_reached" || decoded.Error.Details["limit"] != "3" {
+		t.Errorf("envelope lost the code or details: %+v", decoded.Error)
+	}
+	if decoded.Error.RequestID != "req_test" {
+		t.Errorf("request_id = %q, want req_test", decoded.Error.RequestID)
+	}
+}
+
+// TestRenderErrorJSONModeWrapsLocalErrors keeps --json uniform: an error raised
+// by the CLI itself (a missing flag, no saved session) must be parseable too,
+// or a script has to handle two shapes.
+func TestRenderErrorJSONModeWrapsLocalErrors(t *testing.T) {
+	jsonOutput = true
+	defer func() { jsonOutput = false }()
+
+	errOut := captureStderr(t, func() { renderError(errors.New("nothing to update")) })
+	var decoded map[string]map[string]any
+	if err := json.Unmarshal([]byte(errOut), &decoded); err != nil {
+		t.Fatalf("local error is not JSON in --json mode: %v\n%s", err, errOut)
+	}
+	if decoded["error"]["message"] != "nothing to update" {
+		t.Errorf("message lost: %v", decoded["error"])
+	}
+}
+
+// TestRenderErrorPlainModeStaysHumanReadable is the counterweight: outside
+// --json the operator still gets prose, not an envelope.
+func TestRenderErrorPlainModeStaysHumanReadable(t *testing.T) {
+	errOut := captureStderr(t, func() { renderError(apiErr("validation_failed")) })
+	if !strings.HasPrefix(errOut, "Error: ") {
+		t.Errorf("plain-mode error is not the human form:\n%s", errOut)
+	}
+	if strings.Contains(errOut, `"error"`) {
+		t.Errorf("plain-mode error rendered as JSON:\n%s", errOut)
+	}
+}
+
+// TestRenderErrorRoutesPlanLimitsToTheirOwnExplanation pins the branch in
+// renderError itself: without it a plan limit would fall back to a bullet list
+// of the gate's internals (gate, remediation_action, current…).
+func TestRenderErrorRoutesPlanLimitsToTheirOwnExplanation(t *testing.T) {
+	failure := &client.APIError{
+		Code:    planLimitCode,
+		Message: "You've reached your plan's limit of 3 notebooks.",
+		Details: map[string]any{"resource": "notebook", "used": "3", "limit": "3", "gate": "plan_limit"},
+		Status:  403,
+	}
+	errOut := captureStderr(t, func() { renderError(failure) })
+
+	if !strings.Contains(errOut, "harbor usage") {
+		t.Errorf("plan limit did not get the explanation:\n%s", errOut)
+	}
+	if strings.Contains(errOut, "gate: plan_limit") {
+		t.Errorf("the gate's internals were dumped at the user:\n%s", errOut)
 	}
 }

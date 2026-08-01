@@ -138,3 +138,33 @@ func TestMapSyncError(t *testing.T) {
 		t.Errorf("scope_forbidden = %q", got.Error())
 	}
 }
+
+// TestDisplaySyncPushExplainsPlanLimitRejections covers the one create path
+// that cannot fail loudly: push answers 200 even when the server refused
+// individual changes, so without this the rejection is just a raw error code in
+// one row's NOTE column and the push reads as a success.
+func TestDisplaySyncPushExplainsPlanLimitRejections(t *testing.T) {
+	t.Setenv("HARBOR_API_URL", "https://harbor.example/api/v1")
+	body := `{"results":[
+	  {"change_id":"c1","type":"note","id":"n1","status":"applied","new_usn":11},
+	  {"change_id":"c2","type":"note","id":"n2","status":"rejected","error":"plan_limit_reached"}
+	],"scope_max_usn":11}`
+
+	out := captureStdout(t, func() { displaySyncPush([]byte(body)) })
+	if !strings.Contains(out, "plan limit") {
+		t.Errorf("a plan-limit rejection was not explained:\n%s", out)
+	}
+	if !strings.Contains(out, "https://harbor.example/settings/plan") {
+		t.Errorf("no upgrade pointer after a refused push:\n%s", out)
+	}
+}
+
+// TestDisplaySyncPushStaysQuietWhenNothingWasRefused keeps the notice honest:
+// a clean push must not print a limit warning.
+func TestDisplaySyncPushStaysQuietWhenNothingWasRefused(t *testing.T) {
+	body := `{"results":[{"change_id":"c1","type":"note","id":"n1","status":"applied","new_usn":11}],"scope_max_usn":11}`
+	out := captureStdout(t, func() { displaySyncPush([]byte(body)) })
+	if strings.Contains(out, "plan limit") {
+		t.Errorf("a clean push warned about plan limits:\n%s", out)
+	}
+}
