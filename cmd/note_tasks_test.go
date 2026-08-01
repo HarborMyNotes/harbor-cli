@@ -99,6 +99,76 @@ func TestNotesUpdateKeepTasksCarriesTheBlockIntoTheNewBody(t *testing.T) {
 	}
 }
 
+// --keep-tasks must not report success while deleting the task. Appending a block
+// onto content that ends inside an unterminated ``` fence puts the block INSIDE the
+// fence: the Markdown converter escapes it to text, the server reads back no
+// reference, and the task is tombstoned — by the very flag asked to save it. The
+// remedy the refusal message recommends must not be able to destroy what it exists
+// to protect, so the assembled body is re-scanned and a body that swallows the
+// blocks is refused with nothing written.
+func TestNotesUpdateKeepTasksRefusesWhenTheBodySwallowsTheBlocks(t *testing.T) {
+	m := newAPIMock(t, noteWithTaskRoutes())
+
+	_, err := runCLI(t, m, "notes", "update", "n1", "--keep-tasks",
+		"--content", "# Notes\n\nHere is some code:\n\n```go\nfunc main() {}\n")
+
+	if err == nil {
+		t.Fatal("--keep-tasks appended a block into an unterminated fence and reported success — the task is deleted")
+	}
+	assertNoWrite(t, m)
+	for _, want := range []string{"could not save", "Buy milk", "close the fence", "--allow-task-loss"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal never mentions %q:\n%s", want, err)
+		}
+	}
+}
+
+// The same post-condition in HTML mode. Each of these bodies ends inside something
+// that swallows what follows, so the appended block becomes TEXT and the server
+// reads back no reference. Every one was MEASURED against a real server deleting the
+// task while the CLI exited 0 — they are recorded failures, not hypotheticals.
+func TestNotesUpdateKeepTasksRefusesWhenHTMLSwallowsTheBlocks(t *testing.T) {
+	cases := map[string]string{
+		"unclosed comment":  "<p>new</p><!-- todo: finish this",
+		"unclosed textarea": "<p>new</p><textarea>",
+		"unclosed script":   "<p>new</p><script>",
+		"unclosed style":    "<p>new</p><style>",
+		"unclosed title":    "<p>new</p><title>",
+		"truncated tag":     "<p>new</p><div",
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			m := newAPIMock(t, noteWithTaskRoutes())
+
+			_, err := runCLI(t, m, "notes", "update", "n1", "--keep-tasks", "--format", "html", "--content", content)
+
+			if err == nil {
+				t.Fatal("--keep-tasks reported success on a body that swallows the block — the task is deleted")
+			}
+			assertNoWrite(t, m)
+			if !strings.Contains(err.Error(), "could not save") {
+				t.Errorf("wrong refusal:\n%s", err)
+			}
+		})
+	}
+}
+
+// The post-condition must not fire on ordinary content — a body that ends in a
+// CLOSED fence is fine, and refusing it would make --keep-tasks useless.
+func TestNotesUpdateKeepTasksStillWorksAfterAClosedFence(t *testing.T) {
+	m := newAPIMock(t, noteWithTaskRoutes())
+
+	_, err := runCLI(t, m, "notes", "update", "n1", "--keep-tasks",
+		"--content", "# Notes\n\n```go\nfunc main() {}\n```\n")
+	if err != nil {
+		t.Fatalf("a closed fence was wrongly refused: %v", err)
+	}
+	sent, _ := m.bodyOf(t, "PATCH /api/v1/notes/n1")["content"].(string)
+	if !strings.Contains(sent, taskBlockHTML(fixtureTaskID)) {
+		t.Errorf("the block was dropped from a perfectly good body:\n%s", sent)
+	}
+}
+
 // --allow-task-loss is the escape hatch: it proceeds with exactly the body the
 // user wrote, but says on stderr what it is deleting. The notice goes to stderr
 // so it cannot corrupt a piped --json stdout.
@@ -358,6 +428,20 @@ func TestNoteTaskBlockIDs(t *testing.T) {
 		// Text, not markup: the sanitizer drops comments and the Markdown
 		// converter escapes code, so none of these reaches the server as a block.
 		{"html comment", `<!-- <harbor-task id="` + fixtureTaskID + `"> -->`, "html", []string{}},
+		{"unterminated html comment", `<p>x</p><!-- <harbor-task id="` + fixtureTaskID + `">`, "html", []string{}},
+
+		// Raw-text elements swallow their contents as TEXT. A regex scanner reads
+		// these as markup and the server does not — the divergence that let
+		// --keep-tasks report success while the task was deleted.
+		{"inside textarea", `<textarea><harbor-task id="` + fixtureTaskID + `"></textarea>`, "html", []string{}},
+		{"inside script", `<script><harbor-task id="` + fixtureTaskID + `"></script>`, "html", []string{}},
+		{"inside style", `<style><harbor-task id="` + fixtureTaskID + `"></style>`, "html", []string{}},
+		{"inside title", `<title><harbor-task id="` + fixtureTaskID + `"></title>`, "html", []string{}},
+		{"after an unclosed textarea", `<p>x</p><textarea><harbor-task id="` + fixtureTaskID + `">`, "html", []string{}},
+
+		// …but a block nested in ordinary markup is markup, wherever it sits.
+		{"nested in a list item", `<ul><li><harbor-task id="` + fixtureTaskID + `"></li></ul>`, "html", []string{fixtureTaskID}},
+		{"inside pre", `<pre><harbor-task id="` + fixtureTaskID + `"></pre>`, "html", []string{fixtureTaskID}},
 		{"fenced code", "```\n<harbor-task id=\"" + fixtureTaskID + "\">\n```", "markdown", []string{}},
 		{"tilde fenced code", "~~~\n<harbor-task id=\"" + fixtureTaskID + "\">\n~~~", "markdown", []string{}},
 		{"inline code", "the `<harbor-task id=\"" + fixtureTaskID + "\">` block", "markdown", []string{}},

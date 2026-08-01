@@ -10,6 +10,9 @@ import (
 	"regexp"
 	"strings"
 
+	"golang.org/x/net/html"
+	"golang.org/x/net/html/atom"
+
 	"github.com/HarborMyNotes/harbor-cli/client"
 	"github.com/spf13/cobra"
 )
@@ -36,67 +39,83 @@ import (
 // delete a task. --keep-tasks and --allow-task-loss say which was meant.
 
 var (
-	// taskBlockAttrRe finds the id attribute of every <harbor-task …> tag in a
-	// body, in all three attribute spellings (double-quoted, single-quoted, bare).
-	// It is deliberately a scanner and not an HTML parse: the CLI has no HTML
-	// parser dependency, and the two directions of imprecision are not equal — see
-	// noteTaskBlockIDs.
-	taskBlockAttrRe = regexp.MustCompile(`(?is)<harbor-task\b[^>]*?\sid\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>]+))`)
-
 	// taskBlockIDRe is the server's own rule for a block id worth anything: the
 	// canonical 36-character hyphenated UUID (notes.taskIDRe). A block whose id is
 	// spelled any other way (braced, urn-prefixed, bare 32-hex) references no task
 	// the reconciler can resolve, so it neither saves a task nor endangers one.
 	taskBlockIDRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
-	// htmlCommentRe matches an HTML comment, which the server's sanitizer strips —
-	// so a block inside one is text, not markup, and must not count as carried over.
-	htmlCommentRe = regexp.MustCompile(`(?s)<!--.*?-->`)
-
 	// mdInlineCodeRe matches a single-backtick Markdown code span. Prose about a
 	// task block ("the `<harbor-task id=…>` block") is escaped by the Markdown
-	// converter, so it is text too.
+	// converter, so it is text, not markup.
 	mdInlineCodeRe = regexp.MustCompile("`[^`\n]*`")
 )
 
 // noteTaskBlockIDs returns the distinct task ids a body references through its
-// <harbor-task id="…"> blocks, lower-cased, in order of first appearance. format
-// is "markdown" or "html" and selects how much of the input is code rather than
-// markup.
+// <harbor-task id="…"> blocks, lower-cased, in document order. format is "markdown"
+// or "html" and says how much of the input is code rather than markup.
 //
-// WHY A SCANNER AND NOT A PARSER. The two ways this can be wrong are not
-// symmetric, and the scanner is arranged so the cheap errors are the safe ones:
+// WHY A REAL PARSE. This function answers one question — "which blocks will the
+// SERVER see?" — and the only reliable way to answer it is to do what the server
+// does: notes.extractTaskIDs walks an html.ParseFragment tree, so this walks the
+// same tree from the same library. Getting it wrong in the new content is a silent
+// deletion, and a regex scanner gets it wrong in ways that are not hypothetical:
+// a body ending in an unclosed <textarea>, <script>, <style>, <title> or a
+// truncated tag puts everything after it inside that element as TEXT, which a
+// scanner happily reads as markup and the server does not. Each of those was
+// measured deleting a task while the CLI reported success. A parser handles them,
+// and the ones nobody has thought of yet, by construction.
 //
-//   - Over-detecting in the note's CURRENT body means the guard protects a task
-//     that was not really at risk — a refusal the user did not need. Harmless.
-//   - Over-detecting in the NEW content means believing a task is carried over
-//     when the server will not see its block — a silent deletion, i.e. the very
-//     bug. So the Markdown constructs that turn markup back into text (fenced
-//     code, inline code spans) and HTML comments are removed before scanning.
+// MARKDOWN runs through goldmark first, and goldmark ESCAPES what it treats as
+// code before any HTML parsing happens — so fenced blocks and inline code spans are
+// stripped here first, then the remainder (which goldmark passes through raw,
+// WithUnsafe) is parsed. Comments need no special case: the parser makes them
+// comment nodes, terminated or not.
 //
-// KNOWN LIMIT, stated rather than hidden: a 4-space-indented Markdown code block
-// is not stripped, because in this position indentation is far more often list
-// continuation than code. A task block hidden in one would be counted as carried
-// when it is not. It takes pasting your own note's task UUID into an indented code
-// sample to reach; `--format html` avoids the question entirely.
+// KNOWN LIMIT, stated rather than hidden: a 4-space-indented Markdown code block is
+// not stripped, because in this position indentation is far more often list
+// continuation than code. A task block hidden in one is counted as carried when it
+// is not. It takes pasting your own note's task UUID into an indented code sample to
+// reach; tracked separately, and `--format html` avoids the question entirely.
 func noteTaskBlockIDs(content, format string) []string {
-	scan := htmlCommentRe.ReplaceAllString(content, " ")
+	scan := content
 	if format == "markdown" {
 		scan = stripMarkdownFences(scan)
 		scan = mdInlineCodeRe.ReplaceAllString(scan, " ")
 	}
 
+	nodes, err := html.ParseFragment(strings.NewReader(scan), &html.Node{
+		Type: html.ElementNode, Data: "body", DataAtom: atom.Body,
+	})
+	if err != nil {
+		// Matching the server, which treats an unparseable fragment as "no task
+		// blocks". Here that is also the safe answer: in the NEW content it means
+		// nothing is considered carried, so the guard refuses rather than deletes.
+		return []string{}
+	}
+
 	seen := map[string]bool{}
 	out := []string{}
-	for _, m := range taskBlockAttrRe.FindAllStringSubmatch(scan, -1) {
-		// Exactly one of the three alternatives captured; the rest are empty.
-		raw := m[1] + m[2] + m[3]
-		id := strings.ToLower(strings.TrimSpace(raw))
-		if !taskBlockIDRe.MatchString(id) || seen[id] {
-			continue
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "harbor-task" {
+			for _, a := range n.Attr {
+				if a.Key != "id" {
+					continue
+				}
+				id := strings.ToLower(strings.TrimSpace(a.Val))
+				if taskBlockIDRe.MatchString(id) && !seen[id] {
+					seen[id] = true
+					out = append(out, id)
+				}
+			}
 		}
-		seen[id] = true
-		out = append(out, id)
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	for _, n := range nodes {
+		walk(n)
 	}
 	return out
 }
@@ -206,6 +225,13 @@ func noteTasksAtRisk(c *client.Client, noteID, currentBody string) []noteTask {
 // listNoteTasks reads a note's tasks, in their in-note order. Any error yields an
 // empty slice rather than a failure: this feeds a union whose other half needs no
 // network at all, so degrading here costs precision, not protection.
+//
+// limit=500 is the server's own hard cap on this endpoint, not an arbitrary round
+// number — it is the most one request can return, so this is a single page by
+// design rather than by oversight. A note with more than 500 tasks would leave a
+// STRANDED one past the cap outside the at-risk set (a referenced one is still
+// caught by the body fallback, which reads the whole body). Tracked separately;
+// paging here would cost a round trip per 500 on every content update.
 func listNoteTasks(c *client.Client, noteID string) []noteTask {
 	data, err := c.ListNoteTasks(noteID, map[string]string{"limit": "500"})
 	if err != nil {
@@ -287,7 +313,18 @@ func guardNoteTaskLoss(cmd *cobra.Command, c *client.Client, noteID, format stri
 
 	switch {
 	case keep:
-		body["content"] = appendTaskBlocks(newContent, lost)
+		// Verify the assembled body rather than assume appending worked. The blocks
+		// are concatenated onto content the user wrote, and content that ends inside
+		// an unterminated code fence (or any other construct that swallows what
+		// follows) turns them into text — the server then sees no reference and
+		// deletes the very tasks --keep-tasks was asked to save, while the CLI
+		// reports success. Re-scanning catches that whatever the cause, where a list
+		// of known-bad constructs would only catch the ones already thought of.
+		merged := appendTaskBlocks(newContent, lost)
+		if missing := taskBlocksMissingFrom(merged, format, lost); len(missing) > 0 {
+			return nil, errors.New(keepFailedRefusal(missing, format))
+		}
+		body["content"] = merged
 		fmt.Fprintf(os.Stderr, "Kept %s: their blocks were re-appended to the end of the new body.\n", countTasks(len(lost)))
 		return note, nil
 	case allowLoss:
@@ -315,6 +352,56 @@ func appendTaskBlocks(content string, tasks []noteTask) string {
 		b.WriteString(taskBlockHTML(t.ID))
 		b.WriteString("\n")
 	}
+	return b.String()
+}
+
+// taskBlocksMissingFrom returns the tasks whose blocks a finished body does NOT
+// reference, judged by the same scanner that decides what the new content carries.
+// It is the post-condition on --keep-tasks: appending a block is only useful if the
+// server will read it back as markup.
+func taskBlocksMissingFrom(content, format string, want []noteTask) []noteTask {
+	present := map[string]bool{}
+	for _, id := range noteTaskBlockIDs(content, format) {
+		present[id] = true
+	}
+	missing := make([]noteTask, 0, len(want))
+	for _, t := range want {
+		if !present[t.ID] {
+			missing = append(missing, t)
+		}
+	}
+	return missing
+}
+
+// keepFailedRefusal builds the message for a --keep-tasks that could not be made
+// safe. The user asked for the right thing and it could not be delivered, so the
+// message leads with why rather than with what to type: silently writing the body
+// anyway would delete these tasks, which is exactly what they asked to prevent.
+func keepFailedRefusal(missing []noteTask, format string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "--keep-tasks could not save %s, so nothing has been written:\n", countTasks(len(missing)))
+	for _, t := range missing {
+		if t.Title != "" {
+			fmt.Fprintf(&b, "  • %s (%s)\n", t.Title, t.ID)
+			continue
+		}
+		fmt.Fprintf(&b, "  • %s\n", t.ID)
+	}
+	b.WriteString("\nTheir <harbor-task> blocks were appended to the new body, but the body\n")
+	b.WriteString("swallows them — anything after its last unclosed construct is text, not\n")
+	if format == "markdown" {
+		b.WriteString("markup. The usual cause is content ending inside an unterminated ``` fence.\n")
+		b.WriteString("Saving it would delete these tasks anyway. Fix it with one of:\n\n")
+		b.WriteString("  close the fence     so the body does not end inside a code block\n")
+		b.WriteString("  --format html       if the content is really HTML\n")
+	} else {
+		b.WriteString("markup. The usual cause is an unclosed comment, or an element whose\n")
+		b.WriteString("contents are not parsed as markup. Saving it would delete these tasks\n")
+		b.WriteString("anyway. Fix it with one of:\n\n")
+		b.WriteString("  close the element   so the body does not end inside it\n")
+	}
+	b.WriteString("  harbor notes append add to the body instead of replacing it\n")
+	b.WriteString("  --allow-task-loss   delete them; that is what you meant\n")
 	return b.String()
 }
 
