@@ -96,10 +96,19 @@ var notesGetCmd = &cobra.Command{
 var notesCreateCmd = &cobra.Command{
 	Use:   "create",
 	Short: "Create a note",
-	Long:  "Create a note. Provide the body with --content, --file, or --stdin (Markdown by default; --format html for HTML).",
+	Long: `Create a note. Provide the body with --content, --file, or --stdin (Markdown by
+default; --format html for HTML).
+
+ENCRYPTION. A notebook can be marked "encrypt new notes by default", and that
+applies to your default notebook too. Creating a note in one needs your
+passphrase: set HARBOR_PASSPHRASE and the note is sealed before it leaves this
+machine. WITHOUT IT THE CREATE IS REFUSED and nothing is written — the CLI will
+not quietly land a plaintext note in a notebook you asked to be encrypted. To
+put an unencrypted note there on purpose, say so with --plaintext.`,
 	Example: `  harbor notes create --title "Plan" --content "# Goals\n\n- ship it"
   echo "# Notes" | harbor notes create --title Standup --stdin
-  harbor notes create --title Recipe --file recipe.md --notebook 5b1f...`,
+  harbor notes create --title Recipe --file recipe.md --notebook 5b1f...
+  harbor notes create --title Draft --content "wip" --plaintext   # unencrypted, on purpose`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c, creds, err := loadClientFromConfig()
 		if err != nil {
@@ -123,7 +132,10 @@ var notesCreateCmd = &cobra.Command{
 		}
 		// Encrypt client-side when --encrypt is set or the target notebook defaults
 		// to encryption. The note id is generated first because the field AAD binds
-		// to it; an encrypted note must carry a content envelope.
+		// to it; an encrypted note must carry a content envelope. This also REFUSES
+		// the create outright when the destination encrypts by default and there is
+		// no passphrase to do it with — the error arrives before CreateNote, so a
+		// refusal writes nothing.
 		encrypt, err := shouldEncryptCreate(cmd, c, notebookID)
 		if err != nil {
 			return err
@@ -431,7 +443,7 @@ func init() {
 	notesCreateCmd.Flags().String("source-url", "", "Source URL attribute")
 	notesCreateCmd.Flags().String("author", "", "Author attribute")
 	notesCreateCmd.Flags().Bool("encrypt", false, "Encrypt this note end-to-end (requires HARBOR_PASSPHRASE)")
-	notesCreateCmd.Flags().Bool("plaintext", false, "Force an unencrypted note even in a default_encrypt notebook")
+	notesCreateCmd.Flags().Bool("plaintext", false, "Create an unencrypted note in a default_encrypt notebook (otherwise refused without HARBOR_PASSPHRASE)")
 	addContentFlags(notesCreateCmd)
 
 	notesUpdateCmd.Flags().String("title", "", "New title")

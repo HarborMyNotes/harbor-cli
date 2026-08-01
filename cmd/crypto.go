@@ -284,9 +284,13 @@ func walkDecrypt(v any, key []byte) bool {
 
 // shouldEncryptCreate decides whether a new note should be encrypted: --plaintext
 // forces off, --encrypt forces on (and requires a passphrase), otherwise it
-// auto-encrypts when HARBOR_PASSPHRASE is set and the target notebook is marked
-// default_encrypt.
+// encrypts when the target notebook is marked default_encrypt — and REFUSES the
+// create when that notebook wants encryption and no passphrase is available.
 func shouldEncryptCreate(cmd *cobra.Command, c *client.Client, notebookID string) (bool, error) {
+	// The sanctioned way to put an unencrypted note in an encrypting notebook. It is
+	// read first, so it costs no lookup and nothing below can second-guess it — the
+	// whole point of the guard further down is that skipping encryption is something
+	// the user ASKS for here, rather than something an unset variable does for them.
 	if boolFlag(cmd, "plaintext") {
 		return false, nil
 	}
@@ -296,19 +300,68 @@ func shouldEncryptCreate(cmd *cobra.Command, c *client.Client, notebookID string
 		}
 		return true, nil
 	}
-	if !encryptionEnabled() {
-		return false, nil
+
+	// The notebook is asked what it wants BEFORE this invocation is asked whether it
+	// can deliver it. The old order returned early on "no passphrase" and so never
+	// reached the question at all, which is how a create into an encrypt-by-default
+	// notebook wrote plaintext with nothing said (#78). Whether a notebook requires
+	// encryption is the server's answer and has nothing to do with this shell's
+	// environment; the passphrase only decides what happens next.
+	//
+	// This does cost one request per create now, including on an account that has
+	// never touched encryption — that is the price of the question having an answer.
+	// The lookup also reports whether it could ANSWER, not just what the answer was;
+	// see below and notebookWantsEncryption.
+	wants, known, name := notebookWantsEncryption(c, notebookID)
+
+	// FAIL CLOSED, matching --encrypt just above and the conversion commands
+	// (conversionKey, cmd/notes_convert.go). The notebook says its notes are
+	// encrypted and this invocation holds no key to do that with, so the note is not
+	// written at all. This covers the account's DEFAULT notebook too, because
+	// notebookWantsEncryption resolves it when no --notebook was given.
+	if wants && !encryptionEnabled() {
+		return false, errEncryptedNotebookNeedsPassphrase(name, notebookID)
 	}
 
-	// The lookup reports whether it could ANSWER, not just what the answer was, and
-	// this is the one place that difference gets decided. Both stay false — the
-	// function fails OPEN by design (see notebookWantsEncryption) — but an
-	// unanswered question is said out loud rather than being spent as a "no".
-	wants, known := notebookWantsEncryption(c, notebookID)
+	// An UNANSWERED lookup still warns and proceeds, and that is deliberate — it is
+	// NOT the same oversight as the branch above. There the notebook said "encrypted"
+	// and was overruled; here nothing was established either way, and by far the most
+	// likely reason to be standing here is an ordinary account with no encryption
+	// anywhere near it whose notebook read happened to fail. Refusing every create on
+	// a failed GET would block plain note-taking to protect a setting that is
+	// probably not set, so the user is told on stderr and can re-run. (Same reasoning
+	// as notebookWantsEncryption, which fails open for the same reason.)
 	if !known {
 		warnEncryptionUnknown(notebookID)
 	}
 	return wants, nil
+}
+
+// errEncryptedNotebookNeedsPassphrase is the fail-closed refusal: the destination
+// encrypts every note in it and this run has no passphrase to do that with, so
+// nothing is written. It names both ways forward — supply the key, or say out loud
+// that this one note is meant to be in the clear.
+//
+// The second line is indented to sit under the first once renderError has prefixed
+// it with "Error: " (7 characters).
+func errEncryptedNotebookNeedsPassphrase(name, notebookID string) error {
+	return fmt.Errorf("notes in %s are encrypted by default, and no passphrase is set\n"+
+		"       set %s, or pass --plaintext to create this note unencrypted anyway",
+		notebookLabel(name, notebookID), passphraseEnv)
+}
+
+// notebookLabel names a notebook for a user-facing message: its own name when the
+// lookup returned one, else the id the user typed, else the account default — which
+// the user never named, so neither can this.
+func notebookLabel(name, notebookID string) string {
+	switch {
+	case name != "":
+		return `"` + name + `"`
+	case notebookID != "":
+		return "notebook " + notebookID
+	default:
+		return "your default notebook"
+	}
 }
 
 // warnEncryptionUnknown says out loud that a note is going out UNENCRYPTED because
@@ -324,8 +377,16 @@ func warnEncryptionUnknown(notebookID string) {
 	if notebookID != "" {
 		target = "notebook " + notebookID + "'s"
 	}
+	// --encrypt is only useful advice when there is a key to encrypt WITH. Without a
+	// passphrase this branch is now reachable (the lookup runs either way), and
+	// telling the user to pass --encrypt would just swap this warning for a different
+	// error, so point at the thing that is actually missing.
+	remedy := "re-run, or pass --encrypt to encrypt it regardless"
+	if !encryptionEnabled() {
+		remedy = "re-run with " + passphraseEnv + " set if it should be encrypted"
+	}
 	fmt.Fprintln(os.Stderr, dim("⚠ could not read "+target+" encryption setting, so this note is being "+
-		"written UNENCRYPTED — re-run, or pass --encrypt to encrypt it regardless"))
+		"written UNENCRYPTED — "+remedy))
 }
 
 // notebookWantsEncryption reports whether the target notebook (or the default
@@ -333,6 +394,10 @@ func warnEncryptionUnknown(notebookID string) {
 // established at all. The second return is the point: a lookup that failed and a
 // notebook that said no are different facts, and only the caller can decide what to
 // do about the difference.
+//
+// The third return is the notebook's NAME, for messages only — never for a
+// decision. It is "" whenever the lookup did not reach a notebook, and the callers
+// that print it fall back to the id (see notebookLabel).
 //
 // WHY BOTH BRANCHES REPORT IT. This function fails OPEN — an unanswerable lookup
 // writes the note in the clear — and that is deliberate: failing closed would mean
@@ -349,15 +414,16 @@ func warnEncryptionUnknown(notebookID string) {
 // fit in it. That is the same one-page assumption as issue #67, found while looking
 // for its siblings; it is the only other internal collection read in the command
 // tree. The walk stops at the default, so an ordinary account still pays one request.
-func notebookWantsEncryption(c *client.Client, notebookID string) (wants, known bool) {
+func notebookWantsEncryption(c *client.Client, notebookID string) (wants, known bool, name string) {
 	// A NAMED notebook is the common path — it needs no big account to reach, just a
 	// --notebook flag — and it is a plain GET, so "known" is simply "the read worked".
 	if notebookID != "" {
 		data, err := c.GetNotebook(notebookID, false)
 		if err != nil {
-			return false, false
+			return false, false, ""
 		}
-		return boolean(parseJSON(client.UnwrapData(data)), "default_encrypt"), true
+		nb := parseJSON(client.UnwrapData(data))
+		return boolean(nb, "default_encrypt"), true, str(nb, "name")
 	}
 
 	complete, err := walkCollection(
@@ -368,15 +434,16 @@ func notebookWantsEncryption(c *client.Client, notebookID string) (wants, known 
 				return true
 			}
 			wants = boolean(n, "default_encrypt")
+			name = str(n, "name")
 			known = true
 			return false
 		})
 	if known {
 		// The default was found and read before anything went wrong; whatever the walk
 		// did afterwards cannot unmake that answer.
-		return wants, true
+		return wants, true, name
 	}
-	return false, err == nil && complete
+	return false, err == nil && complete, ""
 }
 
 // encryptCreateBody seals a create body's title and content into HRBC2 envelopes
