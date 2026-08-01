@@ -26,8 +26,8 @@ const (
 	// fixtureTaskID is the task the note fixture carries. It has to be a canonical
 	// hyphenated UUID: any other spelling references no task the server's
 	// reconciler can resolve, so the guard would rightly ignore it.
-	fixtureTaskID  = "11111111-1111-4111-8111-111111111111"
-	fixtureTaskID2 = "22222222-2222-4222-8222-222222222222"
+	fixtureTaskID  = "a1b2c3d4-11e5-4f11-8a11-1234567890ab"
+	fixtureTaskID2 = "b2c3d4e5-22f6-4a22-9b22-abcdef123456"
 )
 
 // noteWithTaskRoutes is a note that owns one task, in both the places that
@@ -412,8 +412,13 @@ func TestNoteTaskBlockIDs(t *testing.T) {
 		{"double quoted", `<harbor-task id="` + fixtureTaskID + `"></harbor-task>`, "html", []string{fixtureTaskID}},
 		{"single quoted", `<harbor-task id='` + fixtureTaskID + `'>`, "html", []string{fixtureTaskID}},
 		{"bare", `<harbor-task id=` + fixtureTaskID + `>`, "html", []string{fixtureTaskID}},
+		// The fixture ids carry hex LETTERS on purpose: with an all-digit uuid
+		// this case is vacuous, and a mutation dropping the lower-casing survived it.
 		{"upper cased is canonicalized", `<harbor-task id="` + strings.ToUpper(fixtureTaskID) + `">`, "html", []string{fixtureTaskID}},
 		{"other attributes first", `<harbor-task data-x="1" id="` + fixtureTaskID + `">`, "html", []string{fixtureTaskID}},
+		// A quoted attribute keeps its padding, and the server trims before matching
+		// (notes.extractTaskIDs) — so this id resolves there and must resolve here.
+		{"padded id is trimmed", `<harbor-task id="  ` + fixtureTaskID + `  ">`, "html", []string{fixtureTaskID}},
 		{"repeat collapses", `<harbor-task id="` + fixtureTaskID + `"><harbor-task id="` + fixtureTaskID + `">`, "html", []string{fixtureTaskID}},
 		{"order preserved", `<harbor-task id="` + fixtureTaskID2 + `"><harbor-task id="` + fixtureTaskID + `">`, "html",
 			[]string{fixtureTaskID2, fixtureTaskID}},
