@@ -71,6 +71,10 @@ is ready is refused — delete it or wait for it to expire; the other format is
 unaffected. Because exports run one at a time server-wide, a new job may report
 "queued" (waiting its turn) for a while before it starts building.
 
+Nothing has to stay running here. The archive is built on the server and a link
+to it is emailed to you when it is done, so you can close this terminal — and
+'harbor account exports' finds the job again afterwards.
+
 Poll it with 'harbor account export-status <id>', or pass --wait to poll here
 until it finishes. --download implies --wait and saves the ZIP straight to disk.`,
 	Example: `  harbor account export
@@ -298,6 +302,48 @@ var accountCancelDeleteCmd = &cobra.Command{
 // Export lifecycle helpers
 // ===========================================================================
 
+// accountExportKeepsBuilding is the reassurance every Harbor client shows while
+// an export is queued or running, rendered verbatim (epic app.harbor.my#1216).
+// The one approved deviation for this platform is "close this" in place of
+// "close Harbor", which is meaningless in a terminal.
+//
+// It is TRUE on both halves, which is the only reason it is printed. The export
+// is an ordinary background job: POST /account/export commits an account_jobs row
+// and enqueues the work, and a worker pool claims it from the database — nothing
+// about the build is tied to the HTTP request or to this process, so exiting the
+// CLI does not touch it. On success the server sends the export_ready email
+// (internal/account/export.go for the ENEX archive, htmlexport.go for the HTML
+// one), and a build that fails for good sends export_failed instead, so quitting
+// does not leave a failure unreported either.
+//
+// It deliberately promises no TIME. Exports run one at a time server-wide, so the
+// wait is however long every export ahead of yours takes; a single very large
+// account has held that slot for the better part of a day (app.harbor.my#1242),
+// and an estimate would be most wrong for exactly the people who most need it to
+// be right.
+const accountExportKeepsBuilding = "You can close this — the export keeps building on our servers, and we'll email you a link when it's ready."
+
+// accountExportEmailNextStep says what that emailed link actually does and gives
+// the terminal-native alternative.
+//
+// The link is NOT a download: it points back at Harbor, which re-authenticates
+// the reader before minting a fresh short-lived URL (exportDownloadPageURL), so a
+// forwarded email cannot fetch someone's archive. Someone told only "we'll email
+// you a link" would reasonably expect to curl it. And having quit, they no longer
+// have the job id — so the route back into the terminal has to be the command
+// that reads the id off the server, not one that takes it as an argument.
+const accountExportEmailNextStep = "That link opens Harbor in a browser — to download from the terminal instead, run: harbor account exports"
+
+// accountExportQueueSlipNote explains a queue position that got WORSE.
+//
+// The line is server-wide and ordered by priority before arrival time: a queued
+// ENEX export outranks a queued HTML one however late it was started. So a
+// position genuinely walks backwards while you watch it, and a number that goes
+// 3 → 4 with no explanation reads as a bug in this CLI rather than as somebody
+// else's export jumping the line. Printed once per wait — after the first time,
+// the point has been made.
+const accountExportQueueSlipNote = "Another export moved ahead of yours — the line is shared with every other account, so a position can go up as well as down."
+
 // accountExportFormats are the archive kinds the server accepts. The CLI checks
 // the value itself so a typo costs a round-trip and a validation error rather
 // than an export of the wrong thing.
@@ -405,6 +451,13 @@ func accountWaitAndMaybeDownload(cmd *cobra.Command, c *client.Client, id, out s
 // slow export scrolls at the speed it actually changes rather than the speed it
 // is polled. A zero timeout means "no limit" — the export is done when it is
 // done, and Ctrl-C is always available.
+//
+// The first poll that finds work still to do says, once, that waiting is
+// OPTIONAL. This is the command someone leaves running, and it is the one place
+// in the CLI where a person can lose a whole day: exports run one at a time
+// server-wide, so a single very large account ahead of you holds the slot for as
+// long as it takes to build (ten hours, in app.harbor.my#1242). Someone who does
+// not know the server finishes on its own will simply sit there for it.
 func accountPollExport(c *client.Client, id string, interval, timeout time.Duration, wait bool) ([]byte, error) {
 	if interval <= 0 {
 		interval = 5 * time.Second
@@ -415,6 +468,9 @@ func accountPollExport(c *client.Client, id string, interval, timeout time.Durat
 	}
 
 	last := ""
+	lastPos := 0
+	slipped := false
+	announced := false
 	for {
 		data, err := c.GetAccountExport(id)
 		if err != nil {
@@ -424,11 +480,35 @@ func accountPollExport(c *client.Client, id string, interval, timeout time.Durat
 		if !wait || accountExportIsTerminal(str(job, "status")) {
 			return data, nil
 		}
+		// Only now is it certain this run will actually wait on something — the
+		// job could have been finished before the first poll, and telling someone
+		// they may leave a wait that is already over is just noise.
+		if !announced {
+			for _, line := range accountExportWaitPreamble() {
+				if !jsonOutput {
+					fmt.Fprintln(os.Stderr, dim(line))
+				}
+			}
+			announced = true
+		}
 		if line := accountExportProgressLine(job); line != "" && line != last {
 			if !jsonOutput {
 				fmt.Fprintln(os.Stderr, dim(line))
 			}
 			last = line
+		}
+		// A queue position that got WORSE, explained the first time it happens —
+		// see accountExportQueueSlipNote. The check is against the last position
+		// SEEN, so it fires on the move itself rather than on every later poll of
+		// the same number.
+		if pos := int(num(job, "queue_position")); pos > 0 {
+			if lastPos > 0 && pos > lastPos && !slipped {
+				if !jsonOutput {
+					fmt.Fprintln(os.Stderr, dim(accountExportQueueSlipNote))
+				}
+				slipped = true
+			}
+			lastPos = pos
 		}
 		if !deadline.IsZero() && time.Now().After(deadline) {
 			return nil, fmt.Errorf("gave up waiting after %s (the export is still %s; poll it with: harbor account export-status %s)",
@@ -915,6 +995,23 @@ func accountExportProgress(j map[string]any) string {
 	return out
 }
 
+// accountExportWaitPreamble is what a --wait run says once, before it settles in
+// to poll: that the wait is optional, and how to leave it without losing the
+// export.
+//
+// Ctrl-C is spelled out because it is the thing a person actually reaches for and
+// the thing they are most likely to be afraid of — this poll is a read loop over
+// the status endpoint, so interrupting it cancels nothing on the server. The
+// route back is 'harbor account exports' rather than 'export-status <id>': the
+// id was on a screen they have just closed.
+func accountExportWaitPreamble() []string {
+	return []string{
+		accountExportKeepsBuilding,
+		accountExportEmailNextStep,
+		"Ctrl-C stops the waiting, not the export.",
+	}
+}
+
 // accountExportProgressLine is the one-line progress report --wait prints while
 // an export builds. It returns "" for a state with nothing to report.
 func accountExportProgressLine(j map[string]any) string {
@@ -939,6 +1036,13 @@ func accountExportProgressLine(j map[string]any) string {
 // that is waiting, gone or broken explains itself rather than leaving a bare
 // status word on screen.
 //
+// The two UNFINISHED states additionally get the "you can close this" pair: an
+// export nobody has to sit through is worth nothing if the person watching it
+// does not know they can leave. The four terminal states get neither line —
+// completed/failed/expired/deleted have nothing left to wait for, so "we'll email
+// you when it's ready" would be describing an email that has already been sent or
+// will never come.
+//
 // A run that is downloading gets none of them. "Download it" is what is already
 // happening, and for every state that CANNOT be downloaded the caller returns an
 // error carrying the same sentence the hint would have printed — so a hint here
@@ -952,10 +1056,16 @@ func accountExportHints(j map[string]any, id string, downloading bool) []string 
 	case "queued":
 		return []string{
 			"Waiting to start — we build one export at a time.",
+			accountExportKeepsBuilding,
+			accountExportEmailNextStep,
 			"Poll it with: harbor account export-status " + id,
 		}
 	case "running":
-		return []string{"Poll it with: harbor account export-status " + id + " --wait"}
+		return []string{
+			accountExportKeepsBuilding,
+			accountExportEmailNextStep,
+			"Poll it with: harbor account export-status " + id + " --wait",
+		}
 	case "completed":
 		if str(j, "download_url") == "" {
 			return []string{"The archive is no longer available — start a new export."}
