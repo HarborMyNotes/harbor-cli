@@ -514,6 +514,78 @@ func TestNotesCreateWritesNothingWhenItRefuses(t *testing.T) {
 	}
 }
 
+// --encrypt is the guard the new one was built to match, and until now nothing held
+// it: its whole body could be deleted and the suite stayed green. That is the
+// sibling of the bug this PR fixes, in the function this PR rewrote, so it gets an
+// assertion of its own rather than an assumption that it still works.
+//
+// Removing it does not currently leak plaintext — encryptCreateBody's unlock fails
+// before CreateNote — but it degrades a precise refusal into a generic one, and the
+// next person to move this code would have no warning that they had.
+func TestEncryptFlagIsRefusedWithoutAPassphrase(t *testing.T) {
+	// No routes: the flag is answered from the flags alone, so a notebook read here
+	// would itself be a failure (the mock treats an unrouted request as an error).
+	m := newAPIMock(t, map[string]mockReply{})
+
+	enc, err, _ := runEncryptDecision(t, m, "nb1", "", "encrypt")
+
+	if err == nil {
+		t.Fatalf("--encrypt with no passphrase promised encryption it has no key for (encrypt=%v)", enc)
+	}
+	if enc {
+		t.Error("the refusal still asked for encryption it cannot perform")
+	}
+	for _, want := range []string{"--encrypt", "HARBOR_PASSPHRASE"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal never mentions %q:\n%v", want, err)
+		}
+	}
+}
+
+// Naming the destination is part of what makes the refusal actionable, and every
+// other fixture here hands back a notebook with a name — so the two FALLBACKS in
+// notebookLabel were never executed by a test and could have been anything at all.
+// A notebook is not guaranteed to have a name, and the account default was never
+// named by the user in the first place.
+func TestARefusalNamesTheNotebookEvenWithoutAName(t *testing.T) {
+	cases := map[string]struct {
+		notebookID string
+		routes     map[string]mockReply
+		want       string
+	}{
+		// No name came back, so the id the user typed is the only handle either side
+		// of the screen shares.
+		"named notebook with no name falls back to its id": {
+			notebookID: "nbnoname",
+			routes: map[string]mockReply{
+				"GET /api/v1/notebooks/nbnoname": {Status: 200, Body: `{"id":"nbnoname","default_encrypt":true}`},
+			},
+			want: "notebook nbnoname",
+		},
+		// Nothing was typed and nothing came back: the message has to describe the
+		// destination rather than identify it.
+		"unnamed default notebook is described, not identified": {
+			notebookID: "",
+			routes: map[string]mockReply{
+				"GET /api/v1/notebooks": {Status: 200, Body: `{"data":[{"id":"nbd","is_default":true,"default_encrypt":true}],` +
+					`"paging":{"limit":500,"offset":0,"total":1,"has_more":false}}`},
+			},
+			want: "your default notebook",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err, _ := runEncryptDecision(t, newAPIMock(t, tc.routes), tc.notebookID, "")
+			if err == nil {
+				t.Fatal("an encrypt-by-default notebook took a plaintext note without complaint")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("the refusal does not say %q, so it does not say where the note was going:\n%v", tc.want, err)
+			}
+		})
+	}
+}
+
 // The UNKNOWN case is deliberately NOT the refusal above, and this pins that apart
 // so a later reader does not "finish the job" by mistake. Nothing established that
 // this notebook encrypts; the likeliest reason to be here is an account with no
