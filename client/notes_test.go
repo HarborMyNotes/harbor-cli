@@ -83,3 +83,63 @@ func TestDeleteNotePermanent(t *testing.T) {
 		t.Errorf("%s query=%s", rec.Method, rec.Query)
 	}
 }
+
+// TestConvertNoteToEncrypted pins the wire shape of the encrypt conversion: a
+// PATCH to the note carrying the envelopes and the marker, plus the base_usn
+// precondition that keeps a concurrent edit from being overwritten.
+func TestConvertNoteToEncrypted(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 200, `{"note":{"id":"n1","is_encrypted":true},"usn":9}`)
+	defer srv.Close()
+	_, err := testClient(srv.URL).ConvertNoteToEncrypted("n1", map[string]any{
+		"is_encrypted": true,
+		"title":        "HRBC2.aaa.bbb",
+		"content":      "HRBC2.ccc.ddd",
+		"base_usn":     8,
+	})
+	if err != nil {
+		t.Fatalf("ConvertNoteToEncrypted error: %v", err)
+	}
+	if rec.Method != "PATCH" || rec.Path != "/notes/n1" {
+		t.Errorf("%s %s, want PATCH /notes/n1", rec.Method, rec.Path)
+	}
+	var body map[string]any
+	_ = json.Unmarshal(rec.Body, &body)
+	if body["is_encrypted"] != true {
+		t.Errorf("is_encrypted = %v, want true", body["is_encrypted"])
+	}
+	if body["content"] != "HRBC2.ccc.ddd" || body["title"] != "HRBC2.aaa.bbb" {
+		t.Errorf("envelopes not sent verbatim: %v / %v", body["title"], body["content"])
+	}
+	if body["base_usn"] != float64(8) {
+		t.Errorf("base_usn = %v, want 8 — without it the write can clobber a concurrent edit", body["base_usn"])
+	}
+}
+
+// TestConvertNoteToPlaintext pins the other direction, including the
+// content_format the server needs to interpret the body it is handed back.
+func TestConvertNoteToPlaintext(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 200, `{"note":{"id":"n1","is_encrypted":false},"usn":9}`)
+	defer srv.Close()
+	_, err := testClient(srv.URL).ConvertNoteToPlaintext("n1", map[string]any{
+		"is_encrypted":   false,
+		"title":          "Quarterly plan",
+		"content":        "<p>hello</p>",
+		"content_format": "html",
+	})
+	if err != nil {
+		t.Fatalf("ConvertNoteToPlaintext error: %v", err)
+	}
+	if rec.Method != "PATCH" || rec.Path != "/notes/n1" {
+		t.Errorf("%s %s, want PATCH /notes/n1", rec.Method, rec.Path)
+	}
+	var body map[string]any
+	_ = json.Unmarshal(rec.Body, &body)
+	if body["is_encrypted"] != false {
+		t.Errorf("is_encrypted = %v, want false", body["is_encrypted"])
+	}
+	if body["content_format"] != "html" {
+		t.Errorf("content_format = %v, want html", body["content_format"])
+	}
+}
