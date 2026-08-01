@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"bytes"
 	"fmt"
 	"net/http"
 	"os"
@@ -76,6 +77,52 @@ func TestNotesUpdateRefusesToDeleteTasksWithTheBody(t *testing.T) {
 	}
 }
 
+// Issue #66, at the command level. A body that carries the block ONLY inside a
+// 4-space-indented code block carries nothing: goldmark renders it as
+// <pre><code>&lt;harbor-task…, the server reads back no reference, and the task is
+// tombstoned. Measured against a running server before the fix — exit 0, no
+// warning, task gone — so the assertion is that the PATCH never leaves.
+//
+// It is written as a command test rather than a scanner test on purpose: the
+// scanner returning the right answer is worth nothing if `notes update` stops
+// consulting it, which is the shape all three of these bugs took.
+func TestNotesUpdateRefusesAnIndentedCodeBlockPretendingToCarryTheTask(t *testing.T) {
+	m := newAPIMock(t, noteWithTaskRoutes())
+
+	_, err := runCLI(t, m, "notes", "update", "n1", "--content",
+		"Here is what a task block looks like:\n\n    "+taskBlockHTML(fixtureTaskID)+"\n")
+
+	if err == nil {
+		t.Fatal("an indented code sample was counted as carrying the task and the update went through — this is issue #66")
+	}
+	assertNoWrite(t, m)
+	for _, want := range []string{"1 task", "Buy milk", "--keep-tasks", "--allow-task-loss"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal never mentions %q:\n%s", want, err)
+		}
+	}
+}
+
+// The other direction, and the reason issue #66 could not be closed by stripping
+// four-space indentation: under a list item that indentation is CONTINUATION, and
+// goldmark renders it as a real element. The server sees the block, the task is
+// safe, and refusing here would break an ordinary edit. A guard that never lets
+// anyone save anything is not a fix, so this is asserted, not assumed.
+func TestNotesUpdateAllowsAnIndentedListContinuationThatReallyCarriesTheTask(t *testing.T) {
+	m := newAPIMock(t, noteWithTaskRoutes())
+
+	_, err := runCLI(t, m, "notes", "update", "n1", "--content",
+		"- a list item\n    "+taskBlockHTML(fixtureTaskID)+"\n")
+
+	if err != nil {
+		t.Fatalf("refused an update whose body really does carry the block — the guard is over-refusing: %v", err)
+	}
+	sent, _ := m.bodyOf(t, "PATCH /api/v1/notes/n1")["content"].(string)
+	if !strings.Contains(sent, taskBlockHTML(fixtureTaskID)) {
+		t.Errorf("the user's own body was not written through as-is:\n%s", sent)
+	}
+}
+
 // --keep-tasks writes the new body with the dropped block re-appended, so the
 // server's reconciler still sees the task referenced and keeps it.
 func TestNotesUpdateKeepTasksCarriesTheBlockIntoTheNewBody(t *testing.T) {
@@ -137,6 +184,15 @@ func TestNotesUpdateKeepTasksRefusesWhenHTMLSwallowsTheBlocks(t *testing.T) {
 		"unclosed style":    "<p>new</p><style>",
 		"unclosed title":    "<p>new</p><title>",
 		"truncated tag":     "<p>new</p><div",
+		// Skip-content elements the PARSER treats as ordinary markup (issue #66
+		// review). These are the dangerous half: the appended block is a real element
+		// in the tree, so the post-condition only catches it because the scanner now
+		// sanitizes. An unclosed one swallows to the end of the body, so --keep-tasks
+		// would append into the discarded subtree and report success.
+		"unclosed object":   "<p>new</p><object>",
+		"unclosed nostyle":  "<p>new</p><nostyle>",
+		"unclosed frameset": "<p>new</p><frameset>",
+		"void frame":        "<p>new</p><frame>",
 	}
 	for name, content := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -602,20 +658,25 @@ func TestNoteTaskBlockIDs(t *testing.T) {
 		{"inside script", `<script><harbor-task id="` + fixtureTaskID + `"></script>`, "html", []string{}},
 		{"inside style", `<style><harbor-task id="` + fixtureTaskID + `"></style>`, "html", []string{}},
 		{"inside title", `<title><harbor-task id="` + fixtureTaskID + `"></title>`, "html", []string{}},
+		{"inside xmp", `<xmp><harbor-task id="` + fixtureTaskID + `"></xmp>`, "html", []string{}},
+		{"inside noscript", `<noscript><harbor-task id="` + fixtureTaskID + `"></noscript>`, "html", []string{}},
+		{"inside iframe", `<iframe><harbor-task id="` + fixtureTaskID + `"></iframe>`, "html", []string{}},
 		{"after an unclosed textarea", `<p>x</p><textarea><harbor-task id="` + fixtureTaskID + `">`, "html", []string{}},
 
-		// …but a block nested in ordinary markup is markup, wherever it sits.
+		// …but a block nested in ordinary markup is markup, wherever it sits. The
+		// last three are where the SANITIZER could have disagreed with this parse and
+		// measurably does not: bluemonday allowlists <harbor-task id>, so it drops the
+		// unknown wrapper, the disallowed attribute and the foreign-content namespace
+		// while leaving the block — and the server still reads the id back.
 		{"nested in a list item", `<ul><li><harbor-task id="` + fixtureTaskID + `"></li></ul>`, "html", []string{fixtureTaskID}},
 		{"inside pre", `<pre><harbor-task id="` + fixtureTaskID + `"></pre>`, "html", []string{fixtureTaskID}},
-		{"fenced code", "```\n<harbor-task id=\"" + fixtureTaskID + "\">\n```", "markdown", []string{}},
-		{"tilde fenced code", "~~~\n<harbor-task id=\"" + fixtureTaskID + "\">\n~~~", "markdown", []string{}},
-		{"inline code", "the `<harbor-task id=\"" + fixtureTaskID + "\">` block", "markdown", []string{}},
-		{"markdown outside a fence still counts", "```\nx\n```\n<harbor-task id=\"" + fixtureTaskID + "\">", "markdown",
-			[]string{fixtureTaskID}},
-
+		{"in a table cell", `<table><tr><td><harbor-task id="` + fixtureTaskID + `"></td></tr></table>`, "html", []string{fixtureTaskID}},
+		{"inside a disallowed element", `<blink><harbor-task id="` + fixtureTaskID + `"></blink>`, "html", []string{fixtureTaskID}},
+		{"alongside a stripped attribute", `<harbor-task id="` + fixtureTaskID + `" onclick="evil()">`, "html", []string{fixtureTaskID}},
 		// In HTML mode Markdown code constructs are not constructs at all — a
 		// backtick is just a character, and the block really does reach the server.
 		{"backticks are literal in html", "`<harbor-task id=\"" + fixtureTaskID + "\">`", "html", []string{fixtureTaskID}},
+		{"four spaces are literal in html", "    <harbor-task id=\"" + fixtureTaskID + "\">", "html", []string{fixtureTaskID}},
 	}
 
 	for _, tc := range cases {
@@ -628,46 +689,262 @@ func TestNoteTaskBlockIDs(t *testing.T) {
 	}
 }
 
-// A fence closes only on a run of the same character at least as long as the one
-// that opened it, and an unterminated fence runs to the end of the input.
-func TestStripMarkdownFences(t *testing.T) {
-	cases := []struct{ name, in, wantGone, wantKept string }{
-		{"simple", "keep\n```\ngone\n```\nkeep2", "gone", "keep2"},
-		{"longer fence inside", "```` \ngone ```\n````\nkeep", "gone", "keep"},
-		{"shorter run does not close", "````\ngone ```\ngone2\n````\nkeep", "gone2", "keep"},
-		{"different char does not close", "```\ngone ~~~\ngone2\n```\nkeep", "gone2", "keep"},
-		{"unterminated runs to the end", "keep\n```\ngone\ngone2", "gone2", "keep"},
-		{"indented three spaces is a fence", "   ```\ngone\n   ```\nkeep", "gone", "keep"},
+// ===========================================================================
+// Markdown: every construct goldmark treats as code (issue #66)
+// ===========================================================================
+//
+// The guard answers ONE question — "which blocks will the server see?" — and for a
+// Markdown body the server answers it by running goldmark. So this table is not a
+// list of special cases anybody thought to handle; it is a list of the CommonMark
+// and GFM constructs whose answers were MEASURED against a running server, each of
+// which the CLI must now agree with. Nine of the "code" rows here were silent
+// deletions before the fix (the hand-written stripper handled only single-backtick
+// spans and top-level fences), and every "markup" row is an update the guard must
+// keep ALLOWING — a guard that refuses everything protects nothing.
+//
+// The measurement is in the PR: for each body the CLI's verdict is compared against
+// whether the task actually survived the write. Adding a construct here means
+// measuring it there first.
+func TestNoteTaskBlockIDsMarkdownCode(t *testing.T) {
+	block := `<harbor-task id="` + fixtureTaskID + `"></harbor-task>`
+
+	// CODE: goldmark escapes these, so the server sees text and would DELETE the
+	// task. The guard must report the block as absent so the update is refused.
+	code := []struct{ name, content string }{
+		{"fenced backticks", "before\n\n```\n" + block + "\n```\n"},
+		{"fenced tildes", "before\n\n~~~\n" + block + "\n~~~\n"},
+		{"fence with an info string", "before\n\n```html\n" + block + "\n```\n"},
+		{"fence indented three spaces", "before\n\n   ```\n   " + block + "\n   ```\n"},
+		{"unterminated fence", "before\n\n```\n" + block + "\n"},
+		{"fence closed by a longer run", "before\n\n````\n" + block + "\n````\n"},
+		{"indented four spaces", "before\n\n    " + block + "\n"},
+		{"indented with a tab", "before\n\n\t" + block + "\n"},
+		{"indented eight spaces", "before\n\n        " + block + "\n"},
+		{"inline code span", "the `" + block + "` block\n"},
+		{"double-backtick code span", "the ``" + block + "`` block\n"},
+		{"code span across a line break", "the `start\n" + block + "` block\n"},
+		{"fence inside a blockquote", "> quoted:\n>\n> ```\n> " + block + "\n> ```\n"},
+		{"indented code inside a blockquote", "> quoted:\n>\n>     " + block + "\n"},
+		{"fence inside a list item", "- item:\n\n  ```\n  " + block + "\n  ```\n"},
+		{"indented code inside a list item", "- item:\n\n      " + block + "\n"},
+		{"backslash escape", "an escape: \\" + block + "\n"},
+		{"entity reference", "an entity: &lt;harbor-task id=\"" + fixtureTaskID + "\"&gt;&lt;/harbor-task&gt;\n"},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := stripMarkdownFences(tc.in)
-			if strings.Contains(got, tc.wantGone) {
-				t.Errorf("fenced %q survived:\n%s", tc.wantGone, got)
+	for _, tc := range code {
+		t.Run("code/"+tc.name, func(t *testing.T) {
+			if got := noteTaskBlockIDs(tc.content, "markdown"); len(got) != 0 {
+				t.Errorf("counted %v as carried, but goldmark makes this TEXT — the server\n"+
+					"would delete the task and the update must be refused:\n%s", got, tc.content)
 			}
-			if !strings.Contains(got, tc.wantKept) {
-				t.Errorf("unfenced %q was stripped:\n%s", tc.wantKept, got)
+		})
+	}
+
+	// MARKUP: goldmark passes these through as a real element, so the server sees
+	// the block and the task survives. Reporting them absent would refuse an update
+	// that was never dangerous. "list continuation" is the shape that made stripping
+	// four-space indentation the wrong fix: it is indented, and it is not code.
+	markup := []struct{ name, content string }{
+		{"block on its own line", "before\n\n" + block + "\n"},
+		{"list continuation", "- a list item\n    " + block + "\n"},
+		{"inside a list item", "- item " + block + "\n"},
+		{"in a paragraph", "some prose " + block + " more prose\n"},
+		{"in a heading", "# heading " + block + "\n"},
+		{"in a blockquote", "> quoted " + block + "\n"},
+		{"in a GFM table cell", "| a | b |\n|---|---|\n| x | " + block + " |\n"},
+		{"after a closed fence", "```\nx\n```\n\n" + block + "\n"},
+		{"indented only three spaces", "before\n\n   " + block + "\n"},
+		{"inside a raw div", "<div>\n\n" + block + "\n\n</div>\n"},
+		{"appended the way --keep-tasks appends", "- a list item\n\n" + block + "\n"},
+	}
+	for _, tc := range markup {
+		t.Run("markup/"+tc.name, func(t *testing.T) {
+			got := noteTaskBlockIDs(tc.content, "markdown")
+			if len(got) != 1 || got[0] != fixtureTaskID {
+				t.Errorf("got %v, want the block counted as carried — goldmark keeps this as\n"+
+					"markup, so refusing this update would block a safe edit:\n%s", got, tc.content)
 			}
 		})
 	}
 }
 
-// Four or more leading spaces is an indented code block, not a fence — so it must
-// not open one and swallow the rest of the body.
-func TestMarkdownFenceMarker(t *testing.T) {
-	cases := []struct{ line, want string }{
-		{"```", "```"},
-		{"```go", "```"},
-		{"~~~~", "~~~~"},
-		{"   ```", "```"},
-		{"    ```", ""},
-		{"``", ""},
-		{"text ```", ""},
-		{"", ""},
+// ===========================================================================
+// The sanitize step: bluemonday's skip-content subtrees
+// ===========================================================================
+
+// bluemondaySkipContentElements is bluemonday v1.0.27's default skip-content set,
+// copied verbatim from addDefaultSkipElementContent(). It is the COMPLETE list of
+// elements whose entire subtree the sanitizer discards when the element itself is
+// not allowlisted — and neither this repo's policy nor the server's allowlists any
+// of them, nor calls SkipElementsContent/AllowElementsContent to change the set.
+//
+// It is written out here rather than reached for through the library so that a
+// bluemonday upgrade which ADDS an element to the set fails
+// TestBlockSanitizerSkipSetIsStillTheOneWeEnumerated below, instead of silently
+// widening the set of bodies nobody has measured.
+var bluemondaySkipContentElements = []string{
+	"frame", "frameset", "iframe", "noembed", "noframes",
+	"noscript", "nostyle", "object", "script", "style", "title",
+}
+
+// The fourth bug in this family, and the one a hand-picked sweep missed (issue #66
+// review). The guard used to parse the body WITHOUT sanitizing it, but the server
+// reads task blocks out of the SANITIZED html — and bluemonday deletes an unallowed
+// element's whole subtree for the elements above. A <harbor-task> inside <object> is
+// real markup to the HTML parser, so the guard counted it, the server never saw it,
+// and the task was deleted at exit 0. Seven such bodies were measured.
+//
+// WHY THIS ENUMERATION IS COMPLETE. The earlier sweep picked examples and happened to
+// pick only elements the HTML PARSER treats as raw text (iframe, noscript, script,
+// style, title) — for those the contents are a text node, no <harbor-task> element
+// exists, and the guard already agreed. The elements parsed as ORDINARY MARKUP
+// (frame, frameset, nostyle, object) are precisely the ones that diverged, and none
+// was tested. So the axis is not "which examples look risky" but "how does the parser
+// treat the element", and the table runs the ENTIRE skip set across both classes.
+//
+// Both wrapping shapes are covered because the skip is a TOKEN-STREAM counter, not a
+// tree relationship: an unclosed one runs to the end of the body, and for a void
+// <frame> the tree builder does not even make the block a descendant.
+func TestNoteTaskBlockIDsHonoursSanitizerSkippedSubtrees(t *testing.T) {
+	block := taskBlockHTML(fixtureTaskID)
+
+	for _, el := range bluemondaySkipContentElements {
+		for _, tc := range []struct{ shape, content string }{
+			{"closed", "<p>x</p><" + el + ">" + block + "</" + el + ">"},
+			{"unclosed", "<p>x</p><" + el + ">" + block},
+		} {
+			// Both formats: a Markdown body reaches the same sanitizer, because
+			// goldmark passes raw HTML straight through (WithUnsafe).
+			for _, format := range []string{"html", "markdown"} {
+				t.Run(el+"/"+tc.shape+"/"+format, func(t *testing.T) {
+					if got := noteTaskBlockIDs(tc.content, format); len(got) != 0 {
+						t.Errorf("counted %v as carried, but the sanitizer discards this whole\n"+
+							"subtree — the server sees no block and deletes the task:\n%s", got, tc.content)
+					}
+				})
+			}
+		}
 	}
-	for _, tc := range cases {
-		if got := markdownFenceMarker(tc.line); got != tc.want {
-			t.Errorf("markdownFenceMarker(%q) = %q, want %q", tc.line, got, tc.want)
+}
+
+// The other direction for the same step. A disallowed element that is NOT in the skip
+// set is stripped TAG-ONLY with its children kept, so the block survives and the guard
+// must keep allowing the update. Without these, "sanitize everything away" would pass
+// the table above and refuse every edit.
+func TestNoteTaskBlockIDsKeepsBlocksUnderOrdinaryWrappers(t *testing.T) {
+	block := taskBlockHTML(fixtureTaskID)
+
+	for _, el := range []string{"div", "span", "p", "blockquote", "td", "svg", "blink", "custom-thing"} {
+		t.Run(el, func(t *testing.T) {
+			got := noteTaskBlockIDs("<"+el+">"+block+"</"+el+">", "html")
+			if len(got) != 1 || got[0] != fixtureTaskID {
+				t.Errorf("got %v, want the block carried — <%s> is not a skip-content element,\n"+
+					"so the sanitizer keeps the block and refusing here would block a safe edit", got, el)
+			}
+		})
+	}
+}
+
+// A bluemonday upgrade that ADDS to the skip set widens the set of bodies where the
+// guard's answer could change, and nothing else in this repo would notice. Rebuild the
+// policy and ask it directly, so the upgrade lands as a failure with instructions
+// rather than as a quiet behaviour change.
+func TestBlockSanitizerSkipSetIsStillTheOneWeEnumerated(t *testing.T) {
+	fresh := newBlockSanitizer()
+	block := taskBlockHTML(fixtureTaskID)
+
+	// Every element we enumerated must still skip its content...
+	for _, el := range bluemondaySkipContentElements {
+		if out := fresh.Sanitize("<" + el + ">" + block + "</" + el + ">"); strings.Contains(out, "harbor-task") {
+			t.Errorf("<%s> no longer skips its content (bluemonday changed): %q\n"+
+				"The guard may now be REFUSING updates that are safe — re-measure and update the list.", el, out)
+		}
+	}
+	// ...and the block must still survive the policy on its own, or the guard would
+	// refuse every content update on a note with tasks.
+	if out := fresh.Sanitize(block); !strings.Contains(out, fixtureTaskID) {
+		t.Fatalf("the policy no longer preserves <harbor-task id>: %q", out)
+	}
+}
+
+// WHAT THIS COVERS, AND WHAT IT DOES NOT. It asserts the converter's OPTIONS — that
+// GFM is enabled and raw HTML is passed through — and nothing else. It was previously
+// named as though it verified the CLI matched the server; it does not, and a reviewer
+// proved it by downgrading goldmark to v1.7.8 with the whole suite still green.
+//
+// The version half is TestPipelineDependencyPinsMatchTheRecordedPairing below, and even
+// that can only see THIS repo. Nothing here can observe app.harbor.my, so a server-side
+// bump — the drift most likely to reopen issue #66 — is not detectable from this
+// package by any test. That is a real gap, stated so the next person keeps looking
+// rather than trusting a green suite.
+//
+// GFM tables are the cheapest proof the extension set matches (a table is not
+// CommonMark, so a plain goldmark.New renders this as a paragraph), and raw HTML
+// passthrough proves WithUnsafe is on (without it goldmark ESCAPES the block and the
+// guard would refuse every update that carries one).
+func TestMarkdownConverterOptionsAreGFMAndUnsafe(t *testing.T) {
+	var buf bytes.Buffer
+	if err := markdownConverter.Convert([]byte("| a |\n|---|\n| x |\n"), &buf); err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	if !strings.Contains(buf.String(), "<table>") {
+		t.Errorf("GFM is not enabled — the server converts with extension.GFM:\n%s", buf.String())
+	}
+
+	buf.Reset()
+	if err := markdownConverter.Convert([]byte(`<harbor-task id="`+fixtureTaskID+`"></harbor-task>`), &buf); err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	if !strings.Contains(buf.String(), `<harbor-task id="`+fixtureTaskID+`">`) {
+		t.Errorf("raw HTML is being escaped — the server renders with html.WithUnsafe:\n%s", buf.String())
+	}
+}
+
+// serverPipelinePins are the versions app.harbor.my's internal/notes pipeline was
+// READ AT and measured against. The guard's whole claim is that its answer is the
+// server's answer, and it can only be that if both sides run the same converter and
+// the same sanitizer — so the pairing is data, recorded here rather than left to
+// memory.
+var serverPipelinePins = map[string]string{
+	"github.com/yuin/goldmark":           "v1.8.2",
+	"github.com/microcosm-cc/bluemonday": "v1.0.27",
+}
+
+// This is the test that actually catches a version change, which the options test
+// above does not: bumping either dependency in go.mod fails here with the reason.
+//
+// It reads go.mod rather than runtime/debug.ReadBuildInfo, which reports no
+// dependencies at all for a test binary (measured — deps=0).
+//
+// BE CLEAR ABOUT THE HALF IT CANNOT COVER. This proves the CLI still pins what it was
+// measured with. It CANNOT prove the server still pins the same thing, because nothing
+// in this repo can see app.harbor.my. A server-side bump stays green here and is the
+// most likely way this drifts back — the mitigation is that bumping on THIS side now
+// forces someone to look at both, and the failure message says so.
+func TestPipelineDependencyPinsMatchTheRecordedPairing(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "go.mod"))
+	if err != nil {
+		t.Fatalf("read go.mod: %v", err)
+	}
+	for module, want := range serverPipelinePins {
+		got := ""
+		for _, line := range strings.Split(string(raw), "\n") {
+			fields := strings.Fields(strings.TrimSpace(line))
+			if len(fields) >= 2 && fields[0] == module {
+				got = fields[1]
+				break
+			}
+		}
+		if got == "" {
+			t.Errorf("%s is no longer required by go.mod — the guard cannot answer with the\n"+
+				"server's own pipeline without it", module)
+			continue
+		}
+		if got != want {
+			t.Errorf("%s is pinned at %s, but the guard was measured against the server at %s.\n"+
+				"Confirm app.harbor.my's go.mod is on %s too, re-measure the guard against a\n"+
+				"running server, then update serverPipelinePins. This repo CANNOT detect a bump\n"+
+				"on the server side, so this is the only moment anyone is prompted to check.",
+				module, got, want, got)
 		}
 	}
 }

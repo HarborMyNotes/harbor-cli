@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,10 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/microcosm-cc/bluemonday"
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/extension"
+	ghtml "github.com/yuin/goldmark/renderer/html"
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
 
@@ -39,18 +44,74 @@ import (
 // deliberately deleted by editing the block out — which is a supported way to
 // delete a task. --keep-tasks and --allow-task-loss say which was meant.
 
-var (
-	// taskBlockIDRe is the server's own rule for a block id worth anything: the
-	// canonical 36-character hyphenated UUID (notes.taskIDRe). A block whose id is
-	// spelled any other way (braced, urn-prefixed, bare 32-hex) references no task
-	// the reconciler can resolve, so it neither saves a task nor endangers one.
-	taskBlockIDRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+// taskBlockIDRe is the server's own rule for a block id worth anything: the
+// canonical 36-character hyphenated UUID (notes.taskIDRe). A block whose id is
+// spelled any other way (braced, urn-prefixed, bare 32-hex) references no task
+// the reconciler can resolve, so it neither saves a task nor endangers one.
+var taskBlockIDRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
-	// mdInlineCodeRe matches a single-backtick Markdown code span. Prose about a
-	// task block ("the `<harbor-task id=…>` block") is escaped by the Markdown
-	// converter, so it is text, not markup.
-	mdInlineCodeRe = regexp.MustCompile("`[^`\n]*`")
+// markdownConverter is the SERVER'S Markdown converter, configured identically:
+// notes.NewContent builds `goldmark.New(WithExtensions(extension.GFM),
+// WithRendererOptions(ghtml.WithUnsafe()))` and both repos pin goldmark v1.8.2.
+// It is a package-level value because a goldmark.Markdown is safe for concurrent
+// use and compiling one per call would be pure waste.
+//
+// It is not "a Markdown converter" — it is THE one whose output the server then
+// reads task blocks out of, which is the only reason its answers are worth
+// anything here. Keep the options and the pinned version in step with
+// app.harbor.my's internal/notes/sanitize.go; a divergence between them is
+// exactly the class of bug this replaced (issue #66).
+var markdownConverter = goldmark.New(
+	goldmark.WithExtensions(extension.GFM),
+	goldmark.WithRendererOptions(ghtml.WithUnsafe()),
 )
+
+// blockSanitizer is the server's SANITIZE step, reduced to the only part of it that
+// can change this file's answer.
+//
+// WHY IT EXISTS. The server does not read task blocks out of the converted HTML — it
+// reads them out of the SANITIZED HTML (notes.derive: convert, Sanitize, then
+// extractTaskIDs). Skipping that step was a silent-deletion bug of its own: bluemonday
+// deletes an unallowed element's ENTIRE SUBTREE for the eleven elements in its default
+// skip-content set, so a <harbor-task> inside e.g. <object> is real markup to the HTML
+// parser, counted as carried by the guard, and then removed on the way through. Seven
+// such bodies were measured deleting a task while the CLI exited 0.
+//
+// WHY IT IS BLUEMONDAY AND NOT A CHECK OF OUR OWN. The skip is a TOKEN-STREAM rule,
+// not a tree rule: bluemonday counts from a <frame> start tag to a </frame> end tag,
+// so a VOID <frame> — which the tree builder does not even make an ancestor — swallows
+// everything after it to the end of the body. An "is any ancestor in the skip set?"
+// walk over the parsed tree looks equivalent and is not; it misses that case. Running
+// the same library on the same token stream cannot.
+//
+// WHY THIS MINIMAL POLICY IS EQUIVALENT TO THE SERVER'S RICH ONE, for this question.
+// bluemonday can only make a <harbor-task id="…"> stop being readable three ways, and
+// this policy matches the server on all three:
+//
+//   - the element is not allowlisted → both allowlist it (AllowElements("harbor-task")).
+//   - the id attribute is not allowlisted → both allowlist it, unvalidated
+//     (AllowAttrs("id").OnElements("harbor-task")), and neither marks harbor-task
+//     allowed-without-attrs, so a block with no id is dropped by both — it references
+//     no task either way.
+//   - an ancestor is in setOfElementsToSkipContent → both inherit bluemonday's default
+//     set untouched (neither calls SkipElementsContent/AllowElementsContent), and none
+//     of its eleven elements is allowlisted by either policy, so both skip all eleven.
+//
+// Everything else the server's policy allows and this one does not is stripped
+// TAG-ONLY, children kept, which cannot hide or reveal a block. Copying the server's
+// full allowlist would be a second implementation to keep in step forever; this is
+// three properties to keep in step, and TestBlockSanitizerMatchesTheServerOnWhatMatters
+// states them.
+var blockSanitizer = newBlockSanitizer()
+
+// newBlockSanitizer builds the policy described above. It is a function so the test
+// can build a second, independent instance rather than mutate the shared one.
+func newBlockSanitizer() *bluemonday.Policy {
+	p := bluemonday.NewPolicy()
+	p.AllowElements("harbor-task")
+	p.AllowAttrs("id").OnElements("harbor-task")
+	return p
+}
 
 // noteTaskBlockIDs returns the distinct task ids a body references through its
 // <harbor-task id="…"> blocks, lower-cased, in document order. format is "markdown"
@@ -67,23 +128,58 @@ var (
 // measured deleting a task while the CLI reported success. A parser handles them,
 // and the ones nobody has thought of yet, by construction.
 //
-// MARKDOWN runs through goldmark first, and goldmark ESCAPES what it treats as
-// code before any HTML parsing happens — so fenced blocks and inline code spans are
-// stripped here first, then the remainder (which goldmark passes through raw,
-// WithUnsafe) is parsed. Comments need no special case: the parser makes them
-// comment nodes, terminated or not.
+// MARKDOWN gets the same treatment one step earlier, for the same reason. The
+// server converts it with goldmark before any of that HTML parsing happens, and
+// goldmark ESCAPES what it treats as code — so this CONVERTS IT WITH GOLDMARK TOO,
+// the server's own instance settings and version (markdownConverter), and parses
+// the result. Comments need no special case either: the parser makes them comment
+// nodes, terminated or not.
 //
-// KNOWN LIMIT, stated rather than hidden: a 4-space-indented Markdown code block is
-// not stripped, because in this position indentation is far more often list
-// continuation than code. A task block hidden in one is counted as carried when it
-// is not. It takes pasting your own note's task UUID into an indented code sample to
-// reach; tracked separately, and `--format html` avoids the question entirely.
+// WHY CONVERT RATHER THAN STRIP (issue #66). This used to blank out the code
+// constructs by hand — a fence scanner plus an inline-code regex — and hand-written
+// stripping is a SECOND implementation of CommonMark that has to agree with the
+// first one everywhere or it is wrong. It did not. A 4-space-indented code block
+// was not stripped, so a task block inside one was counted as carried, the guard
+// let the update through, and the server (which sees `<pre><code>&lt;harbor-task…`,
+// text) deleted the task. Adding indented blocks to the stripper would have fixed
+// that one input and left the shape intact: every construct goldmark treats as code
+// is another chance for the two to disagree, and each disagreement is a silent
+// deletion. Converting with goldmark ends the class rather than the instance.
+//
+// It also fixes the OTHER direction, which is why stripping indentation was never
+// the answer: four spaces under a list item is CONTINUATION, not code, and goldmark
+// renders it as real markup. A stripper cannot tell those apart from the line alone;
+// the parser does not have to.
+//
+// Constructs this now inherits, all measured against a live server (see the PR):
+// fenced code (``` and ~~~, unterminated, indented up to three spaces, info string,
+// longer closing runs), 4-space and tab-indented code blocks, inline code spans of
+// any backtick count including multi-line ones, code fences and indentation nested
+// inside blockquotes and list items, backslash escapes (\<harbor-task…), and entity
+// references (&lt;harbor-task…) — against list continuation, tables, headings and
+// ordinary raw-HTML passthrough, which stay markup and stay allowed.
+//
+// THE ORDER OF THE THREE STEPS IS THE SERVER'S ORDER — convert, sanitize, parse —
+// and each was skipped once and cost a task. Every step this function leaves out is
+// a step the server takes and we are guessing at.
 func noteTaskBlockIDs(content, format string) []string {
 	scan := content
 	if format == "markdown" {
-		scan = stripMarkdownFences(scan)
-		scan = mdInlineCodeRe.ReplaceAllString(scan, " ")
+		var buf bytes.Buffer
+		if err := markdownConverter.Convert([]byte(scan), &buf); err != nil {
+			// Unreachable in practice — goldmark.Convert errors only on a
+			// misconfigured renderer, never on user input, and this renderer is a
+			// package-level literal. Fail closed anyway: for markdown this function
+			// is only ever asked about NEW content, where "no blocks" means the
+			// guard refuses rather than deletes.
+			return []string{}
+		}
+		scan = buf.String()
 	}
+	// The server reads blocks out of the SANITIZED html, not the raw or converted
+	// html, so sanitize before parsing — for BOTH formats, since an html body reaches
+	// the same step without passing through goldmark.
+	scan = blockSanitizer.Sanitize(scan)
 
 	nodes, err := html.ParseFragment(strings.NewReader(scan), &html.Node{
 		Type: html.ElementNode, Data: "body", DataAtom: atom.Body,
@@ -119,52 +215,6 @@ func noteTaskBlockIDs(content, format string) []string {
 		walk(n)
 	}
 	return out
-}
-
-// stripMarkdownFences blanks out fenced code blocks (``` or ~~~) so markup quoted
-// inside one is not mistaken for markup that will reach the server. It is a line
-// scanner because Go's regexp has no backreferences, and a fence closes only on a
-// run of the same character at least as long as the one that opened it. An
-// unterminated fence runs to the end of the input, exactly as CommonMark says.
-func stripMarkdownFences(s string) string {
-	lines := strings.Split(s, "\n")
-	out := make([]string, 0, len(lines))
-	fence := "" // the open fence's marker run, empty when not inside one
-	for _, line := range lines {
-		marker := markdownFenceMarker(line)
-		switch {
-		case fence == "" && marker != "":
-			fence = marker
-			out = append(out, "")
-		case fence != "" && marker != "" && marker[0] == fence[0] && len(marker) >= len(fence):
-			fence = ""
-			out = append(out, "")
-		case fence != "":
-			out = append(out, "")
-		default:
-			out = append(out, line)
-		}
-	}
-	return strings.Join(out, "\n")
-}
-
-// markdownFenceMarker returns the leading run of ``` or ~~~ that makes a line a
-// code fence (three or more of one character, indented at most three spaces), or
-// "" when the line is not a fence.
-func markdownFenceMarker(line string) string {
-	trimmed := strings.TrimLeft(line, " ")
-	if len(line)-len(trimmed) > 3 {
-		return "" // four or more spaces is an indented code block, not a fence
-	}
-	if !strings.HasPrefix(trimmed, "```") && !strings.HasPrefix(trimmed, "~~~") {
-		return ""
-	}
-	ch := trimmed[0]
-	n := 0
-	for n < len(trimmed) && trimmed[n] == ch {
-		n++
-	}
-	return trimmed[:n]
 }
 
 // taskBlockHTML renders the canonical in-note block for a task id — the same
