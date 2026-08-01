@@ -191,10 +191,10 @@ func displayUsage(data []byte) {
 	}
 	if len(full) > 0 {
 		fmt.Println(redWarn("At the limit: ") + strings.Join(full, ", ") + " — the next one you create will be refused.")
-		fmt.Println("Free up room by deleting and then emptying the trash, or upgrade at " + bold(upgradeURL("")) + ".")
+		fmt.Println("Delete what you no longer need, or upgrade at " + bold(upgradeURL("")) + ".")
 		return
 	}
-	fmt.Println(dim("Counts include trashed items; expunging them frees the slot. Run 'harbor plan' for your plan details."))
+	fmt.Println(dim("Trashed notes still count until you empty the trash. Run 'harbor plan' for your plan details."))
 }
 
 // displaySubscription renders the current entitlement as a detail view, then
@@ -323,7 +323,7 @@ func planLimitLines(apiErr *client.APIError) []string {
 
 	if planLimitIsReadOnly(apiErr) {
 		lines = append(lines, "Your whole account is frozen — creates and edits are blocked until you are back under your plan's limits.")
-		lines = append(lines, "Deleting still works, so you can free up room: delete what you no longer need, then 'harbor trash empty'.")
+		lines = append(lines, "Deleting still works, so you can free up room: delete what you no longer need, "+freeUpRoomHint("")+".")
 	} else if resource := str(d, "resource"); resource != "" {
 		plural := resourcePlural(resource)
 		if used, limit := str(d, "used"), str(d, "limit"); used != "" && limit != "" {
@@ -331,7 +331,7 @@ func planLimitLines(apiErr *client.APIError) []string {
 		} else {
 			lines = append(lines, fmt.Sprintf("You have reached your %s limit%s.", plural, planCodeSuffix(d)))
 		}
-		lines = append(lines, fmt.Sprintf("Only %s are blocked — everything else still works. Trashed %s still count; expunge them ('harbor trash empty') to free a slot.", plural, plural))
+		lines = append(lines, fmt.Sprintf("Only %s are blocked — everything else still works. To free a slot, delete %s you no longer need, %s.", plural, plural, freeUpRoomHint(plural)))
 	}
 
 	lines = append(lines, "Upgrade at "+bold(upgradeURL(str(d, "upgrade_url")))+" — plans are changed in the Harbor web app, not the CLI.")
@@ -349,6 +349,19 @@ func planLimitIsReadOnly(apiErr *client.APIError) bool {
 		return true
 	}
 	return str(d, "resource") == ""
+}
+
+// freeUpRoomHint finishes a "delete things to get back under the cap" sentence.
+// Only NOTES have a recycle bin — a deleted notebook, tag, file, or task is
+// tombstoned outright and frees its slot immediately — so telling someone at
+// the notebook cap to empty their trash would send them somewhere that cannot
+// help. Pass the plural resource, or "" when the whole account is frozen and
+// every kind of deletion is on the table.
+func freeUpRoomHint(plural string) string {
+	if plural == "" || plural == "notes" {
+		return "remembering that trashed notes still count until you run 'harbor trash empty'"
+	}
+	return "then re-run the command"
 }
 
 // planCodeSuffix renders " on the <code> plan" when the API named the plan, and

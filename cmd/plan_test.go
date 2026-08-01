@@ -284,6 +284,26 @@ func TestPlanLimitErrorExplainsWhichCapAndWhatToDo(t *testing.T) {
 	if !strings.Contains(body, "Only notebooks are blocked") {
 		t.Errorf("per-resource scope not explained:\n%s", body)
 	}
+	// Only notes have a recycle bin, so pointing a notebook cap at the trash
+	// would send the user somewhere that cannot free a single slot.
+	if strings.Contains(body, "trash") {
+		t.Errorf("notebook cap pointed the user at the trash:\n%s", body)
+	}
+}
+
+// TestPlanLimitOnNotesMentionsTheTrash is the counterpart: notes DO have a
+// recycle bin, and a trashed note keeps holding its slot — the one case where
+// "I already deleted things" does not explain why the cap is still full.
+func TestPlanLimitOnNotesMentionsTheTrash(t *testing.T) {
+	details := map[string]any{"resource": "note", "used": "50", "limit": "50", "plan_code": "starter"}
+	body := strings.Join(planLimitLines(planLimitError("You've reached your plan's limit of 50 notes.", details)), "\n")
+
+	if !strings.Contains(body, "50 of 50 notes") {
+		t.Errorf("note cap numbers missing:\n%s", body)
+	}
+	if !strings.Contains(body, "harbor trash empty") {
+		t.Errorf("note cap did not mention the trash:\n%s", body)
+	}
 }
 
 // TestPlanLimitErrorExplainsTheReadOnlyFreeze covers the other gate behind the

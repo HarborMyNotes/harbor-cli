@@ -10,7 +10,7 @@ description: >-
   assistant.
 ---
 
-<!-- Harbor agent skill • v1.0.0 -->
+<!-- Harbor agent skill • v1.1.0 -->
 <!-- Copyright (c) 2026 Cloudmanic Labs, LLC. All rights reserved. Date: 2026-06-22 -->
 
 # Harbor CLI — managing notes from the terminal
@@ -408,7 +408,16 @@ has copy-paste recipes and the full allowlist.
   `.paging.has_more`. `--order` takes fields like `-updated_at,title` (`-` =
   descending).
 - **Cheap listings:** `harbor notes list --meta --json` omits note bodies.
-- **Exit codes:** `0` success, `1` any error. Safe to branch on `$?`.
+- **Exit codes:** `0` success, `1` any error, `3` the API was unreachable (worth
+  retrying), `4` a plan limit blocked the write (never worth retrying). Safe to
+  branch on `$?`. Errors go to stderr — with `--json` they are the error
+  envelope, so you parse one shape either way.
+- **Plan limits.** Harbor caps notes/notebooks/tags/files/tasks per plan. On
+  exit `4`, stop and tell the user which limit they hit and that upgrading
+  happens in the Harbor web app — the CLI cannot take payment. `harbor usage`
+  shows used vs limit for everything (`∞` = unlimited) and `harbor plan` shows
+  the current plan; check `harbor usage --json` before a bulk import rather than
+  failing halfway through it.
 - **Timestamps** are UTC epoch-milliseconds everywhere (e.g. `updated_at`).
 - **No color / non-TTY:** output auto-plainifies; force with `--no-color`.
 - **Targeting a non-default server** (rare; dev/staging): `--api-url` or
@@ -456,6 +465,7 @@ has copy-paste recipes and the full allowlist.
 | History | `harbor history list \| show \| revert <id>` |
 | Files | `harbor files upload \| list \| download` |
 | Links | `harbor notes links \| backlinks <id>` |
+| Plan limits / usage | `harbor usage` · `harbor plan \| plan list` |
 | Anything else | `harbor <cmd> --help` or read `reference.md` |
 
 When in doubt: **`harbor --help`**, **`harbor <command> --help`**, or read
