@@ -78,10 +78,17 @@ func TestMapNoteError(t *testing.T) {
 		"note_title_too_long":            "title is too long",
 		"note_too_large":                 "too large",
 		"append_not_supported_encrypted": "encrypted",
+		// The base_usn precondition the task guard sends. The message has to say
+		// "nothing was written" and "merge" — a user told only "stale" retries the
+		// same body, which is exactly the clobber the server just refused.
+		"note_usn_stale": "nothing was written",
 	}
 	for code, sub := range cases {
 		if got := mapNoteError(apiErr(code)); !strings.Contains(got.Error(), sub) {
 			t.Errorf("mapNoteError(%s) = %q", code, got.Error())
 		}
+	}
+	if got := mapNoteError(apiErr("note_usn_stale")); !strings.Contains(got.Error(), "merge") {
+		t.Errorf("the stale-usn message never says to merge: %q", got)
 	}
 }

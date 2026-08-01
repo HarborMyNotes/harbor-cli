@@ -353,21 +353,29 @@ func encryptCreateBody(c *client.Client, creds *config.Credentials, body map[str
 }
 
 // encryptUpdateBody re-seals an update's title/content when the target note is
-// encrypted. It fetches the note's encryption marker first. A plaintext note is
+// encrypted. It reads the note's encryption marker first. A plaintext note is
 // left untouched; an encrypted note with no passphrase is a hard error so the CLI
 // never clobbers ciphertext with plaintext.
-func encryptUpdateBody(c *client.Client, creds *config.Credentials, noteID string, body map[string]any) error {
+//
+// note is an already-read copy of the note, or nil to fetch one. A content-carrying
+// `notes update` has just read it for the task guard (cmd/note_tasks.go), and
+// reading it a second time here would be a round trip that answers a question we
+// already hold the answer to.
+func encryptUpdateBody(c *client.Client, creds *config.Credentials, noteID string, body, note map[string]any) error {
 	_, hasTitle := body["title"]
 	_, hasContent := body["content"]
 	if !hasTitle && !hasContent {
 		return nil // only metadata is changing; the body is untouched
 	}
 
-	meta, err := c.GetNote(noteID, nil)
-	if err != nil {
-		return mapNoteError(err)
+	if note == nil {
+		meta, err := c.GetNote(noteID, nil)
+		if err != nil {
+			return mapNoteError(err)
+		}
+		note = parseJSON(client.UnwrapData(meta))
 	}
-	if !boolean(parseJSON(client.UnwrapData(meta)), "is_encrypted") {
+	if !boolean(note, "is_encrypted") {
 		return nil // plaintext note → normal update
 	}
 	if !encryptionEnabled() {
