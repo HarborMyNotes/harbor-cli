@@ -216,12 +216,19 @@ func TestEveryConfirmationIsWellFormed(t *testing.T) {
 // commands whose help merely EXPLAINS what an expunged note is. Prose describes
 // destruction at least as often as it performs it; the request on the wire does
 // not lie.
+// "Destroys" is meant broadly enough to cover the last entry, which destroys no
+// note at all: writing a note's contents back to the server in the clear cannot
+// be taken back either, because the plaintext is indexed and snapshotted into the
+// note's history the moment it lands. Re-encrypting protects the note from then
+// on; it does not retract what was already stored. Both are "you cannot get the
+// old state back", which is the property the confirmation exists for.
 var irreversibleClientCalls = []string{
 	"c.EmptyTrash(",             // every note in the bin, gone
 	"c.ExpungeNote(",            // one note, gone
 	"c.DeleteNote(",             // trashes by default, but expunges with --permanent
 	"c.DeleteAccountExport(",    // the archive and its emailed link
 	"c.RequestAccountDeletion(", // the whole account, after a grace window
+	"c.ConvertNoteToPlaintext(", // a note's contents, published to the server
 }
 
 // TestEveryIrreversibleCommandAsksFirst is the check that would have caught the
@@ -234,12 +241,20 @@ var irreversibleClientCalls = []string{
 // it from the source instead: any cobra command whose body issues one of the
 // irreversible calls above must also consult a confirmation. A new destructive
 // command fails this by default, which is the whole point.
+// It also insists the call it found REACHES confirmDestructive, rather than
+// merely being spelled like it does. Matching the name alone was not enough: a
+// helper called verifyConversionLanded — a post-write sanity check with no
+// prompt in it — was originally named confirmConversionLanded, and with that name
+// it satisfied this test on its own. The gate could then be deleted outright and
+// nothing failed. A command is only asking first if the thing it calls actually
+// ends up at the one function that reads an answer.
 func TestEveryIrreversibleCommandAsksFirst(t *testing.T) {
 	// Every gate is reached through a helper named *Confirm*/*confirm*, so this
 	// looks for a CALL rather than the word. That distinction is load-bearing:
 	// scanning the whole declaration for "confirm" passed even with the gate
 	// deleted, because the help text says "you will be asked to confirm".
-	confirmCall := regexp.MustCompile(`(?i)confirm\w*\(`)
+	confirmCall := regexp.MustCompile(`(?i)\b(\w*confirm\w*)\(`)
+	bodies := packageFuncBodies(t)
 
 	for _, block := range cobraCommandBlocks(t) {
 		call := ""
@@ -252,11 +267,85 @@ func TestEveryIrreversibleCommandAsksFirst(t *testing.T) {
 		if call == "" {
 			continue
 		}
-		if !confirmCall.MatchString(block.runE) {
+		gated := false
+		for _, m := range confirmCall.FindAllStringSubmatch(block.runE, -1) {
+			if reachesConfirmDestructive(m[1], bodies, map[string]bool{}) {
+				gated = true
+				break
+			}
+		}
+		if !gated {
 			t.Errorf("%s (%s) calls %s in its RunE but never consults a confirmation — it destroys without asking",
 				block.varName, block.use, call)
 		}
 	}
+}
+
+// reachesConfirmDestructive reports whether calling name eventually reaches the
+// gate — directly, or through however many package-level helpers sit in between.
+// A name that resolves to no package-level function (a method, a local closure,
+// something from another package) reaches nothing, which is the answer that
+// matters: it cannot be shown to ask.
+func reachesConfirmDestructive(name string, bodies map[string]string, seen map[string]bool) bool {
+	if name == "confirmDestructive" {
+		return true
+	}
+	if seen[name] {
+		return false // a cycle; it has not reached the gate by going round again
+	}
+	seen[name] = true
+	body, ok := bodies[name]
+	if !ok {
+		return false
+	}
+	for _, m := range regexp.MustCompile(`\b(\w+)\(`).FindAllStringSubmatch(body, -1) {
+		if reachesConfirmDestructive(m[1], bodies, seen) {
+			return true
+		}
+	}
+	return false
+}
+
+// packageFuncBodies returns every package-level function in the command sources,
+// keyed by name. It ends each body at the next top-level declaration for the same
+// reason cobraCommandBlocks does — brace counting walks straight off the end of a
+// function containing a raw string with braces in it.
+func packageFuncBodies(t *testing.T) map[string]string {
+	t.Helper()
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Plain functions only: a method's receiver makes it unreachable by bare name
+	// from a RunE, so including one would let an unrelated same-named method
+	// answer for it.
+	marker := regexp.MustCompile(`(?m)^func (\w+)\(`)
+	nextDecl := regexp.MustCompile(`(?m)^(var|func) `)
+
+	out := map[string]string{}
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(src)
+		for _, m := range marker.FindAllStringSubmatchIndex(text, -1) {
+			rest := text[m[1]:]
+			end := len(rest)
+			if next := nextDecl.FindStringIndex(rest); next != nil {
+				end = next[0]
+			}
+			out[text[m[2]:m[3]]] = rest[:end]
+		}
+	}
+	if len(out) < 50 {
+		t.Fatalf("only found %d package functions in the sources; the scan is broken, so this test proves nothing", len(out))
+	}
+	return out
 }
 
 // commandBlock is one `var xxxCmd = &cobra.Command{...}` declaration, as source.
