@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/microcosm-cc/bluemonday"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/extension"
 	ghtml "github.com/yuin/goldmark/renderer/html"
@@ -65,6 +66,53 @@ var markdownConverter = goldmark.New(
 	goldmark.WithRendererOptions(ghtml.WithUnsafe()),
 )
 
+// blockSanitizer is the server's SANITIZE step, reduced to the only part of it that
+// can change this file's answer.
+//
+// WHY IT EXISTS. The server does not read task blocks out of the converted HTML — it
+// reads them out of the SANITIZED HTML (notes.derive: convert, Sanitize, then
+// extractTaskIDs). Skipping that step was a silent-deletion bug of its own: bluemonday
+// deletes an unallowed element's ENTIRE SUBTREE for the eleven elements in its default
+// skip-content set, so a <harbor-task> inside e.g. <object> is real markup to the HTML
+// parser, counted as carried by the guard, and then removed on the way through. Seven
+// such bodies were measured deleting a task while the CLI exited 0.
+//
+// WHY IT IS BLUEMONDAY AND NOT A CHECK OF OUR OWN. The skip is a TOKEN-STREAM rule,
+// not a tree rule: bluemonday counts from a <frame> start tag to a </frame> end tag,
+// so a VOID <frame> — which the tree builder does not even make an ancestor — swallows
+// everything after it to the end of the body. An "is any ancestor in the skip set?"
+// walk over the parsed tree looks equivalent and is not; it misses that case. Running
+// the same library on the same token stream cannot.
+//
+// WHY THIS MINIMAL POLICY IS EQUIVALENT TO THE SERVER'S RICH ONE, for this question.
+// bluemonday can only make a <harbor-task id="…"> stop being readable three ways, and
+// this policy matches the server on all three:
+//
+//   - the element is not allowlisted → both allowlist it (AllowElements("harbor-task")).
+//   - the id attribute is not allowlisted → both allowlist it, unvalidated
+//     (AllowAttrs("id").OnElements("harbor-task")), and neither marks harbor-task
+//     allowed-without-attrs, so a block with no id is dropped by both — it references
+//     no task either way.
+//   - an ancestor is in setOfElementsToSkipContent → both inherit bluemonday's default
+//     set untouched (neither calls SkipElementsContent/AllowElementsContent), and none
+//     of its eleven elements is allowlisted by either policy, so both skip all eleven.
+//
+// Everything else the server's policy allows and this one does not is stripped
+// TAG-ONLY, children kept, which cannot hide or reveal a block. Copying the server's
+// full allowlist would be a second implementation to keep in step forever; this is
+// three properties to keep in step, and TestBlockSanitizerMatchesTheServerOnWhatMatters
+// states them.
+var blockSanitizer = newBlockSanitizer()
+
+// newBlockSanitizer builds the policy described above. It is a function so the test
+// can build a second, independent instance rather than mutate the shared one.
+func newBlockSanitizer() *bluemonday.Policy {
+	p := bluemonday.NewPolicy()
+	p.AllowElements("harbor-task")
+	p.AllowAttrs("id").OnElements("harbor-task")
+	return p
+}
+
 // noteTaskBlockIDs returns the distinct task ids a body references through its
 // <harbor-task id="…"> blocks, lower-cased, in document order. format is "markdown"
 // or "html" and says how much of the input is code rather than markup.
@@ -110,6 +158,10 @@ var markdownConverter = goldmark.New(
 // inside blockquotes and list items, backslash escapes (\<harbor-task…), and entity
 // references (&lt;harbor-task…) — against list continuation, tables, headings and
 // ordinary raw-HTML passthrough, which stay markup and stay allowed.
+//
+// THE ORDER OF THE THREE STEPS IS THE SERVER'S ORDER — convert, sanitize, parse —
+// and each was skipped once and cost a task. Every step this function leaves out is
+// a step the server takes and we are guessing at.
 func noteTaskBlockIDs(content, format string) []string {
 	scan := content
 	if format == "markdown" {
@@ -124,6 +176,10 @@ func noteTaskBlockIDs(content, format string) []string {
 		}
 		scan = buf.String()
 	}
+	// The server reads blocks out of the SANITIZED html, not the raw or converted
+	// html, so sanitize before parsing — for BOTH formats, since an html body reaches
+	// the same step without passing through goldmark.
+	scan = blockSanitizer.Sanitize(scan)
 
 	nodes, err := html.ParseFragment(strings.NewReader(scan), &html.Node{
 		Type: html.ElementNode, Data: "body", DataAtom: atom.Body,

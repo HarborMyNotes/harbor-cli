@@ -184,6 +184,15 @@ func TestNotesUpdateKeepTasksRefusesWhenHTMLSwallowsTheBlocks(t *testing.T) {
 		"unclosed style":    "<p>new</p><style>",
 		"unclosed title":    "<p>new</p><title>",
 		"truncated tag":     "<p>new</p><div",
+		// Skip-content elements the PARSER treats as ordinary markup (issue #66
+		// review). These are the dangerous half: the appended block is a real element
+		// in the tree, so the post-condition only catches it because the scanner now
+		// sanitizes. An unclosed one swallows to the end of the body, so --keep-tasks
+		// would append into the discarded subtree and report success.
+		"unclosed object":   "<p>new</p><object>",
+		"unclosed nostyle":  "<p>new</p><nostyle>",
+		"unclosed frameset": "<p>new</p><frameset>",
+		"void frame":        "<p>new</p><frame>",
 	}
 	for name, content := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -758,13 +767,121 @@ func TestNoteTaskBlockIDsMarkdownCode(t *testing.T) {
 	}
 }
 
-// The CLI's converter has to be the SERVER'S converter, not merely a Markdown
-// converter, because the guard's whole claim is that its answer is the server's
-// answer. GFM tables are the cheapest proof the extension set matches (a table is
-// not CommonMark, so a plain goldmark.New renders this as a paragraph), and raw
-// HTML passthrough proves WithUnsafe is on (without it goldmark ESCAPES the block
-// and the guard would refuse every update that carries one).
-func TestMarkdownConverterMatchesTheServerConfig(t *testing.T) {
+// ===========================================================================
+// The sanitize step: bluemonday's skip-content subtrees
+// ===========================================================================
+
+// bluemondaySkipContentElements is bluemonday v1.0.27's default skip-content set,
+// copied verbatim from addDefaultSkipElementContent(). It is the COMPLETE list of
+// elements whose entire subtree the sanitizer discards when the element itself is
+// not allowlisted — and neither this repo's policy nor the server's allowlists any
+// of them, nor calls SkipElementsContent/AllowElementsContent to change the set.
+//
+// It is written out here rather than reached for through the library so that a
+// bluemonday upgrade which ADDS an element to the set fails
+// TestBlockSanitizerSkipSetIsStillTheOneWeEnumerated below, instead of silently
+// widening the set of bodies nobody has measured.
+var bluemondaySkipContentElements = []string{
+	"frame", "frameset", "iframe", "noembed", "noframes",
+	"noscript", "nostyle", "object", "script", "style", "title",
+}
+
+// The fourth bug in this family, and the one a hand-picked sweep missed (issue #66
+// review). The guard used to parse the body WITHOUT sanitizing it, but the server
+// reads task blocks out of the SANITIZED html — and bluemonday deletes an unallowed
+// element's whole subtree for the elements above. A <harbor-task> inside <object> is
+// real markup to the HTML parser, so the guard counted it, the server never saw it,
+// and the task was deleted at exit 0. Seven such bodies were measured.
+//
+// WHY THIS ENUMERATION IS COMPLETE. The earlier sweep picked examples and happened to
+// pick only elements the HTML PARSER treats as raw text (iframe, noscript, script,
+// style, title) — for those the contents are a text node, no <harbor-task> element
+// exists, and the guard already agreed. The elements parsed as ORDINARY MARKUP
+// (frame, frameset, nostyle, object) are precisely the ones that diverged, and none
+// was tested. So the axis is not "which examples look risky" but "how does the parser
+// treat the element", and the table runs the ENTIRE skip set across both classes.
+//
+// Both wrapping shapes are covered because the skip is a TOKEN-STREAM counter, not a
+// tree relationship: an unclosed one runs to the end of the body, and for a void
+// <frame> the tree builder does not even make the block a descendant.
+func TestNoteTaskBlockIDsHonoursSanitizerSkippedSubtrees(t *testing.T) {
+	block := taskBlockHTML(fixtureTaskID)
+
+	for _, el := range bluemondaySkipContentElements {
+		for _, tc := range []struct{ shape, content string }{
+			{"closed", "<p>x</p><" + el + ">" + block + "</" + el + ">"},
+			{"unclosed", "<p>x</p><" + el + ">" + block},
+		} {
+			// Both formats: a Markdown body reaches the same sanitizer, because
+			// goldmark passes raw HTML straight through (WithUnsafe).
+			for _, format := range []string{"html", "markdown"} {
+				t.Run(el+"/"+tc.shape+"/"+format, func(t *testing.T) {
+					if got := noteTaskBlockIDs(tc.content, format); len(got) != 0 {
+						t.Errorf("counted %v as carried, but the sanitizer discards this whole\n"+
+							"subtree — the server sees no block and deletes the task:\n%s", got, tc.content)
+					}
+				})
+			}
+		}
+	}
+}
+
+// The other direction for the same step. A disallowed element that is NOT in the skip
+// set is stripped TAG-ONLY with its children kept, so the block survives and the guard
+// must keep allowing the update. Without these, "sanitize everything away" would pass
+// the table above and refuse every edit.
+func TestNoteTaskBlockIDsKeepsBlocksUnderOrdinaryWrappers(t *testing.T) {
+	block := taskBlockHTML(fixtureTaskID)
+
+	for _, el := range []string{"div", "span", "p", "blockquote", "td", "svg", "blink", "custom-thing"} {
+		t.Run(el, func(t *testing.T) {
+			got := noteTaskBlockIDs("<"+el+">"+block+"</"+el+">", "html")
+			if len(got) != 1 || got[0] != fixtureTaskID {
+				t.Errorf("got %v, want the block carried — <%s> is not a skip-content element,\n"+
+					"so the sanitizer keeps the block and refusing here would block a safe edit", got, el)
+			}
+		})
+	}
+}
+
+// A bluemonday upgrade that ADDS to the skip set widens the set of bodies where the
+// guard's answer could change, and nothing else in this repo would notice. Rebuild the
+// policy and ask it directly, so the upgrade lands as a failure with instructions
+// rather than as a quiet behaviour change.
+func TestBlockSanitizerSkipSetIsStillTheOneWeEnumerated(t *testing.T) {
+	fresh := newBlockSanitizer()
+	block := taskBlockHTML(fixtureTaskID)
+
+	// Every element we enumerated must still skip its content...
+	for _, el := range bluemondaySkipContentElements {
+		if out := fresh.Sanitize("<" + el + ">" + block + "</" + el + ">"); strings.Contains(out, "harbor-task") {
+			t.Errorf("<%s> no longer skips its content (bluemonday changed): %q\n"+
+				"The guard may now be REFUSING updates that are safe — re-measure and update the list.", el, out)
+		}
+	}
+	// ...and the block must still survive the policy on its own, or the guard would
+	// refuse every content update on a note with tasks.
+	if out := fresh.Sanitize(block); !strings.Contains(out, fixtureTaskID) {
+		t.Fatalf("the policy no longer preserves <harbor-task id>: %q", out)
+	}
+}
+
+// WHAT THIS COVERS, AND WHAT IT DOES NOT. It asserts the converter's OPTIONS — that
+// GFM is enabled and raw HTML is passed through — and nothing else. It was previously
+// named as though it verified the CLI matched the server; it does not, and a reviewer
+// proved it by downgrading goldmark to v1.7.8 with the whole suite still green.
+//
+// The version half is TestPipelineDependencyPinsMatchTheRecordedPairing below, and even
+// that can only see THIS repo. Nothing here can observe app.harbor.my, so a server-side
+// bump — the drift most likely to reopen issue #66 — is not detectable from this
+// package by any test. That is a real gap, stated so the next person keeps looking
+// rather than trusting a green suite.
+//
+// GFM tables are the cheapest proof the extension set matches (a table is not
+// CommonMark, so a plain goldmark.New renders this as a paragraph), and raw HTML
+// passthrough proves WithUnsafe is on (without it goldmark ESCAPES the block and the
+// guard would refuse every update that carries one).
+func TestMarkdownConverterOptionsAreGFMAndUnsafe(t *testing.T) {
 	var buf bytes.Buffer
 	if err := markdownConverter.Convert([]byte("| a |\n|---|\n| x |\n"), &buf); err != nil {
 		t.Fatalf("convert: %v", err)
@@ -779,6 +896,56 @@ func TestMarkdownConverterMatchesTheServerConfig(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), `<harbor-task id="`+fixtureTaskID+`">`) {
 		t.Errorf("raw HTML is being escaped — the server renders with html.WithUnsafe:\n%s", buf.String())
+	}
+}
+
+// serverPipelinePins are the versions app.harbor.my's internal/notes pipeline was
+// READ AT and measured against. The guard's whole claim is that its answer is the
+// server's answer, and it can only be that if both sides run the same converter and
+// the same sanitizer — so the pairing is data, recorded here rather than left to
+// memory.
+var serverPipelinePins = map[string]string{
+	"github.com/yuin/goldmark":           "v1.8.2",
+	"github.com/microcosm-cc/bluemonday": "v1.0.27",
+}
+
+// This is the test that actually catches a version change, which the options test
+// above does not: bumping either dependency in go.mod fails here with the reason.
+//
+// It reads go.mod rather than runtime/debug.ReadBuildInfo, which reports no
+// dependencies at all for a test binary (measured — deps=0).
+//
+// BE CLEAR ABOUT THE HALF IT CANNOT COVER. This proves the CLI still pins what it was
+// measured with. It CANNOT prove the server still pins the same thing, because nothing
+// in this repo can see app.harbor.my. A server-side bump stays green here and is the
+// most likely way this drifts back — the mitigation is that bumping on THIS side now
+// forces someone to look at both, and the failure message says so.
+func TestPipelineDependencyPinsMatchTheRecordedPairing(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "go.mod"))
+	if err != nil {
+		t.Fatalf("read go.mod: %v", err)
+	}
+	for module, want := range serverPipelinePins {
+		got := ""
+		for _, line := range strings.Split(string(raw), "\n") {
+			fields := strings.Fields(strings.TrimSpace(line))
+			if len(fields) >= 2 && fields[0] == module {
+				got = fields[1]
+				break
+			}
+		}
+		if got == "" {
+			t.Errorf("%s is no longer required by go.mod — the guard cannot answer with the\n"+
+				"server's own pipeline without it", module)
+			continue
+		}
+		if got != want {
+			t.Errorf("%s is pinned at %s, but the guard was measured against the server at %s.\n"+
+				"Confirm app.harbor.my's go.mod is on %s too, re-measure the guard against a\n"+
+				"running server, then update serverPipelinePins. This repo CANNOT detect a bump\n"+
+				"on the server side, so this is the only moment anyone is prompted to check.",
+				module, got, want, got)
+		}
 	}
 }
 
