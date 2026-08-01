@@ -35,10 +35,10 @@ var (
 	sessionUnlockd bool
 	decryptWarned  bool
 
-	// defaultNotebookWarned tracks the "could not read the notebook list" warning
-	// separately from decryptWarned. They are different facts, and sharing one flag
-	// would let whichever fired first silence the other.
-	defaultNotebookWarned bool
+	// encryptCheckWarned tracks the "could not tell whether this note should be
+	// encrypted" warning separately from decryptWarned. They are different facts, and
+	// sharing one flag would let whichever fired first silence the other.
+	encryptCheckWarned bool
 )
 
 // Sentinel errors for the encryption session.
@@ -299,29 +299,67 @@ func shouldEncryptCreate(cmd *cobra.Command, c *client.Client, notebookID string
 	if !encryptionEnabled() {
 		return false, nil
 	}
-	return notebookWantsEncryption(c, notebookID), nil
+
+	// The lookup reports whether it could ANSWER, not just what the answer was, and
+	// this is the one place that difference gets decided. Both stay false — the
+	// function fails OPEN by design (see notebookWantsEncryption) — but an
+	// unanswered question is said out loud rather than being spent as a "no".
+	wants, known := notebookWantsEncryption(c, notebookID)
+	if !known {
+		warnEncryptionUnknown(notebookID)
+	}
+	return wants, nil
 }
 
-// notebookWantsEncryption best-effort reports whether the target notebook (or the
-// default notebook, when none is given) has default_encrypt set. On any lookup
-// error it returns false so a transient failure never silently encrypts.
+// warnEncryptionUnknown says out loud that a note is going out UNENCRYPTED because
+// a notebook lookup could not establish whether it should be, rather than because
+// the notebook said no. Once per process, on stderr, so it cannot corrupt a piped
+// --json stdout.
+func warnEncryptionUnknown(notebookID string) {
+	if encryptCheckWarned {
+		return
+	}
+	encryptCheckWarned = true
+	target := "the default notebook's"
+	if notebookID != "" {
+		target = "notebook " + notebookID + "'s"
+	}
+	fmt.Fprintln(os.Stderr, dim("⚠ could not read "+target+" encryption setting, so this note is being "+
+		"written UNENCRYPTED — re-run, or pass --encrypt to encrypt it regardless"))
+}
+
+// notebookWantsEncryption reports whether the target notebook (or the default
+// notebook, when none is given) has default_encrypt set — AND whether that could be
+// established at all. The second return is the point: a lookup that failed and a
+// notebook that said no are different facts, and only the caller can decide what to
+// do about the difference.
 //
-// The default-notebook lookup WALKS THE PAGES. GET /notebooks is paged and has no
-// "just the default one" filter, so the default notebook can sit on any page —
+// WHY BOTH BRANCHES REPORT IT. This function fails OPEN — an unanswerable lookup
+// writes the note in the clear — and that is deliberate: failing closed would mean
+// encrypting on a guess, and a note sealed under a passphrase the user did not mean
+// to use is unrecoverable, where a note written in the clear can simply be re-saved.
+// But "false" as the sole answer let a failed GetNotebook read back at the call site
+// as "this notebook does not want encryption", which is how a named notebook marked
+// default_encrypt silently produced a plaintext note. The signal is returned rather
+// than warned about in here so there is no branch left that can forget to.
+//
+// The DEFAULT-notebook lookup also WALKS THE PAGES. GET /notebooks is paged and has
+// no "just the default one" filter, so the default notebook can sit on any page —
 // reading only the first would answer "no" for an account with more notebooks than
-// fit in it, and write a note in the clear that its notebook asked to be encrypted.
-// That is the same one-page assumption as issue #67, found while looking for its
-// siblings; it is the only other internal collection read in the command tree. The
-// walk stops at the default, so an ordinary account still pays one request.
-func notebookWantsEncryption(c *client.Client, notebookID string) bool {
+// fit in it. That is the same one-page assumption as issue #67, found while looking
+// for its siblings; it is the only other internal collection read in the command
+// tree. The walk stops at the default, so an ordinary account still pays one request.
+func notebookWantsEncryption(c *client.Client, notebookID string) (wants, known bool) {
+	// A NAMED notebook is the common path — it needs no big account to reach, just a
+	// --notebook flag — and it is a plain GET, so "known" is simply "the read worked".
 	if notebookID != "" {
 		data, err := c.GetNotebook(notebookID, false)
 		if err != nil {
-			return false
+			return false, false
 		}
-		return boolean(parseJSON(client.UnwrapData(data)), "default_encrypt")
+		return boolean(parseJSON(client.UnwrapData(data)), "default_encrypt"), true
 	}
-	wants := false
+
 	complete, err := walkCollection(
 		func(params map[string]string) ([]byte, error) { return c.ListNotebooks(params) },
 		func(raw json.RawMessage) bool {
@@ -330,30 +368,15 @@ func notebookWantsEncryption(c *client.Client, notebookID string) bool {
 				return true
 			}
 			wants = boolean(n, "default_encrypt")
+			known = true
 			return false
 		})
-
-	// "We could not read the whole notebook list" is not the same fact as "this
-	// notebook does not want encryption", and only one of them is true here. The
-	// answer is still false — this function fails OPEN by design, because failing
-	// closed would mean encrypting on a guess, and a note encrypted under a
-	// passphrase the user did not mean to use is unrecoverable, where a note
-	// written in the clear can be re-saved. But that is a decision, not a
-	// discarded return value, so it is made out loud: the user is told which
-	// question went unanswered and can re-run, or pass --encrypt to settle it.
-	if err != nil || !complete {
-		if wants {
-			return true // the default was found before the read went wrong
-		}
-		if !defaultNotebookWarned {
-			defaultNotebookWarned = true
-			fmt.Fprintln(os.Stderr, dim("⚠ could not read the notebook list in full, so the default "+
-				"notebook's encryption setting is unknown — writing this note unencrypted "+
-				"(pass --encrypt to force it)"))
-		}
-		return false
+	if known {
+		// The default was found and read before anything went wrong; whatever the walk
+		// did afterwards cannot unmake that answer.
+		return wants, true
 	}
-	return wants
+	return false, err == nil && complete
 }
 
 // encryptCreateBody seals a create body's title and content into HRBC2 envelopes
