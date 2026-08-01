@@ -310,12 +310,18 @@ $ harbor notebooks create --name "Q3 Planning"
 Error: You've reached your plan's limit of 3 notebooks. Upgrade to add more.
   code: plan_limit_reached
   You are using 3 of 3 notebooks on the starter plan.
-  Only notebooks are blocked — everything else still works. To free a slot,
-  delete notebooks you no longer need, then re-run the command.
+  Only notebooks are blocked — everything else still works.
+  To free a slot, delete notebooks you no longer need with
+  'harbor notebooks delete <id>' — that frees it immediately.
   Upgrade at https://app.harbor.my/settings/plan — plans are changed in the
   Harbor web app, not the CLI.
   Run 'harbor usage' to see every limit on this plan.
 ```
+
+The remedy is per resource, because they do not free a slot the same way:
+trashing a **note** frees nothing until it is expunged, and **files** have no
+delete at all — an attachment is released only when the notes holding it are
+permanently deleted.
 
 `harbor usage` shows where you stand before you hit a wall, and `harbor plan`
 shows what you are subscribed to. **Billing is never handled in the CLI** —

@@ -428,8 +428,13 @@ create and edit; deletes and exports still work). Retrying never helps — free 
 room or upgrade in the web app. Check `harbor usage --json` before a bulk import
 to avoid failing halfway.
 
-Counts include trashed **notes** (empty the trash to free those slots);
-notebooks, tags, files, and tasks free their slot as soon as they are deleted.
+**How a slot is actually freed** differs per resource — do not assume "delete it":
+
+| Resource | What frees a slot |
+|---|---|
+| notebooks, tags, tasks | `harbor <domain> delete <id>` — immediate |
+| notes | Trashing does **not** free it. `harbor notes delete <id> --permanent`, or trash then `harbor trash empty` |
+| files | **There is no `harbor files delete`.** A blob is released only when the notes holding it are **expunged** (and no other live-or-trashed note references it). An upload never attached to a note has no user-reachable delete at all |
 
 ---
 

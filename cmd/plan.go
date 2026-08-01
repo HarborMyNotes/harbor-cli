@@ -186,12 +186,19 @@ func displayUsage(data []byte) {
 
 	if boolean(root, "is_read_only") {
 		fmt.Println(redWarn("Your account is read-only.") + " You are over your plan's limits, so nothing can be created or edited.")
-		fmt.Println("Delete what you no longer need (deleting and emptying the trash still work), or upgrade at " + bold(upgradeURL("")) + ".")
+		fmt.Println("Deleting still works: remove what you no longer need, then run 'harbor trash empty' (trashed notes still count).")
+		fmt.Println("Or upgrade at " + bold(upgradeURL("")) + ".")
 		return
 	}
 	if len(full) > 0 {
 		fmt.Println(redWarn("At the limit: ") + strings.Join(full, ", ") + " — the next one you create will be refused.")
-		fmt.Println("Delete what you no longer need, or upgrade at " + bold(upgradeURL("")) + ".")
+		// Each full resource frees its slot a different way, so the advice is
+		// per resource rather than one "delete something" line that is wrong
+		// for whichever of them the user actually cares about.
+		for _, remedy := range planLimitFullResourceRemedy(full) {
+			fmt.Println(remedy)
+		}
+		fmt.Println("Or upgrade at " + bold(upgradeURL("")) + ".")
 		return
 	}
 	fmt.Println(dim("Trashed notes still count until you empty the trash. Run 'harbor plan' for your plan details."))
@@ -323,7 +330,11 @@ func planLimitLines(apiErr *client.APIError) []string {
 
 	if planLimitIsReadOnly(apiErr) {
 		lines = append(lines, "Your whole account is frozen — creates and edits are blocked until you are back under your plan's limits.")
-		lines = append(lines, "Deleting still works, so you can free up room: delete what you no longer need, "+freeUpRoomHint("")+".")
+		// Deleting is the documented escape hatch and is never gated, but for
+		// notes it only counts once the note leaves the trash — so a user who
+		// deletes and sees nothing change has done the right thing and stopped
+		// one step early.
+		lines = append(lines, "Deleting still works: remove what you no longer need, then run 'harbor trash empty' (trashed notes still count against your limits).")
 	} else if resource := str(d, "resource"); resource != "" {
 		plural := resourcePlural(resource)
 		if used, limit := str(d, "used"), str(d, "limit"); used != "" && limit != "" {
@@ -331,7 +342,10 @@ func planLimitLines(apiErr *client.APIError) []string {
 		} else {
 			lines = append(lines, fmt.Sprintf("You have reached your %s limit%s.", plural, planCodeSuffix(d)))
 		}
-		lines = append(lines, fmt.Sprintf("Only %s are blocked — everything else still works. To free a slot, delete %s you no longer need, %s.", plural, plural, freeUpRoomHint(plural)))
+		lines = append(lines, fmt.Sprintf("Only %s are blocked — everything else still works.", plural))
+		if remedy := planLimitRemedy(plural); remedy != "" {
+			lines = append(lines, remedy)
+		}
 	}
 
 	lines = append(lines, "Upgrade at "+bold(upgradeURL(str(d, "upgrade_url")))+" — plans are changed in the Harbor web app, not the CLI.")
@@ -351,17 +365,52 @@ func planLimitIsReadOnly(apiErr *client.APIError) bool {
 	return str(d, "resource") == ""
 }
 
-// freeUpRoomHint finishes a "delete things to get back under the cap" sentence.
-// Only NOTES have a recycle bin — a deleted notebook, tag, file, or task is
-// tombstoned outright and frees its slot immediately — so telling someone at
-// the notebook cap to empty their trash would send them somewhere that cannot
-// help. Pass the plural resource, or "" when the whole account is frozen and
-// every kind of deletion is on the table.
-func freeUpRoomHint(plural string) string {
-	if plural == "" || plural == "notes" {
-		return "remembering that trashed notes still count until you run 'harbor trash empty'"
+// planLimitRemedy is the "here is how you actually free a slot" sentence for a
+// resource — or "" when there is nothing we can honestly tell the user to do.
+//
+// Every branch names only commands that exist and a path that really drops the
+// server-side count, because a remedy the user cannot follow is worse than no
+// remedy: they burn time proving the CLI wrong. The counts differ per resource:
+//
+//   - notebooks / tags / tasks are tombstoned the moment they are deleted, so
+//     `<domain> delete` frees the slot immediately.
+//   - notes go to a recycle bin first, and the count includes trashed rows —
+//     trashing frees nothing until the note is expunged.
+//   - files have NO delete: there is no `harbor files delete` and the API
+//     registers no DELETE route. A blob row is tombstoned only by the orphan
+//     reclaim that runs after a note is EXPUNGED, and only when no live-or-
+//     trashed note still references that hash. So the remedy is to permanently
+//     delete the notes holding the attachments — and an upload that was never
+//     attached to a note has no user-reachable path at all, which we say rather
+//     than sending them hunting for a command that is not there.
+//
+// An unknown resource (a cap added server-side after this build) gets "" — the
+// upgrade line still applies, and inventing a delete command would be a guess.
+func planLimitRemedy(plural string) string {
+	switch plural {
+	case "notes":
+		return "Trashing a note does not free its slot. Delete notes with 'harbor notes delete <id> --permanent', or trash them and then run 'harbor trash empty'."
+	case "notebooks", "tags", "tasks":
+		return fmt.Sprintf("To free a slot, delete %s you no longer need with 'harbor %s delete <id>' — that frees it immediately.", plural, plural)
+	case "files":
+		return "Attachments are freed only when the notes holding them are permanently deleted ('harbor notes delete <id> --permanent', or trash them and run 'harbor trash empty') — a trashed note still holds its files. There is no 'harbor files delete', so an upload never attached to a note cannot be freed from here; reach us with 'harbor support'."
+	default:
+		return ""
 	}
-	return "then re-run the command"
+}
+
+// planLimitFullResourceRemedy is planLimitRemedy for the usage meter, which
+// names the resources that are already full rather than one the API refused.
+// Several can be full at once; each gets its own line, so nobody is handed a
+// remedy that belongs to a different resource.
+func planLimitFullResourceRemedy(full []string) []string {
+	lines := make([]string, 0, len(full))
+	for _, plural := range full {
+		if remedy := planLimitRemedy(plural); remedy != "" {
+			lines = append(lines, remedy)
+		}
+	}
+	return lines
 }
 
 // planCodeSuffix renders " on the <code> plan" when the API named the plan, and

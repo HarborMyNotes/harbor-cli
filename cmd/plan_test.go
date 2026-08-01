@@ -124,6 +124,51 @@ func TestDisplayUsageWarnsWhenAccountIsReadOnly(t *testing.T) {
 	}
 }
 
+// TestDisplayUsageGivesTheRemedyForTheResourceThatIsFull covers the meter's
+// half of the same promise the error makes: whichever resource is full, the
+// advice under the table has to be the one that works for THAT resource. A
+// single "delete something" line is wrong for files, whose slots are freed only
+// by expunging the notes holding them.
+func TestDisplayUsageGivesTheRemedyForTheResourceThatIsFull(t *testing.T) {
+	filesFull := `{"data":{
+	  "plan":{"code":"starter","name":"Starter","source":"free","status":""},
+	  "is_read_only":false,
+	  "usage":{"notes":{"used":1,"limit":50},"files":{"used":50,"limit":50}}}}`
+	out := captureStdout(t, func() { displayUsage([]byte(filesFull)) })
+
+	if !strings.Contains(out, "At the limit: files") {
+		t.Errorf("full resource not named:\n%s", out)
+	}
+	if !strings.Contains(out, "harbor notes delete") {
+		t.Errorf("files remedy missing — the meter gave no way to free a file slot:\n%s", out)
+	}
+	// The remedy names 'harbor files delete' only to say it does not exist, so
+	// the check has to be for the INSTRUCTION form, not the mention.
+	if strings.Contains(out, "with 'harbor files delete") || strings.Contains(out, "run 'harbor files delete") {
+		t.Errorf("meter told the user to run a command that does not exist:\n%s", out)
+	}
+	if !strings.Contains(out, "no 'harbor files delete'") {
+		t.Errorf("meter did not warn that files have no delete:\n%s", out)
+	}
+}
+
+// TestDisplayUsageRemediesEveryFullResource guards the multi-resource case: two
+// caps full at once must each get their own advice, not the first one's.
+func TestDisplayUsageRemediesEveryFullResource(t *testing.T) {
+	bothFull := `{"data":{
+	  "plan":{"code":"starter","name":"Starter","source":"free","status":""},
+	  "is_read_only":false,
+	  "usage":{"notes":{"used":50,"limit":50},"tags":{"used":20,"limit":20}}}}`
+	out := captureStdout(t, func() { displayUsage([]byte(bothFull)) })
+
+	if !strings.Contains(out, "harbor trash empty") {
+		t.Errorf("notes remedy missing:\n%s", out)
+	}
+	if !strings.Contains(out, "harbor tags delete") {
+		t.Errorf("tags remedy missing:\n%s", out)
+	}
+}
+
 // TestUsageResourceNamesKeepsDocumentedOrderAndAddsNewOnes pins the row order
 // and, just as importantly, that a resource the API adds later still appears.
 func TestUsageResourceNamesKeepsDocumentedOrderAndAddsNewOnes(t *testing.T) {
@@ -366,6 +411,120 @@ func TestRenderPlanLimitErrorWritesToStderrOnly(t *testing.T) {
 	}
 	if !strings.Contains(errOut, "3 of 3 notebooks") || !strings.Contains(errOut, planLimitCode) {
 		t.Errorf("stderr missing the explanation or the code:\n%s", errOut)
+	}
+}
+
+// TestNoDomainErrorMapperSwallowsThePlanLimit is the regression guard for the
+// bug this feature shipped with: cmd/tasks.go rewrote plan_limit_reached into a
+// plain errors.New before it ever reached Execute, so tasks — one of the five
+// capped resources — silently lost both the explanation and exit code 4.
+//
+// Every domain mapper is checked, not just the one that was broken, because the
+// failure is invisible from inside a domain: its own tests pass, and only the
+// central handler notices the type is gone. A new mapper (or a new case in an
+// old one) that swallows the code fails here.
+func TestNoDomainErrorMapperSwallowsThePlanLimit(t *testing.T) {
+	mappers := map[string]func(error) error{
+		"account":      mapAccountError,
+		"auth/login":   mapLoginError,
+		"auth/pat":     mapPATError,
+		"auth/refresh": mapRefreshError,
+		"files":        mapFileError,
+		"history":      mapHistoryError,
+		"importexport": mapImportExportError,
+		"insights":     mapInsightError,
+		"notebooks":    mapNotebookError,
+		"notes":        mapNoteError,
+		"profile":      mapProfileError,
+		"reminders":    mapReminderError,
+		"search":       mapSearchError,
+		"share":        mapShareError,
+		"shortcuts":    mapShortcutError,
+		"support":      mapSupportError,
+		"sync":         mapSyncError,
+		"tags":         mapTagError,
+		"tasks":        mapTaskError,
+		"templates":    mapTemplateError,
+		"trash":        mapTrashError,
+	}
+
+	for _, details := range []map[string]any{
+		planLimitDetails(),
+		{"gate": planLimitReadOnlyGate, "reason": planLimitReadOnlyGate, "plan_code": "starter"},
+	} {
+		for name, mapper := range mappers {
+			mapped := mapper(planLimitError("You've reached your plan's limit.", details))
+			if !isPlanLimitError(mapped) {
+				t.Errorf("map%sError swallowed the plan limit — it would lose the explanation and exit code %d (got %T: %v)",
+					strings.ToUpper(name[:1])+name[1:], exitPlanLimit, mapped, mapped)
+			}
+		}
+	}
+}
+
+// TestEveryCappedResourceHasAReachableRemedy is the guard for the other half of
+// the review: the copy must never tell someone to run a command that does not
+// exist. Each remedy is checked against the real command tree, so deleting or
+// renaming a command breaks this test rather than a user's afternoon.
+func TestEveryCappedResourceHasAReachableRemedy(t *testing.T) {
+	// Every command a remedy is allowed to name, confirmed present in the tree
+	// below before any wording is checked.
+	for _, path := range [][]string{
+		{"notes", "delete"}, {"notebooks", "delete"}, {"tags", "delete"},
+		{"tasks", "delete"}, {"trash", "empty"}, {"support"},
+	} {
+		if cmd, _, err := rootCmd.Find(path); err != nil || cmd.Name() != path[len(path)-1] {
+			t.Fatalf("remedy names 'harbor %s', which does not exist", strings.Join(path, " "))
+		}
+	}
+	// Files are the trap: there is no 'harbor files delete' and no DELETE route
+	// behind one, so no remedy may imply otherwise.
+	if cmd, _, err := rootCmd.Find([]string{"files", "delete"}); err == nil && cmd.Name() == "delete" {
+		t.Fatal("'harbor files delete' now exists — the files remedy needs rewriting to use it")
+	}
+	files := planLimitRemedy("files")
+	// It may NAME 'harbor files delete' (to say it does not exist) but must
+	// never instruct the user to run it.
+	if strings.Contains(files, "with 'harbor files delete") || strings.Contains(files, "run 'harbor files delete") {
+		t.Errorf("the files remedy instructs the user to run a command that does not exist: %q", files)
+	}
+	if !strings.Contains(files, "no 'harbor files delete'") {
+		t.Errorf("the files remedy does not warn that there is no file delete: %q", files)
+	}
+	if !strings.Contains(files, "notes delete") {
+		t.Errorf("the files remedy does not name the only path that frees an attachment: %q", files)
+	}
+
+	// Every resource the plan gate can name must produce a remedy naming a real
+	// command — except an unknown future one, which must stay silent rather than
+	// guess.
+	for _, plural := range planResourceOrder {
+		remedy := planLimitRemedy(plural)
+		if remedy == "" {
+			t.Errorf("%s has no remedy at all", plural)
+			continue
+		}
+		if !strings.Contains(remedy, "harbor ") {
+			t.Errorf("%s remedy names no command: %q", plural, remedy)
+		}
+	}
+	if got := planLimitRemedy("widgets"); got != "" {
+		t.Errorf("an unknown resource invented a remedy: %q", got)
+	}
+}
+
+// TestNotebookTagTaskRemediesDoNotMentionTheTrash keeps the recycle-bin advice
+// where it belongs: only notes (and, through them, files) pass through a trash.
+func TestNotebookTagTaskRemediesDoNotMentionTheTrash(t *testing.T) {
+	for _, plural := range []string{"notebooks", "tags", "tasks"} {
+		if strings.Contains(planLimitRemedy(plural), "trash") {
+			t.Errorf("%s remedy sends the user to the trash, which cannot free that slot: %q", plural, planLimitRemedy(plural))
+		}
+	}
+	for _, plural := range []string{"notes", "files"} {
+		if !strings.Contains(planLimitRemedy(plural), "trash empty") {
+			t.Errorf("%s remedy omits the expunge step, so following it frees nothing: %q", plural, planLimitRemedy(plural))
+		}
 	}
 }
 
