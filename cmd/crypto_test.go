@@ -5,11 +5,15 @@ package cmd
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 
+	"github.com/HarborMyNotes/harbor-cli/client"
 	"github.com/HarborMyNotes/harbor-cli/config"
 	"github.com/HarborMyNotes/harbor-cli/crypto"
+	"github.com/spf13/cobra"
 )
 
 // testParams is a cheap Argon2id profile so the wiring tests stay fast.
@@ -22,6 +26,7 @@ func resetSession() {
 	sessionKey = nil
 	sessionErr = nil
 	decryptWarned = false
+	encryptCheckWarned = false
 }
 
 // setupEncryption isolates HOME, writes a cached keystore, and sets the
@@ -153,5 +158,195 @@ func TestEncryptCreateBody_EmptyTitleStaysEmpty(t *testing.T) {
 	}
 	if !crypto.IsEnvelope(body["content"].(string)) {
 		t.Fatal("content should be sealed")
+	}
+}
+
+// ===========================================================================
+// The default notebook can be on any page (issue #67's sibling)
+// ===========================================================================
+//
+// GET /notebooks is paged and carries no "just the default" filter, so which page
+// the default notebook lands on is decided by its NAME. Reading only the first
+// page answers "the default does not want encryption" for any account with more
+// notebooks than fit in it — and the caller then writes the note in the clear.
+// This is the same one-page assumption as the task guard, with a quieter failure:
+// nothing refuses, nothing warns, the note is just not encrypted.
+
+// notebookPageMock serves a notebooks list where the default notebook — the only
+// one with default_encrypt set — sits on the SECOND page.
+func notebookPageMock(t *testing.T) *apiMock {
+	t.Helper()
+	rows := make([]string, 0, collectionPageSize)
+	for i := 0; i < collectionPageSize; i++ {
+		rows = append(rows, fmt.Sprintf(`{"id":"nb%d","name":"Notebook %d","is_default":false,"default_encrypt":false}`, i, i))
+	}
+	first := fmt.Sprintf(`{"data":[%s],"paging":{"limit":500,"offset":0,"total":%d,"has_more":true}}`,
+		strings.Join(rows, ","), collectionPageSize+1)
+	second := fmt.Sprintf(`{"data":[{"id":"nbdefault","name":"Zed","is_default":true,"default_encrypt":true}],`+
+		`"paging":{"limit":500,"offset":500,"total":%d,"has_more":false}}`, collectionPageSize+1)
+
+	m := newAPIMock(t, map[string]mockReply{})
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("offset") == "500" {
+			_, _ = w.Write([]byte(second))
+			return
+		}
+		_, _ = w.Write([]byte(first))
+	}
+	return m
+}
+
+// TestNotebookWantsEncryptionFindsADefaultPastTheFirstPage proves the lookup walks
+// the pages. Against a single-page read this returns false and the note is written
+// unencrypted, against the user's own stated default.
+func TestNotebookWantsEncryptionFindsADefaultPastTheFirstPage(t *testing.T) {
+	m := notebookPageMock(t)
+
+	wants, known := notebookWantsEncryption(client.NewClient(m.baseURL(), "tok"), "")
+
+	if !known {
+		t.Fatal("the walk reached the default notebook but reported the answer as unknown")
+	}
+	if !wants {
+		t.Error("the default notebook asks for encryption and the lookup said no — it only read page 1")
+	}
+}
+
+// TestNotebookWantsEncryptionStopsAtTheDefault proves the walk is not a tax on the
+// ordinary account: it stops as soon as the default is in hand, so a default on the
+// first page costs the one request it always cost.
+func TestNotebookWantsEncryptionStopsAtTheDefault(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/notebooks": {Status: 200, Body: `{"data":[{"id":"nb1","is_default":true,"default_encrypt":true}],` +
+			`"paging":{"limit":500,"offset":0,"total":900,"has_more":true}}`},
+	})
+
+	if wants, known := notebookWantsEncryption(client.NewClient(m.baseURL(), "tok"), ""); !wants || !known {
+		t.Fatalf("the default notebook on page 1 was not found: wants=%v known=%v", wants, known)
+	}
+	if len(m.calls()) != 1 {
+		t.Errorf("kept paging after finding the default: %v", m.calls())
+	}
+}
+
+// ===========================================================================
+// A lookup that FAILED is not a notebook that said no
+// ===========================================================================
+//
+// The whole point of the (wants, known) pair. Both branches fail OPEN — an
+// unanswerable lookup writes the note in the clear, deliberately, because failing
+// closed would encrypt on a guess and a note sealed under the wrong passphrase is
+// unrecoverable where an unencrypted one can be re-saved. What must not happen is
+// that decision being made SILENTLY, and it must not happen on either branch: the
+// named-notebook one needs no unusual account at all, just a --notebook flag.
+
+// encryptDecisionCmd builds the flag set shouldEncryptCreate reads, so the decision
+// point can be exercised without the whole `notes create` command around it.
+func encryptDecisionCmd() *cobra.Command {
+	cmd := &cobra.Command{}
+	cmd.Flags().Bool("plaintext", false, "")
+	cmd.Flags().Bool("encrypt", false, "")
+	return cmd
+}
+
+// decideEncrypt runs the real decision with encryption enabled, returning what it
+// chose and whatever it said about it.
+func decideEncrypt(t *testing.T, m *apiMock, notebookID string) (bool, string) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("HARBOR_PASSPHRASE", "pw")
+	resetSession()
+
+	var enc bool
+	var err error
+	warned := captureStderr(t, func() {
+		enc, err = shouldEncryptCreate(encryptDecisionCmd(), client.NewClient(m.baseURL(), "tok"), notebookID)
+	})
+	if err != nil {
+		t.Fatalf("shouldEncryptCreate: %v", err)
+	}
+	return enc, warned
+}
+
+// TestNamedNotebookLookupFailureIsAudible is the branch that matters most, because
+// it takes no unusual account to reach — anyone who passes --notebook. A failed
+// GetNotebook used to return plain `false`, indistinguishable at the call site from
+// "this notebook does not want encryption", so a notebook marked default_encrypt
+// produced a plaintext note with nothing said.
+func TestNamedNotebookLookupFailureIsAudible(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/notebooks/nb1": {Status: 500, Body: apiErrorBody("internal", "boom")},
+	})
+
+	enc, warned := decideEncrypt(t, m, "nb1")
+
+	if enc {
+		t.Error("a failed notebook lookup encrypted the note on a guess")
+	}
+	if !strings.Contains(warned, "UNENCRYPTED") {
+		t.Errorf("the note was written in the clear on an unanswered question, silently:\n%q", warned)
+	}
+	if !strings.Contains(warned, "nb1") {
+		t.Errorf("the warning does not say which notebook could not be read:\n%q", warned)
+	}
+}
+
+// The same requirement on the default-notebook branch: a walk that cannot finish
+// leaves the setting unknown, and that is said rather than spent as a "no".
+func TestDefaultNotebookLookupFailureIsAudible(t *testing.T) {
+	// A list that claims more and hands back nothing: the walk cannot advance, so
+	// the default notebook is never reached and its setting stays unknown.
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/notebooks": {Status: 200, Body: `{"data":[],"paging":{"limit":500,"offset":0,"total":900,"has_more":true}}`},
+	})
+
+	enc, warned := decideEncrypt(t, m, "")
+
+	if enc {
+		t.Error("an unreadable notebook list encrypted the note on a guess")
+	}
+	if !strings.Contains(warned, "UNENCRYPTED") {
+		t.Errorf("the note was written in the clear on an unanswered question, silently:\n%q", warned)
+	}
+}
+
+// The warning is not noise. A lookup that ANSWERS says nothing, on either branch and
+// whichever way it answered — otherwise every ordinary write in a plaintext notebook
+// would carry a warning nobody can act on.
+func TestAnAnsweredLookupIsQuiet(t *testing.T) {
+	cases := map[string]struct {
+		notebookID string
+		routes     map[string]mockReply
+	}{
+		"named notebook, says no": {"nb1", map[string]mockReply{
+			"GET /api/v1/notebooks/nb1": {Status: 200, Body: `{"id":"nb1","default_encrypt":false}`},
+		}},
+		"named notebook, says yes": {"nb1", map[string]mockReply{
+			"GET /api/v1/notebooks/nb1": {Status: 200, Body: `{"id":"nb1","default_encrypt":true}`},
+		}},
+		"default notebook, says no": {"", map[string]mockReply{
+			"GET /api/v1/notebooks": {Status: 200, Body: `{"data":[{"id":"nb1","is_default":true,"default_encrypt":false}],` +
+				`"paging":{"limit":500,"offset":0,"total":1,"has_more":false}}`},
+		}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, warned := decideEncrypt(t, newAPIMock(t, tc.routes), tc.notebookID); warned != "" {
+				t.Errorf("a lookup that answered warned anyway:\n%q", warned)
+			}
+		})
+	}
+}
+
+// A named notebook marked default_encrypt still encrypts — the guard against
+// "fixed the warning, broke the feature".
+func TestNamedNotebookThatWantsEncryptionStillEncrypts(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/notebooks/nb1": {Status: 200, Body: `{"id":"nb1","default_encrypt":true}`},
+	})
+
+	if enc, _ := decideEncrypt(t, m, "nb1"); !enc {
+		t.Error("a notebook marked default_encrypt did not encrypt the note")
 	}
 }

@@ -4,6 +4,8 @@
 package cmd
 
 import (
+	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -300,6 +302,164 @@ func TestNotesUpdateFallsBackToTheBodyWhenTheTaskListFails(t *testing.T) {
 	}
 }
 
+// ===========================================================================
+// Issue #67: the guard used to read ONE page of the note's task list
+// ===========================================================================
+//
+// Everything above holds for a note whose tasks fit in a single 500-row page,
+// which is why the hole stayed invisible. These four run the same command tree
+// against a note whose list needs two pages, and the state that matters is the
+// one the body cannot describe: a task LINKED to the note and absent from its
+// body, sitting past the cap. Against the single-page read, the first of these
+// writes the note, exits 0, and the task is gone.
+
+// strandedTaskID is that task: on page 2 of the note's task list, referenced by
+// nothing in the note's body, and therefore visible to the guard through exactly
+// one source — the page a single-page read never asks for.
+const strandedTaskID = "c3d4e5f6-33a7-4b33-8c33-fedcba654321"
+
+// pagedTaskListMock serves a note with more tasks than one page holds. Page 1 is a
+// full page of tasks the note's body DOES reference; page 2 carries only
+// strandedTaskID, which it does not. page2 overrides the second page's reply, for
+// the tests about a walk that cannot finish.
+func pagedTaskListMock(t *testing.T, page2 *mockReply) *apiMock {
+	t.Helper()
+	rows := make([]string, 0, collectionPageSize)
+	blocks := make([]string, 0, collectionPageSize)
+	for i := 0; i < collectionPageSize; i++ {
+		id := fmt.Sprintf("aaaaaaaa-0000-4000-8000-%012d", i)
+		rows = append(rows, fmt.Sprintf(`{"id":%q,"title":"task %d"}`, id, i))
+		blocks = append(blocks, taskBlockHTML(id))
+	}
+	note := fmt.Sprintf(`{"id":"n1","usn":42,"is_encrypted":false,"content":%q}`,
+		"<p>the plan</p>"+strings.Join(blocks, ""))
+	first := fmt.Sprintf(`{"data":[%s],"paging":{"limit":500,"offset":0,"total":%d,"has_more":true}}`,
+		strings.Join(rows, ","), collectionPageSize+1)
+	second := fmt.Sprintf(`{"data":[{"id":%q,"title":"Stranded"}],`+
+		`"paging":{"limit":500,"offset":500,"total":%d,"has_more":false}}`, strandedTaskID, collectionPageSize+1)
+
+	m := newAPIMock(t, map[string]mockReply{})
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/v1/notes/n1/tasks" && r.URL.Query().Get("offset") == "500":
+			if page2 != nil {
+				w.WriteHeader(page2.Status)
+				_, _ = w.Write([]byte(page2.Body))
+				return
+			}
+			_, _ = w.Write([]byte(second))
+		case r.URL.Path == "/api/v1/notes/n1/tasks":
+			_, _ = w.Write([]byte(first))
+		case r.URL.Path == "/api/v1/notes/n1" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(note))
+		case r.URL.Path == "/api/v1/notes/n1" && r.Method == http.MethodPatch:
+			_, _ = w.Write([]byte(`{"note":{"id":"n1","usn":43},"usn":43}`))
+		default:
+			t.Errorf("pagedTaskListMock: unrouted request %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}
+	return m
+}
+
+// THE #67 REGRESSION. --keep-tasks has to carry the block for a task on page 2, or
+// the server's reconciler sees no reference and tombstones it — while the CLI
+// reports "Kept 500 tasks" and exits 0. Against the single-page read this fails:
+// the written body carries 500 blocks and the 501st task is deleted.
+func TestNotesUpdateKeepTasksCarriesATaskPastTheFirstPage(t *testing.T) {
+	m := pagedTaskListMock(t, nil)
+
+	_, err := runCLI(t, m, "notes", "update", "n1", "--format", "html",
+		"--content", "<p>Rewritten</p>", "--keep-tasks")
+	if err != nil {
+		t.Fatalf("notes update --keep-tasks: %v", err)
+	}
+
+	sent, _ := m.bodyOf(t, "PATCH /api/v1/notes/n1")["content"].(string)
+	if !strings.Contains(sent, taskBlockHTML(strandedTaskID)) {
+		t.Errorf("--keep-tasks wrote a body carrying no block for the task on page 2 of the "+
+			"task list, so the server deletes it — and the CLI said it kept everything (issue #67). "+
+			"Body was %d bytes, %d blocks", len(sent), strings.Count(sent, "<harbor-task"))
+	}
+}
+
+// The refusal has to account for the whole list too. Naming the 500 tasks it
+// happened to read and staying silent about the 501st is a report the user cannot
+// act on — they would --keep-tasks, be told it worked, and lose the task anyway.
+func TestNotesUpdateRefusalNamesATaskPastTheFirstPage(t *testing.T) {
+	m := pagedTaskListMock(t, nil)
+
+	_, err := runCLI(t, m, "notes", "update", "n1", "--format", "html", "--content", "<p>Rewritten</p>")
+
+	if err == nil {
+		t.Fatal("a whole-body write dropped 501 task blocks and still succeeded")
+	}
+	assertNoWrite(t, m)
+	if !strings.Contains(err.Error(), strandedTaskID) {
+		t.Error("the refusal accounts for page 1 and says nothing about the task on page 2 (issue #67)")
+	}
+}
+
+// A short read is not a clean read. When the walk cannot finish, the at-risk set is
+// KNOWN to be missing rows, so there is nothing honest to compare the new content
+// against — the update is refused rather than measured against a partial list.
+// --keep-tasks cannot rescue it either: it can only carry what it was told about.
+func TestNotesUpdateRefusesWhenTheTaskListCannotBeReadWhole(t *testing.T) {
+	m := pagedTaskListMock(t, &mockReply{Status: 500, Body: apiErrorBody("internal", "boom")})
+
+	_, err := runCLI(t, m, "notes", "update", "n1", "--format", "html",
+		"--content", "<p>Rewritten</p>", "--keep-tasks")
+
+	if err == nil {
+		t.Fatal("the guard ran against a task list it could not finish reading, and wrote the note")
+	}
+	assertNoWrite(t, m)
+	for _, want := range []string{"in full", "--allow-task-loss"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal never mentions %q:\n%s", want, err)
+		}
+	}
+}
+
+// --allow-task-loss still means "delete them, that is what I meant" — including the
+// ones the CLI could not enumerate. It is the way past a list that will not read.
+func TestNotesUpdateAllowTaskLossProceedsThroughAShortRead(t *testing.T) {
+	m := pagedTaskListMock(t, &mockReply{Status: 500, Body: apiErrorBody("internal", "boom")})
+
+	var err error
+	captureStderr(t, func() {
+		_, err = runCLI(t, m, "notes", "update", "n1", "--format", "html",
+			"--content", "<p>Rewritten</p>", "--allow-task-loss")
+	})
+	if err != nil {
+		t.Fatalf("--allow-task-loss was blocked by a partial task list: %v", err)
+	}
+	m.bodyOf(t, "PATCH /api/v1/notes/n1") // fails the test if the write never happened
+}
+
+// Paging costs the common note NOTHING. A first page the server marks
+// `has_more: false` ends the walk, so the ordinary update pays the single request
+// it paid before — which is the objection that kept #65 on one page.
+func TestNotesUpdateReadsOnePageWhenTheServerSaysThereIsNoMore(t *testing.T) {
+	m := newAPIMock(t, noteWithTaskRoutes())
+
+	_, err := runCLI(t, m, "notes", "update", "n1",
+		"--format", "html", "--content", `<p>new</p>`+taskBlockHTML(fixtureTaskID))
+	if err != nil {
+		t.Fatalf("notes update: %v", err)
+	}
+	reads := 0
+	for _, call := range m.calls() {
+		if call == "GET /api/v1/notes/n1/tasks" {
+			reads++
+		}
+	}
+	if reads != 1 {
+		t.Errorf("the task list was read %d times, want 1: %v", reads, m.calls())
+	}
+}
+
 // If the note itself cannot be read the guard fails CLOSED. Proceeding would run
 // the write with the protection silently switched off, which is the bug.
 func TestNotesUpdateRefusesWhenTheNoteCannotBeRead(t *testing.T) {
@@ -551,5 +711,44 @@ func TestCountTasks(t *testing.T) {
 	}
 	if got := countTasks(3); got != "3 tasks" {
 		t.Errorf("countTasks(3) = %q", got)
+	}
+}
+
+// Every refusal in this file used to offer `harbor notes append` as the safe way
+// out. It is not one: append keeps the body, so it saves a task the body still
+// REFERENCES — and releases one it has stopped referencing exactly like the update
+// just refused (measured against a local server: the referenced task survived the
+// append, the stranded one was gone). The stranded task is the whole reason the
+// task-list read exists, so unqualified append advice at the moment of a refusal
+// walks the user into the loss they were spared a line earlier. If a message names
+// append, it has to name the limit too.
+func TestNoRefusalOffersAppendAsUnconditionallySafe(t *testing.T) {
+	lost := []noteTask{{ID: fixtureTaskID, Title: "Buy milk"}}
+	for name, msg := range map[string]string{
+		"taskLossRefusal":           taskLossRefusal(lost),
+		"keepFailedRefusal/md":      keepFailedRefusal(lost, "markdown"),
+		"keepFailedRefusal/html":    keepFailedRefusal(lost, "html"),
+		"taskListIncompleteRefusal": taskListIncompleteRefusal(500),
+	} {
+		if !strings.Contains(msg, "notes append") {
+			continue
+		}
+		if !strings.Contains(msg, "stopped referencing") {
+			t.Errorf("%s offers 'notes append' with no mention of what it still deletes:\n%s", name, msg)
+		}
+	}
+}
+
+// The short-read refusal must not send the user to --keep-tasks: it can only carry
+// the blocks it was told about, so on a list that would not read whole it reports
+// success and deletes the rest.
+func TestTaskListIncompleteRefusalDoesNotOfferKeepTasks(t *testing.T) {
+	msg := taskListIncompleteRefusal(500)
+
+	if strings.Contains(msg, "--keep-tasks") {
+		t.Errorf("the short-read refusal offers --keep-tasks, which cannot cover the tasks it could not read:\n%s", msg)
+	}
+	if !strings.Contains(msg, "--allow-task-loss") {
+		t.Errorf("the short-read refusal leaves the user with no way through:\n%s", msg)
 	}
 }

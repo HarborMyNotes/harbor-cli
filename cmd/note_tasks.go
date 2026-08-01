@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -183,7 +184,9 @@ type noteTask struct {
 }
 
 // noteTasksAtRisk returns every task a whole-body write of noteID could delete,
-// in a stable order, given the note's CURRENT body.
+// in a stable order, given the note's CURRENT body. The bool reports whether the
+// note's task list was read WHOLE — false means there are tasks the caller has
+// not been told about, which is a refusal, not a detail (issue #67).
 //
 // It is the UNION of two sources, because neither alone is the server's release
 // set and each covers the other's blind spot:
@@ -202,10 +205,11 @@ type noteTask struct {
 // Over-counting is the safe direction: an id in the body that owns no task row
 // costs at most a refusal the user did not need, where under-counting costs the
 // task. Ids are lower-cased, matching the server's canonicalization.
-func noteTasksAtRisk(c *client.Client, noteID, currentBody string) []noteTask {
+func noteTasksAtRisk(c *client.Client, noteID, currentBody string) ([]noteTask, bool) {
 	out := []noteTask{}
 	seen := map[string]bool{}
-	for _, t := range listNoteTasks(c, noteID) {
+	tasks, complete := listNoteTasks(c, noteID)
+	for _, t := range tasks {
 		if t.ID == "" || seen[t.ID] {
 			continue
 		}
@@ -219,33 +223,59 @@ func noteTasksAtRisk(c *client.Client, noteID, currentBody string) []noteTask {
 		seen[id] = true
 		out = append(out, noteTask{ID: id})
 	}
-	return out
+	return out, complete
 }
 
-// listNoteTasks reads a note's tasks, in their in-note order. Any error yields an
-// empty slice rather than a failure: this feeds a union whose other half needs no
-// network at all, so degrading here costs precision, not protection.
+// listNoteTasks reads a note's tasks, in their in-note order, ACROSS EVERY PAGE.
+// The bool reports whether the list was read whole.
 //
-// limit=500 is the server's own hard cap on this endpoint, not an arbitrary round
-// number — it is the most one request can return, so this is a single page by
-// design rather than by oversight. A note with more than 500 tasks would leave a
-// STRANDED one past the cap outside the at-risk set (a referenced one is still
-// caught by the body fallback, which reads the whole body). Tracked separately;
-// paging here would cost a round trip per 500 on every content update.
-func listNoteTasks(c *client.Client, noteID string) []noteTask {
-	data, err := c.ListNoteTasks(noteID, map[string]string{"limit": "500"})
+// WHY IT PAGES (issue #67). 500 is the server's hard cap on this endpoint, so one
+// request is the most a single read can return — but "the most one request can
+// return" is not "all of them", and the guard this feeds is only as good as the
+// tasks it can see. A note with more than 500 tasks has tasks past the cap, and a
+// task the guard never sees is one it silently deletes: the referenced ones are
+// still caught by the body fallback, but a STRANDED task — linked to the note and
+// no longer in its body (an app.harbor.my#1094 orphan, or one left behind by
+// history revert, app.harbor.my#1236) — exists ONLY in this list. Measured against
+// a 501-task note, `--keep-tasks` reported "Kept 500 tasks", exited 0, and
+// tombstoned the 501st without a word.
+//
+// It costs the common case nothing. The first page ends the walk unless the server
+// says has_more, so a note with 0 — or 500 — tasks pays exactly the one request it
+// paid before; only a note past the cap pays a round trip per further 500.
+//
+// AN ERROR IS NOT THE SAME AS A SHORT READ, and the two degrade differently:
+//
+//   - The FIRST page fails → (nothing, complete). Unchanged from #65, deliberately:
+//     this feeds a union whose other half needs no network at all, and refusing
+//     every content update over one transient hiccup would trade a data guard for
+//     an outage. It costs precision on a stranded task, which is the tradeoff #65
+//     documented and this does not reopen.
+//   - A LATER page fails, or the page cap cuts the walk → (what we read, INCOMPLETE).
+//     Here the server has already told us the list is bigger than what we hold, so
+//     "we saw it all" would be a claim we know to be false. The caller refuses.
+func listNoteTasks(c *client.Client, noteID string) ([]noteTask, bool) {
+	out := []noteTask{}
+	pages := 0
+	complete, err := walkCollection(
+		func(params map[string]string) ([]byte, error) {
+			data, ferr := c.ListNoteTasks(noteID, params)
+			if ferr == nil {
+				pages++
+			}
+			return data, ferr
+		},
+		func(raw json.RawMessage) bool {
+			t := parseJSON(raw)
+			if id := strings.ToLower(strings.TrimSpace(str(t, "id"))); id != "" {
+				out = append(out, noteTask{ID: id, Title: str(t, "title")})
+			}
+			return true
+		})
 	if err != nil {
-		return nil
+		return out, pages == 0
 	}
-	items := client.CollectionItems(data)
-	out := make([]noteTask, 0, len(items))
-	for _, raw := range items {
-		t := parseJSON(raw)
-		if id := strings.ToLower(strings.TrimSpace(str(t, "id"))); id != "" {
-			out = append(out, noteTask{ID: id, Title: str(t, "title")})
-		}
-	}
-	return out
+	return out, complete
 }
 
 // guardNoteTaskLoss protects the tasks stored in a note's body from a content
@@ -265,7 +295,9 @@ func listNoteTasks(c *client.Client, noteID string) []noteTask {
 //  3. Compares the tasks at risk (noteTasksAtRisk) against the blocks in the new
 //     content and, when the new content drops any, applies the user's choice:
 //     --keep-tasks re-appends the dropped blocks, --allow-task-loss proceeds, and
-//     neither refuses the update with nothing written.
+//     neither refuses the update with nothing written. When the note's task list
+//     could not be read whole, there is nothing to compare against and the update
+//     is refused outright — see taskListIncompleteRefusal.
 //
 // body is mutated in place (base_usn, and content when keeping). The parsed note is
 // returned so the caller's encryption step reuses this read instead of repeating it.
@@ -292,7 +324,14 @@ func guardNoteTaskLoss(cmd *cobra.Command, c *client.Client, noteID, format stri
 		return note, nil
 	}
 
-	atRisk := noteTasksAtRisk(c, noteID, str(note, "content"))
+	atRisk, complete := noteTasksAtRisk(c, noteID, str(note, "content"))
+	if !complete && !allowLoss {
+		// The note's task list is longer than what could be read, so the at-risk
+		// set is known to be short. Comparing the new content against a set we know
+		// is incomplete would report "nothing lost" about tasks we never saw —
+		// which is the silent deletion this whole file exists to prevent.
+		return nil, errors.New(taskListIncompleteRefusal(len(atRisk)))
+	}
 	if len(atRisk) == 0 {
 		return note, nil
 	}
@@ -400,10 +439,24 @@ func keepFailedRefusal(missing []noteTask, format string) string {
 		b.WriteString("anyway. Fix it with one of:\n\n")
 		b.WriteString("  close the element   so the body does not end inside it\n")
 	}
-	b.WriteString("  harbor notes append add to the body instead of replacing it\n")
-	b.WriteString("  --allow-task-loss   delete them; that is what you meant\n")
+	b.WriteString("  --allow-task-loss   delete them; that is what you meant\n\n")
+	b.WriteString(appendCaveat)
 	return b.String()
 }
+
+// appendCaveat is the honest version of "just use notes append instead".
+//
+// Every refusal in this file used to offer `harbor notes append` as the safe
+// alternative, full stop. It is not one. Append keeps the existing body, so every
+// task the body still REFERENCES survives it — but a task the body has stopped
+// referencing is released by ANY save (app.harbor.my#461's delete-on-release), and
+// append is a save. For the STRANDED task — the class this guard exists for, the
+// one only the task list can see (issue #67) — append is exactly as destructive as
+// the update just refused. Offering it unqualified at the moment of a refusal
+// walks the user straight into the loss they were spared a line earlier.
+const appendCaveat = "'harbor notes append' adds to the body instead of replacing it, which saves\n" +
+	"every task the body still references — but NOT one it has stopped referencing:\n" +
+	"any save releases that, append included."
 
 // taskLossRefusal builds the message for a refused update: what would be deleted,
 // why replacing the body deletes it, and the two ways to proceed on purpose. A task
@@ -424,7 +477,41 @@ func taskLossRefusal(lost []noteTask) string {
 	b.WriteString("detached. Nothing has been written. Re-run with one of:\n\n")
 	b.WriteString("  --keep-tasks       carry those blocks into the new body (appended at the end)\n")
 	b.WriteString("  --allow-task-loss  delete them; that is what you meant\n\n")
-	b.WriteString("Or use 'harbor notes append' to add to the body without replacing it.")
+	b.WriteString(appendCaveat)
+	return b.String()
+}
+
+// taskListIncompleteRefusal builds the message for an update refused because the
+// note's task list could not be read whole (issue #67). It names no tasks on
+// purpose: the problem is precisely the ones that could not be named, and a list
+// of the ones we did read would read as the full accounting it is not.
+//
+// --keep-tasks is not offered as a way forward. It can only carry the blocks it
+// was told about, so on a short read it would report success while deleting the
+// rest — the failure mode this refusal exists to stop.
+//
+// NOT AN OVERSIGHT: --allow-task-loss is the only way through, so "keep the ones
+// you did read and accept losing the rest" cannot be asked for. Combining the two
+// flags is rejected earlier as contradictory, and it would be — the half that says
+// keep cannot cover a task nobody enumerated, so the pair would promise a safety
+// it cannot deliver. Re-running (the list usually reads fine the second time) is
+// the way to get everything; --allow-task-loss is the way to stop caring.
+//
+// The append caveat matters more here than anywhere else in this file: elsewhere
+// the user can at least see which tasks are at stake, and here the whole problem
+// is the ones that could not be named. None of them can be shown to be safe under
+// an append, so it is offered with the same qualification and no more.
+func taskListIncompleteRefusal(read int) string {
+	var b strings.Builder
+	b.WriteString("could not read this note's task list in full, so nothing has been written.\n\n")
+	fmt.Fprintf(&b, "The server reports more tasks on this note than the CLI could read (it got %s),\n", countTasks(read))
+	b.WriteString("and a task it cannot see is a task it cannot protect: --content/--file/--stdin\n")
+	b.WriteString("REPLACE the body, and a task whose <harbor-task> block the new body omits is\n")
+	b.WriteString("deleted, not detached. Re-run to try again, or:\n\n")
+	b.WriteString("  --allow-task-loss    proceed anyway, deleting whatever the new body omits\n\n")
+	b.WriteString(appendCaveat)
+	b.WriteString("\nThe tasks that could not be read cannot be sorted into those two groups, so\n")
+	b.WriteString("append is not a safe way around this particular refusal either.\n")
 	return b.String()
 }
 
