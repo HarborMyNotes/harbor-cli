@@ -242,20 +242,47 @@ var notesAppendCmd = &cobra.Command{
 	},
 }
 
+// notesDeletePermanentConfirmation gates `notes delete --permanent`, which is a
+// second route to exactly the expunge `trash expunge` performs — same call, same
+// irreversibility. Being a flag on an otherwise recoverable command is what let
+// it sit unguarded: `notes delete` is the safe, everyday command, and the one
+// character that makes it permanent is easy to overlook when reading a script.
+var notesDeletePermanentConfirmation = registerConfirmation("harbor notes delete", confirmation{
+	Warning:     "This permanently deletes the note. It does NOT go to the trash and cannot be restored.",
+	Prompt:      `Type "yes" to confirm: `,
+	Affirmative: "yes",
+	Unattended:  "refusing to permanently delete a note without confirmation — pass --yes",
+	Aborted:     "aborted — the note was not deleted",
+})
+
 // notesDeleteCmd trashes (or permanently expunges) a note.
 var notesDeleteCmd = &cobra.Command{
 	Use:   "delete <id>",
 	Short: "Delete a note (trash by default, --permanent to expunge)",
 	Args:  cobra.ExactArgs(1),
-	Long:  "Move a note to the trash (recoverable with 'harbor trash restore'), or expunge it permanently with --permanent.",
+	Long: `Move a note to the trash (recoverable with 'harbor trash restore'), or expunge
+it permanently with --permanent.
+
+The default is recoverable and asks nothing. --permanent is not: the note is
+gone, so you will be asked to confirm by typing "yes" unless you pass --yes, and
+in --json or non-interactive use --yes is required.`,
 	Example: `  harbor notes delete 9c2e...
-  harbor notes delete 9c2e... --permanent`,
+  harbor notes delete 9c2e... --permanent
+  harbor notes delete 9c2e... --permanent --yes`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c, _, err := loadClientFromConfig()
 		if err != nil {
 			return err
 		}
 		permanent := boolFlag(cmd, "permanent")
+		// Only the irreversible half is gated. Trashing is recoverable, and
+		// making the everyday delete prompt would train people to type "yes"
+		// without reading — which is how the prompt that matters gets ignored.
+		if permanent {
+			if err := notesConfirmPermanentDelete(boolFlag(cmd, "yes")); err != nil {
+				return err
+			}
+		}
 		if _, err := c.DeleteNote(args[0], permanent); err != nil {
 			return err
 		}
@@ -266,6 +293,12 @@ var notesDeleteCmd = &cobra.Command{
 		}
 		return nil
 	},
+}
+
+// notesConfirmPermanentDelete gates `notes delete --permanent`, resolving the
+// ambient state and handing the decision to the shared confirmDestructive.
+func notesConfirmPermanentDelete(yes bool) error {
+	return confirmDestructive(notesDeletePermanentConfirmation, jsonOutput, stdinIsInteractive(), yes, askLine)
 }
 
 // mapNoteError gives friendly messages for note-specific codes.
@@ -411,6 +444,7 @@ func init() {
 	addContentFlags(notesAppendCmd)
 
 	notesDeleteCmd.Flags().Bool("permanent", false, "Expunge permanently instead of trashing")
+	notesDeleteCmd.Flags().Bool("yes", false, "Skip the --permanent confirmation prompt (required in --json/non-interactive use)")
 
 	notesCmd.AddCommand(notesListCmd, notesGetCmd, notesCreateCmd, notesUpdateCmd, notesAppendCmd, notesDeleteCmd)
 	rootCmd.AddCommand(notesCmd)

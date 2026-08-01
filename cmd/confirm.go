@@ -52,6 +52,28 @@ type confirmation struct {
 	Aborted string
 }
 
+// destructiveConfirmations is every confirmation the CLI declares, keyed by the
+// command path that asks it ("harbor trash empty").
+//
+// It is BUILT by registerConfirmation as each command declares its wording, not
+// hand-listed somewhere else. A list maintained by hand only stays complete
+// while someone remembers to append to it, and the tests that walk this map are
+// the ones proving destructive commands ask before they destroy — so a forgotten
+// entry silently reduces coverage instead of failing.
+var destructiveConfirmations = map[string]confirmation{}
+
+// registerConfirmation records a command's confirmation under its command path
+// and hands it straight back, so declaring one and registering it are the same
+// statement. A duplicate path is a copy-paste bug (two commands sharing one
+// registry slot would hide one of them from the audit), so it panics at init.
+func registerConfirmation(commandPath string, c confirmation) confirmation {
+	if _, dup := destructiveConfirmations[commandPath]; dup {
+		panic("two confirmations registered for " + commandPath)
+	}
+	destructiveConfirmations[commandPath] = c
+	return c
+}
+
 // confirmDestructive decides whether an irreversible command may proceed.
 //
 // Interactivity and the prompt reader are parameters rather than ambient state
@@ -65,7 +87,9 @@ type confirmation struct {
 //     prompt read off a pipe would take whatever byte happened to be next as
 //     consent.
 //   - On a terminal, warn plainly, then require the affirmative word exactly.
-//   - A failed read aborts. An unreadable answer is not an answer.
+//   - A failed read aborts with the SAME message a wrong answer gets. Pressing
+//     ^D at the prompt is a person declining, and reporting it as "EOF" would be
+//     the one destructive refusal in the CLI that reads like a crash.
 //
 // The only route to nil is --yes or an exact match. Every other path returns an
 // error, so a caller that forgets to check the return value fails closed at the
@@ -80,7 +104,7 @@ func confirmDestructive(c confirmation, jsonMode, interactive, yes bool, ask fun
 	fmt.Println(c.Warning)
 	answer, err := ask(c.Prompt)
 	if err != nil {
-		return err
+		return errors.New(c.Aborted)
 	}
 	if answer != c.Affirmative {
 		return errors.New(c.Aborted)

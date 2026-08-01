@@ -70,14 +70,23 @@ var trashRestoreCmd = &cobra.Command{
 
 // trashExpungeCmd permanently deletes a single note.
 var trashExpungeCmd = &cobra.Command{
-	Use:     "expunge <note-id>",
-	Short:   "Permanently delete a single note",
-	Args:    cobra.ExactArgs(1),
-	Long:    "Permanently delete a note (it cannot be restored). Works whether or not the note is currently in the trash. Attachment bytes left with no remaining reference are reclaimed.",
-	Example: "  harbor trash expunge 9c2e7b10-...",
+	Use:   "expunge <note-id>",
+	Short: "Permanently delete a single note",
+	Args:  cobra.ExactArgs(1),
+	Long: `Permanently delete a note (it cannot be restored). Works whether or not the
+note is currently in the trash. Attachment bytes left with no remaining
+reference are reclaimed.
+
+This cannot be undone, so you will be asked to confirm by typing "yes" unless
+you pass --yes. In --json or non-interactive use, --yes is required.`,
+	Example: `  harbor trash expunge 9c2e7b10-...
+  harbor trash expunge 9c2e7b10-... --yes`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c, _, err := loadClientFromConfig()
 		if err != nil {
+			return err
+		}
+		if err := trashConfirmExpunge(boolFlag(cmd, "yes")); err != nil {
 			return err
 		}
 		if _, err := c.ExpungeNote(args[0]); err != nil {
@@ -121,13 +130,25 @@ cannot be undone. You will be asked to confirm by typing "yes" unless you pass
 // trashEmptyConfirmation is what `harbor trash empty` asks before it destroys
 // anything. It is a value so the wording — and the fact that only the exact
 // word "yes" proceeds — can be asserted without a terminal.
-var trashEmptyConfirmation = confirmation{
+var trashEmptyConfirmation = registerConfirmation("harbor trash empty", confirmation{
 	Warning:     "This permanently deletes every note in the trash. This cannot be undone.",
 	Prompt:      `Type "yes" to confirm: `,
 	Affirmative: "yes",
 	Unattended:  "refusing to empty the trash without confirmation — pass --yes",
 	Aborted:     "aborted — the trash was not emptied",
-}
+})
+
+// trashExpungeConfirmation gates the single-note expunge. It destroys exactly
+// as permanently as emptying the whole bin does — the only difference is how
+// many notes go — so it asks the same question rather than relying on the id
+// having been typed deliberately.
+var trashExpungeConfirmation = registerConfirmation("harbor trash expunge", confirmation{
+	Warning:     "This permanently deletes the note. It cannot be restored.",
+	Prompt:      `Type "yes" to confirm: `,
+	Affirmative: "yes",
+	Unattended:  "refusing to permanently delete a note without confirmation — pass --yes",
+	Aborted:     "aborted — the note was not deleted",
+})
 
 // trashConfirmEmpty gates the destructive empty operation. It resolves the
 // ambient state — is --json set, is stdin a terminal, how do we read a line —
@@ -135,6 +156,11 @@ var trashEmptyConfirmation = confirmation{
 // (including the typed-wrong-answer one) is pinned by tests.
 func trashConfirmEmpty(yes bool) error {
 	return confirmDestructive(trashEmptyConfirmation, jsonOutput, stdinIsInteractive(), yes, askLine)
+}
+
+// trashConfirmExpunge gates the single-note permanent delete the same way.
+func trashConfirmExpunge(yes bool) error {
+	return confirmDestructive(trashExpungeConfirmation, jsonOutput, stdinIsInteractive(), yes, askLine)
 }
 
 // mapTrashError gives friendly messages for the trash-specific codes.
@@ -213,6 +239,7 @@ func init() {
 	addPagingFlags(trashListCmd)
 
 	trashEmptyCmd.Flags().Bool("yes", false, "Skip the confirmation prompt (required in --json/non-interactive use)")
+	trashExpungeCmd.Flags().Bool("yes", false, "Skip the confirmation prompt (required in --json/non-interactive use)")
 
 	trashCmd.AddCommand(trashListCmd, trashRestoreCmd, trashExpungeCmd, trashEmptyCmd)
 	rootCmd.AddCommand(trashCmd)

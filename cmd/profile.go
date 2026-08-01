@@ -348,13 +348,13 @@ func inboundEmailProfile(data []byte) (map[string]any, error) {
 
 // inboundEmailResetConfirmation is what `harbor profile inbound-email reset`
 // asks before it rotates the address out from under whoever was mailing it.
-var inboundEmailResetConfirmation = confirmation{
+var inboundEmailResetConfirmation = registerConfirmation("harbor profile inbound-email reset", confirmation{
 	Warning:     "This rotates your email-to-note address. The old address stops working IMMEDIATELY and mail sent to it will be dropped.",
 	Prompt:      `Type "yes" to confirm: `,
 	Affirmative: "yes",
 	Unattended:  "refusing to rotate your email-to-note address without confirmation — pass --yes",
 	Aborted:     "aborted — your email-to-note address was not changed",
-}
+})
 
 // inboundEmailConfirmReset gates the destructive rotation for the command,
 // resolving how the user should be asked (is this a terminal we can prompt on?)

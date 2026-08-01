@@ -254,6 +254,49 @@ func TestTrashEmptyRunEProceedsWithYesFlag(t *testing.T) {
 	}
 }
 
+// TestTrashExpungeRunEStopsOnAWrongAnswer covers the single-note expunge, which
+// destroys just as permanently as emptying the bin — it simply destroys less.
+func TestTrashExpungeRunEStopsOnAWrongAnswer(t *testing.T) {
+	for _, answer := range []string{"no", "", "y", "YES"} {
+		t.Run(answer, func(t *testing.T) {
+			answerPrompt(t, answer)
+			m := newAPIMock(t, map[string]mockReply{})
+
+			_, err := runCLI(t, m, "trash", "expunge", "n1")
+			if err == nil {
+				t.Fatalf("answering %q expunged the note", answer)
+			}
+			if len(m.calls()) != 0 {
+				t.Fatalf("the note was expunged anyway: %v", m.calls())
+			}
+		})
+	}
+}
+
+// TestTrashExpungeRunEProceedsWhenConfirmed keeps the gate passable, both by
+// typing and by the scripted --yes.
+func TestTrashExpungeRunEProceedsWhenConfirmed(t *testing.T) {
+	const route = "POST /api/v1/notes/n1/expunge"
+
+	answerPrompt(t, "yes")
+	m := newAPIMock(t, map[string]mockReply{route: {Status: 204, Body: ""}})
+	if _, err := runCLI(t, m, "trash", "expunge", "n1"); err != nil {
+		t.Fatalf("typed yes: %v", err)
+	}
+	if len(m.calls()) != 1 || m.calls()[0] != route {
+		t.Errorf("calls = %v, want [%s]", m.calls(), route)
+	}
+
+	pipedStdin(t) // --yes must not prompt
+	m2 := newAPIMock(t, map[string]mockReply{route: {Status: 204, Body: ""}})
+	if _, err := runCLI(t, m2, "trash", "expunge", "n1", "--yes"); err != nil {
+		t.Fatalf("--yes: %v", err)
+	}
+	if len(m2.calls()) != 1 {
+		t.Errorf("calls = %v", m2.calls())
+	}
+}
+
 // TestTrashEmptyRunEReportsAPIFailureAsAnError guards the other half of the
 // stdout/exit-code distinction: when the server refuses, the command must fail
 // rather than print and exit 0.
