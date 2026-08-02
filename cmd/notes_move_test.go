@@ -8,9 +8,12 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -830,23 +833,52 @@ func sortedFieldNames(body map[string]any) []string {
 // It is deliberately the weaker of the two guards — it proves a name exists, not
 // that the code does the right thing, and TestSealedMoveAndNotesEncryptSendTheSameWrite
 // is what proves the behaviour. What it adds is the case that one cannot cover: a
-// new pipeline that seals CORRECTLY today. That is exactly how the reference's
-// fork started, and it stayed correct for about a day; a behavioural test only
-// catches the fork once the two copies have drifted, which is after the bug.
+// new pipeline that seals CORRECTLY today. That is how the reference's fork
+// started, and it stayed correct for about a day; a behavioural test only catches
+// a fork once the two copies have drifted, which is after the bug.
 //
-// IT TAKES TWO PASSES, AND THE SECOND ONE IS THE POINT. The first version of this
-// test watched crypto.SealField alone — and a review proved it blind to the fork
-// most likely to actually happen. sealAndVerify is itself the reusable primitive,
-// so a second pipeline written the sensible way, through sealAndVerify, never
-// touches crypto.SealField and walked straight past the tripwire: a
-// reimplementation of planEncrypt wired into the live move path left the whole
-// suite green. Every rung of the ladder has to be watched, not just the bottom one.
+// IT TAKES TWO PASSES, AND THE SECOND ONE IS THE POINT. The first version watched
+// crypto.SealField alone, and a review proved it blind to the fork most likely to
+// actually happen: sealAndVerify is itself the reusable primitive, so a second
+// pipeline written the sensible way never touches crypto.SealField. A
+// reimplementation of planEncrypt through sealAndVerify, wired into the live move
+// path, left the whole suite green. Every rung of the ladder is watched, not just
+// the bottom one.
+//
+// WHAT THIS SCAN DOES AND DOES NOT SEE. Stated plainly, because a tripwire that
+// is described as more thorough than it is becomes worse than none — that
+// over-claim is the exact defect class this PR has spent its life on.
+//
+// It sees:
+//
+//   - direct calls by name, in every non-test .go file in the MODULE, not merely
+//     in package cmd. A pipeline parked in another package used to be invisible to
+//     both passes, and silently so, because the allowlisted callers still existed
+//     here and the "found nothing at all" self-check stayed quiet.
+//   - calls through an ALIASED import. The qualifier is resolved to the import
+//     PATH, so `import hc ".../crypto"` then `hc.SealField(…)` is caught. Matching
+//     the local identifier `crypto` missed that, and an alias is an ordinary thing
+//     for someone to write.
+//
+// It does NOT see:
+//
+//   - a call through a FUNCTION VALUE — `sealer := sealAndVerify; sealer(…)`.
+//     Catching that means real dataflow analysis, which is not worth its weight
+//     here, so it is knowingly out of scope rather than overlooked. The behavioural
+//     equivalence test remains the guard that does not care how the call was
+//     spelled.
+//   - reflection, code generation, or a call from outside this module.
+//
+// The package-name-from-last-path-segment assumption below is the usual one and
+// holds throughout this repo.
 func TestOnlyTheKnownFunctionsSeal(t *testing.T) {
+	cryptoPkg := modulePath(t) + "/crypto"
+
 	// crypto.SealField is the raw primitive: encryptCreateBody seals a note being
 	// born, encryptUpdateBody re-seals one that is already ciphertext, and
 	// sealAndVerify is the seal-then-open-it-back wrapper the in-place conversion
 	// uses. A fourth name here is a fourth idea about how to encrypt a note.
-	assertOnlyTheseCall(t, "crypto", "SealField", "encryptCreateBody", "encryptUpdateBody", "sealAndVerify")
+	assertOnlyTheseCall(t, cryptoPkg, "SealField", "encryptCreateBody", "encryptUpdateBody", "sealAndVerify")
 
 	// sealAndVerify is the rung above, and planEncrypt is the ONE in-place
 	// plaintext-to-ciphertext pipeline — `notes encrypt` and the sealed move both
@@ -855,14 +887,14 @@ func TestOnlyTheKnownFunctionsSeal(t *testing.T) {
 	assertOnlyTheseCall(t, "", "sealAndVerify", "planEncrypt")
 }
 
-// assertOnlyTheseCall fails unless the functions in package cmd that call
-// pkg.name (or plain name, when pkg is "") are exactly the ones allowed.
+// assertOnlyTheseCall fails unless the functions in this module that call
+// pkgPath.name (or plain name, when pkgPath is "") are exactly the ones allowed.
 //
-// The empty result is an error rather than a pass. A test that asserts "none of
-// the disallowed functions call this" while nothing calls it at all — because it
-// was renamed, or the pass is looking for the wrong spelling — is a test that has
-// stopped guarding anything without ever going red.
-func assertOnlyTheseCall(t *testing.T, pkg, name string, allow ...string) {
+// The empty result is an error rather than a pass. A pass asserting "none of the
+// disallowed functions call this" while nothing calls it at all — because it was
+// renamed, or the pass looks for the wrong spelling — has stopped guarding
+// anything without ever going red.
+func assertOnlyTheseCall(t *testing.T, pkgPath, name string, allow ...string) {
 	t.Helper()
 	allowed := map[string]bool{}
 	for _, a := range allow {
@@ -870,10 +902,10 @@ func assertOnlyTheseCall(t *testing.T, pkg, name string, allow ...string) {
 	}
 
 	label := name
-	if pkg != "" {
-		label = pkg + "." + name
+	if pkgPath != "" {
+		label = pkgPath + "." + name
 	}
-	found := callersOf(t, pkg, name)
+	found := callersOf(t, pkgPath, name)
 
 	if len(found) == 0 {
 		t.Fatalf("no %s call sites were found at all — this pass is asserting nothing", label)
@@ -893,25 +925,38 @@ func assertOnlyTheseCall(t *testing.T, pkg, name string, allow ...string) {
 	}
 }
 
-// callersOf returns the names of the functions in the non-test files of package
-// cmd that call pkg.name, or plain name when pkg is "".
-func callersOf(t *testing.T, pkg, name string) map[string]bool {
+// callersOf returns the functions in this module's non-test files that call
+// pkgPath.name, or plain name when pkgPath is "". Callers outside package cmd are
+// reported as "package.Func" so a fork parked elsewhere names its own home.
+func callersOf(t *testing.T, pkgPath, name string) map[string]bool {
 	t.Helper()
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("read cmd package: %v", err)
-	}
 	fset := token.NewFileSet()
 	found := map[string]bool{}
-	for _, entry := range entries {
-		file := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(file, ".go") || strings.HasSuffix(file, "_test.go") {
-			continue
+
+	err := filepath.WalkDir(repoRoot(t), func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
-		parsed, perr := parser.ParseFile(fset, file, nil, 0)
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", "vendor", "build", "dist", "node_modules", ".playwright":
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		parsed, perr := parser.ParseFile(fset, path, nil, parser.ImportsOnly|parser.SkipObjectResolution)
+		if perr == nil {
+			parsed, perr = parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+		}
 		if perr != nil {
-			t.Fatalf("parse %s: %v", file, perr)
+			t.Fatalf("parse %s: %v", path, perr)
 		}
+		imports := importPaths(parsed)
+		pkgName := parsed.Name.Name
+
 		ast.Inspect(parsed, func(n ast.Node) bool {
 			fn, isFunc := n.(*ast.FuncDecl)
 			if !isFunc || fn.Body == nil {
@@ -919,26 +964,50 @@ func callersOf(t *testing.T, pkg, name string) map[string]bool {
 			}
 			ast.Inspect(fn.Body, func(inner ast.Node) bool {
 				call, isCall := inner.(*ast.CallExpr)
-				if !isCall {
+				if !isCall || !callTargets(call.Fun, pkgPath, name, imports) {
 					return true
 				}
-				if callTargets(call.Fun, pkg, name) {
-					found[fn.Name.Name] = true
+				caller := fn.Name.Name
+				if pkgName != "cmd" {
+					caller = pkgName + "." + caller
 				}
+				found[caller] = true
 				return true
 			})
-			// Do not descend into nested declarations twice; the walk above already
-			// covered this function's whole body, closures included.
+			// The walk above already covered this function's whole body, closures
+			// included, so there is nothing left to descend into.
 			return false
 		})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk module: %v", err)
 	}
 	return found
 }
 
-// callTargets reports whether a call expression names pkg.name, or plain name
-// when pkg is "".
-func callTargets(fun ast.Expr, pkg, name string) bool {
-	if pkg == "" {
+// importPaths maps each local qualifier in a file to the import PATH it stands
+// for, so an aliased import resolves to the same package as an unaliased one.
+func importPaths(file *ast.File) map[string]string {
+	out := map[string]string{}
+	for _, imp := range file.Imports {
+		path, err := strconv.Unquote(imp.Path.Value)
+		if err != nil {
+			continue
+		}
+		local := path[strings.LastIndex(path, "/")+1:]
+		if imp.Name != nil {
+			local = imp.Name.Name
+		}
+		out[local] = path
+	}
+	return out
+}
+
+// callTargets reports whether a call expression names pkgPath.name — resolving
+// the qualifier through the file's imports — or plain name when pkgPath is "".
+func callTargets(fun ast.Expr, pkgPath, name string, imports map[string]string) bool {
+	if pkgPath == "" {
 		ident, isIdent := fun.(*ast.Ident)
 		return isIdent && ident.Name == name
 	}
@@ -946,8 +1015,46 @@ func callTargets(fun ast.Expr, pkg, name string) bool {
 	if !isSel || sel.Sel.Name != name {
 		return false
 	}
-	pkgIdent, isIdent := sel.X.(*ast.Ident)
-	return isIdent && pkgIdent.Name == pkg
+	qualifier, isIdent := sel.X.(*ast.Ident)
+	return isIdent && imports[qualifier.Name] == pkgPath
+}
+
+// repoRoot walks up from the test's working directory to the directory holding
+// go.mod, so the scan covers the module rather than whichever package is running.
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	for {
+		if _, statErr := os.Stat(filepath.Join(dir, "go.mod")); statErr == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("no go.mod above the test's working directory — the scan cannot find the module")
+		}
+		dir = parent
+	}
+}
+
+// modulePath reads the module's import path from go.mod, so the passes above
+// compare against a real import path rather than a hardcoded string that would
+// quietly stop matching if the module were renamed.
+func modulePath(t *testing.T) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(repoRoot(t), "go.mod"))
+	if err != nil {
+		t.Fatalf("read go.mod: %v", err)
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "module "); ok {
+			return strings.TrimSpace(rest)
+		}
+	}
+	t.Fatal("go.mod has no module line")
+	return ""
 }
 
 // ===========================================================================
