@@ -175,10 +175,31 @@ attachments and note-to-note links are derived from the body the same way.
 So an update that would drop tasks is REFUSED and nothing is written. Re-run it
 with --keep-tasks to carry those blocks into the new body, or with
 --allow-task-loss to delete them on purpose. To add to a body without replacing
-it, use 'harbor notes append'.`,
+it, use 'harbor notes append'.
+
+ENCRYPTION FOLLOWS THE NOTEBOOK. --notebook is how a note is moved, and moving
+one into a notebook marked "encrypt new notes by default" ENCRYPTS it as part of
+the move: the ciphertext, the encryption flag and the new notebook go out in a
+single write, so the note is never sitting in that notebook readable. That needs
+your passphrase — set HARBOR_PASSPHRASE, or the move is REFUSED and the note
+stays plaintext where it was. Passing --notebook "" means your default notebook,
+and the same applies if that is the one that encrypts.
+
+A note that is ALREADY encrypted is moved as it is, in either direction: nothing
+is re-encrypted and nothing is re-keyed. Moving one OUT of an encrypting notebook
+does not decrypt it — encryption is per-note. Use 'harbor notes decrypt' for
+that, which is itself refused while the note is still inside such a notebook.
+
+What sealing a note does NOT cover, and it is worth knowing BEFORE you move one:
+
+` + bulletCaveat(attachmentCaveat) + `
+
+So a note moved into an encrypting notebook is unreadable, but any file attached
+to it is not. The same caveat is printed after the move.`,
 	Example: `  harbor notes update 9c2e... --title "Plan (final)"
   harbor notes update 9c2e... --file updated.md
-  harbor notes update 9c2e... --content "# Rewritten" --keep-tasks`,
+  harbor notes update 9c2e... --content "# Rewritten" --keep-tasks
+  harbor notes update 9c2e... --notebook 5b1f...   # sealed if 5b1f encrypts by default`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c, creds, err := loadClientFromConfig()
 		if err != nil {
@@ -203,7 +224,7 @@ it, use 'harbor notes append'.`,
 		// Replacing the body releases every task the new body does not carry, and
 		// the server deletes a released task. Refuse rather than do that silently
 		// (issue #62); only a content-carrying update can trigger it. The note it
-		// read is handed to the encryption step so the note is not fetched twice.
+		// read is handed to the steps below so the note is not fetched twice.
 		var note map[string]any
 		if hasContent {
 			note, err = guardNoteTaskLoss(cmd, c, args[0], format, body)
@@ -211,17 +232,31 @@ it, use 'harbor notes append'.`,
 				return err
 			}
 		}
-		// If the note is encrypted, re-seal any title/content we are sending.
-		// Refuse to overwrite ciphertext with plaintext when no passphrase is set.
-		if err := encryptUpdateBody(c, creds, args[0], body, note); err != nil {
+		// Encryption follows the notebook: --notebook into a notebook that encrypts
+		// by default SEALS the note, and the ciphertext rides out in this same PATCH
+		// rather than in a second one — so the note is never sitting in an encrypting
+		// notebook readable. A refusal here writes nothing and moves nothing.
+		move, err := prepareNoteMove(c, creds, args[0], body, note)
+		if err != nil {
 			return err
 		}
-		data, err := c.UpdateNote(args[0], body)
+		// Only when the move did not already seal it. Re-sealing what was just
+		// sealed would encrypt an envelope, and re-reading the note to find that out
+		// would ask a question already answered.
+		if !move.sealed {
+			// If the note is encrypted, re-seal any title/content we are sending.
+			// Refuse to overwrite ciphertext with plaintext when no passphrase is set.
+			if err := encryptUpdateBody(c, creds, args[0], body, note); err != nil {
+				return err
+			}
+		}
+		data, err := writeNoteUpdate(c, args[0], body, move)
 		if err != nil {
-			return mapNoteError(err)
+			return err
 		}
 		data = decryptResult(c, creds, data)
 		printResult(data, displayNote)
+		move.announce()
 		return nil
 	},
 }
@@ -324,6 +359,24 @@ func mapNoteError(err error) error {
 			return errors.New("the note body is too large (max 5 MiB)")
 		case "append_not_supported_encrypted":
 			return errors.New("cannot append to an encrypted note")
+		case "cannot_move_plaintext_into_encrypted":
+			// The server's own backstop on this CLI's move guard. Nothing was written
+			// and no usn was spent, so re-running is always the fix — but WHY the local
+			// guard did not fire first decides what else to say, and getting that wrong
+			// sends someone hunting for a key they are already holding.
+			//
+			// With a passphrase set, the local guard ran and was told the destination
+			// does not encrypt. That is the race this backstop exists for: the flag was
+			// flipped from another device between this command's notebook read and its
+			// write. Naming the passphrase there is simply wrong. Without one, the
+			// destination genuinely could not be sealed and the passphrase IS the gap —
+			// an old binary, or some other path that skipped the guard.
+			if encryptionEnabled() {
+				return errors.New("that notebook keeps its notes encrypted and this note was still plaintext, so nothing was written and the note was not moved.\n" +
+					"       its encrypt-by-default setting changed after this command read the notebook — run the same command again")
+			}
+			return fmt.Errorf("that notebook keeps its notes encrypted and this note is still plaintext, so nothing was written and the note was not moved.\n"+
+				"       set %s and run the same command again — the note is then sealed and moved in one write", passphraseEnv)
 		case "note_usn_stale":
 			// The base_usn precondition guardNoteTaskLoss sends. Retrying the same
 			// body is exactly the clobber the server just refused, so say to merge.

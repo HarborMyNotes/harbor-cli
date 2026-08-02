@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
@@ -312,15 +313,15 @@ func shouldEncryptCreate(cmd *cobra.Command, c *client.Client, notebookID string
 	// never touched encryption — that is the price of the question having an answer.
 	// The lookup also reports whether it could ANSWER, not just what the answer was;
 	// see below and notebookWantsEncryption.
-	wants, known, name := notebookWantsEncryption(c, notebookID)
+	nb := notebookWantsEncryption(c, notebookID)
 
 	// FAIL CLOSED, matching --encrypt just above and the conversion commands
 	// (conversionKey, cmd/notes_convert.go). The notebook says its notes are
 	// encrypted and this invocation holds no key to do that with, so the note is not
 	// written at all. This covers the account's DEFAULT notebook too, because
 	// notebookWantsEncryption resolves it when no --notebook was given.
-	if wants && !encryptionEnabled() {
-		return false, errEncryptedNotebookNeedsPassphrase(name, notebookID)
+	if nb.Wants && !encryptionEnabled() {
+		return false, errEncryptedNotebookNeedsPassphrase(nb.Name, notebookID)
 	}
 
 	// An UNANSWERED lookup still warns and proceeds, and that is deliberate — it is
@@ -331,10 +332,10 @@ func shouldEncryptCreate(cmd *cobra.Command, c *client.Client, notebookID string
 	// a failed GET would block plain note-taking to protect a setting that is
 	// probably not set, so the user is told on stderr and can re-run. (Same reasoning
 	// as notebookWantsEncryption, which fails open for the same reason.)
-	if !known {
+	if !nb.Known {
 		warnEncryptionUnknown(notebookID)
 	}
-	return wants, nil
+	return nb.Wants, nil
 }
 
 // errEncryptedNotebookNeedsPassphrase is the fail-closed refusal: the destination
@@ -389,15 +390,42 @@ func warnEncryptionUnknown(notebookID string) {
 		"written UNENCRYPTED — "+remedy))
 }
 
-// notebookWantsEncryption reports whether the target notebook (or the default
-// notebook, when none is given) has default_encrypt set — AND whether that could be
-// established at all. The second return is the point: a lookup that failed and a
-// notebook that said no are different facts, and only the caller can decide what to
-// do about the difference.
+// notebookEncryption is everything a notebook lookup established about one
+// notebook, and it is four facts rather than one bool because each of them is
+// answerable on its own and the callers branch on different ones.
 //
-// The third return is the notebook's NAME, for messages only — never for a
-// decision. It is "" whenever the lookup did not reach a notebook, and the callers
-// that print it fall back to the id (see notebookLabel).
+// ID is the RESOLVED id — the notebook the server will actually act on, which is
+// not always the one the user typed: an empty --notebook means "my default
+// notebook" and resolves to whatever that is (app.harbor.my
+// internal/notes/notes.go resolveNotebook). The move guard needs it because the
+// question "is this even a move?" is `resolved != the note's current notebook`,
+// and comparing against the raw flag would call every no-op echo of a note's own
+// notebook_id a move.
+//
+// Known is separate from Wants because a lookup that FAILED and a notebook that
+// said no are different facts, and only the caller can decide what to do about
+// the difference — a create says so and proceeds, a move refuses.
+//
+// Name is for messages only, never for a decision. It is "" whenever the lookup
+// did not reach a notebook, and the callers that print it fall back to the id
+// (see notebookLabel).
+// Missing separates the one unanswered lookup that is actually an ANSWER. A
+// notebook the server returns 404 for does not exist, and that is settled — it
+// will not be there on a retry, and it cannot have an encryption setting to read.
+// Folding it in with "the read did not work" is how a mistyped id ends up
+// answered with "re-run to try again".
+type notebookEncryption struct {
+	ID      string
+	Name    string
+	Wants   bool
+	Known   bool
+	Missing bool
+}
+
+// notebookWantsEncryption reports what the target notebook (or the default
+// notebook, when none is given) says about encrypting new notes — and whether
+// that could be established at all. See notebookEncryption for what each field
+// means and why the pair matters.
 //
 // WHY BOTH BRANCHES REPORT IT. This function fails OPEN — an unanswerable lookup
 // writes the note in the clear — and that is deliberate: failing closed would mean
@@ -415,17 +443,31 @@ func warnEncryptionUnknown(notebookID string) {
 // for its siblings; it is the only other internal collection read in the command
 // tree. The walk stops at the default, so an ordinary account still pays one request
 // — and a walk that never reaches a default answers UNKNOWN, not "no" (see below).
-func notebookWantsEncryption(c *client.Client, notebookID string) (wants, known bool, name string) {
+func notebookWantsEncryption(c *client.Client, notebookID string) notebookEncryption {
 	// A NAMED notebook is the common path — it needs no big account to reach, just a
 	// --notebook flag — and it is a plain GET, so "known" is simply "the read worked".
+	//
+	// The ID is filled in whether or not that read works, because it does not depend
+	// on it: the id is the one the user typed and the one the server will resolve to
+	// the same notebook. Only default_encrypt and the name are in doubt. That is what
+	// lets a failed lookup still tell a no-op echo apart from a real move, instead of
+	// refusing a write that was never going anywhere.
 	if notebookID != "" {
+		out := notebookEncryption{ID: notebookID}
 		data, err := c.GetNotebook(notebookID, false)
 		if err != nil {
-			return false, false, ""
+			var apiErr *client.APIError
+			out.Missing = errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound
+			return out
 		}
 		nb := parseJSON(client.UnwrapData(data))
-		return boolean(nb, "default_encrypt"), true, str(nb, "name")
+		out.Wants = boolean(nb, "default_encrypt")
+		out.Name = str(nb, "name")
+		out.Known = true
+		return out
 	}
+
+	var out notebookEncryption
 
 	// known is set inside the visit callback and NOWHERE else, so it is true exactly
 	// when a notebook flagged is_default was actually read — which is the only thing
@@ -447,12 +489,13 @@ func notebookWantsEncryption(c *client.Client, notebookID string) (wants, known 
 			if !boolean(n, "is_default") {
 				return true
 			}
-			wants = boolean(n, "default_encrypt")
-			name = str(n, "name")
-			known = true
+			out.ID = str(n, "id")
+			out.Wants = boolean(n, "default_encrypt")
+			out.Name = str(n, "name")
+			out.Known = true
 			return false
 		})
-	return wants, known, name
+	return out
 }
 
 // encryptCreateBody seals a create body's title and content into HRBC2 envelopes

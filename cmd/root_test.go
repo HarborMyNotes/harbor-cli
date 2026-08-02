@@ -198,6 +198,11 @@ func resetCommandState(t *testing.T) {
 		verboseFlag = false
 		utcFlag = false
 		apiURLFlag = ""
+		// The notebook lookups a run memoizes are keyed by id alone, which is right
+		// for a process that runs one command and wrong for a test binary that runs
+		// hundreds against different stub servers — "nb1 encrypts" would outlive the
+		// server that said so.
+		notebookEncryptionLookups = nil
 		resetFlags(rootCmd)
 	}
 	clear()
