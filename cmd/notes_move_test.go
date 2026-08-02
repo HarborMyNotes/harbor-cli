@@ -555,6 +555,40 @@ func TestEmptyNotebookFlagResolvesToTheDefaultNotebook(t *testing.T) {
 	}
 }
 
+// TestUnresolvableDefaultNotebookWritesNothing pins the one branch of
+// isNotebookMove that has no id to compare against at all: `--notebook ""` means
+// "my default notebook", and when the walk that would have named it fails there
+// is no way to tell a move from an echo.
+//
+// It is the case where BOTH of the other answers are wrong — "not a move" waves
+// the write through into a notebook that may well encrypt, and "a move" refuses
+// an echo — so it fails closed instead. The server would still catch the first
+// of those, but turning a confusing server error into a clear local one is a
+// large part of why this feature exists.
+func TestUnresolvableDefaultNotebookWritesNothing(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	mm := newMoveMock(t, moveNotebooks(), movePlaintextNote())
+	mm.notebookStatus = 500
+
+	_, err := runCLI(t, mm.m, "notes", "update", moveNoteID, "--notebook", "")
+
+	if err == nil {
+		t.Fatal("a move to an unresolvable default notebook was treated as a destination that said no")
+	}
+	if !strings.Contains(err.Error(), "your default notebook") {
+		t.Errorf("the refusal does not say which notebook it could not read:\n%s", err)
+	}
+	if got := patchesTo(mm, moveNoteID); got != 0 {
+		t.Errorf("the refusal still wrote %d times", got)
+	}
+	if got := str(mm.notes[moveNoteID], "notebook_id"); got != nbPlain {
+		t.Errorf("the note moved anyway: notebook_id = %q", got)
+	}
+	if boolean(mm.notes[moveNoteID], "is_encrypted") {
+		t.Error("the note was marked encrypted by a run that wrote nothing")
+	}
+}
+
 // TestEmptyNotebookFlagOnANoteAlreadyThereIsNotAMove is the resolution rule and
 // the no-op rule meeting. The note is already in the default notebook, so "" is
 // an echo of where it already is, and nothing should be sealed.
@@ -794,21 +828,75 @@ func sortedFieldNames(body map[string]any) []string {
 // asked for: a test that fails when a SECOND sealing path appears.
 //
 // It is deliberately the weaker of the two guards — it proves a name exists, not
-// that the code does the right thing, and the test above is what proves the
-// behaviour. What it adds is the case that one cannot cover: a new function that
-// seals correctly today. That is exactly how the reference's fork started, and it
-// stayed correct for about a day.
+// that the code does the right thing, and TestSealedMoveAndNotesEncryptSendTheSameWrite
+// is what proves the behaviour. What it adds is the case that one cannot cover: a
+// new pipeline that seals CORRECTLY today. That is exactly how the reference's
+// fork started, and it stayed correct for about a day; a behavioural test only
+// catches the fork once the two copies have drifted, which is after the bug.
+//
+// IT TAKES TWO PASSES, AND THE SECOND ONE IS THE POINT. The first version of this
+// test watched crypto.SealField alone — and a review proved it blind to the fork
+// most likely to actually happen. sealAndVerify is itself the reusable primitive,
+// so a second pipeline written the sensible way, through sealAndVerify, never
+// touches crypto.SealField and walked straight past the tripwire: a
+// reimplementation of planEncrypt wired into the live move path left the whole
+// suite green. Every rung of the ladder has to be watched, not just the bottom one.
 func TestOnlyTheKnownFunctionsSeal(t *testing.T) {
-	// encryptCreateBody seals a note being born, encryptUpdateBody re-seals one
-	// that is already ciphertext, and sealAndVerify is the single primitive the
-	// in-place conversion (planEncrypt) — and therefore the sealed move — goes
-	// through. A fourth name here means a fourth idea about how to encrypt a note.
-	allowed := map[string]bool{
-		"encryptCreateBody": true,
-		"encryptUpdateBody": true,
-		"sealAndVerify":     true,
+	// crypto.SealField is the raw primitive: encryptCreateBody seals a note being
+	// born, encryptUpdateBody re-seals one that is already ciphertext, and
+	// sealAndVerify is the seal-then-open-it-back wrapper the in-place conversion
+	// uses. A fourth name here is a fourth idea about how to encrypt a note.
+	assertOnlyTheseCall(t, "crypto", "SealField", "encryptCreateBody", "encryptUpdateBody", "sealAndVerify")
+
+	// sealAndVerify is the rung above, and planEncrypt is the ONE in-place
+	// plaintext-to-ciphertext pipeline — `notes encrypt` and the sealed move both
+	// come through it. A second caller here is a second pipeline, however correct
+	// it looks on the day it is written.
+	assertOnlyTheseCall(t, "", "sealAndVerify", "planEncrypt")
+}
+
+// assertOnlyTheseCall fails unless the functions in package cmd that call
+// pkg.name (or plain name, when pkg is "") are exactly the ones allowed.
+//
+// The empty result is an error rather than a pass. A test that asserts "none of
+// the disallowed functions call this" while nothing calls it at all — because it
+// was renamed, or the pass is looking for the wrong spelling — is a test that has
+// stopped guarding anything without ever going red.
+func assertOnlyTheseCall(t *testing.T, pkg, name string, allow ...string) {
+	t.Helper()
+	allowed := map[string]bool{}
+	for _, a := range allow {
+		allowed[a] = true
 	}
 
+	label := name
+	if pkg != "" {
+		label = pkg + "." + name
+	}
+	found := callersOf(t, pkg, name)
+
+	if len(found) == 0 {
+		t.Fatalf("no %s call sites were found at all — this pass is asserting nothing", label)
+	}
+	for caller := range found {
+		if !allowed[caller] {
+			t.Errorf("%s() calls %s, and it is not one of the sealing paths this CLI is supposed to have. "+
+				"Extend the existing one instead — the web reference forked its seal and the two copies disagreed inside a single PR",
+				caller, label)
+		}
+	}
+	for caller := range allowed {
+		if !found[caller] {
+			t.Errorf("%s() no longer calls %s — this allowlist has gone stale and is no longer guarding what it claims to",
+				caller, label)
+		}
+	}
+}
+
+// callersOf returns the names of the functions in the non-test files of package
+// cmd that call pkg.name, or plain name when pkg is "".
+func callersOf(t *testing.T, pkg, name string) map[string]bool {
+	t.Helper()
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatalf("read cmd package: %v", err)
@@ -816,17 +904,17 @@ func TestOnlyTheKnownFunctionsSeal(t *testing.T) {
 	fset := token.NewFileSet()
 	found := map[string]bool{}
 	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+		file := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(file, ".go") || strings.HasSuffix(file, "_test.go") {
 			continue
 		}
-		file, perr := parser.ParseFile(fset, name, nil, 0)
+		parsed, perr := parser.ParseFile(fset, file, nil, 0)
 		if perr != nil {
-			t.Fatalf("parse %s: %v", name, perr)
+			t.Fatalf("parse %s: %v", file, perr)
 		}
-		ast.Inspect(file, func(n ast.Node) bool {
+		ast.Inspect(parsed, func(n ast.Node) bool {
 			fn, isFunc := n.(*ast.FuncDecl)
-			if !isFunc {
+			if !isFunc || fn.Body == nil {
 				return true
 			}
 			ast.Inspect(fn.Body, func(inner ast.Node) bool {
@@ -834,33 +922,32 @@ func TestOnlyTheKnownFunctionsSeal(t *testing.T) {
 				if !isCall {
 					return true
 				}
-				sel, isSel := call.Fun.(*ast.SelectorExpr)
-				if !isSel || sel.Sel.Name != "SealField" {
-					return true
-				}
-				if pkgName, isIdent := sel.X.(*ast.Ident); isIdent && pkgName.Name == "crypto" {
+				if callTargets(call.Fun, pkg, name) {
 					found[fn.Name.Name] = true
 				}
 				return true
 			})
+			// Do not descend into nested declarations twice; the walk above already
+			// covered this function's whole body, closures included.
 			return false
 		})
 	}
+	return found
+}
 
-	if len(found) == 0 {
-		t.Fatal("no crypto.SealField call sites were found at all — this test is asserting nothing")
+// callTargets reports whether a call expression names pkg.name, or plain name
+// when pkg is "".
+func callTargets(fun ast.Expr, pkg, name string) bool {
+	if pkg == "" {
+		ident, isIdent := fun.(*ast.Ident)
+		return isIdent && ident.Name == name
 	}
-	for name := range found {
-		if !allowed[name] {
-			t.Errorf("%s() turns plaintext into ciphertext, and it is not one of the pipelines this CLI is supposed to have. "+
-				"Extend the existing one instead — the web reference forked its seal and the two copies disagreed inside a single PR", name)
-		}
+	sel, isSel := fun.(*ast.SelectorExpr)
+	if !isSel || sel.Sel.Name != name {
+		return false
 	}
-	for name := range allowed {
-		if !found[name] {
-			t.Errorf("%s() no longer seals anything — this allowlist has gone stale and is no longer guarding what it claims to", name)
-		}
-	}
+	pkgIdent, isIdent := sel.X.(*ast.Ident)
+	return isIdent && pkgIdent.Name == pkg
 }
 
 // ===========================================================================
@@ -932,6 +1019,73 @@ func TestSealedMoveSealsTheNewBodyAndClaimsNoFormat(t *testing.T) {
 }
 
 // ===========================================================================
+// The compare-and-set must not be renewed across a window nobody looked at
+// ===========================================================================
+
+// TestSealedMoveKeepsTheCompareAndSetOnTheFirstRead is a regression test for a
+// bug this feature introduced and a review caught.
+//
+// `notes update --content … --notebook <encrypting>` reads the note TWICE — once
+// for the task guard, once for the seal's server-authoritative recheck — and both
+// reads are necessary. But base_usn is a promise that nothing has changed since
+// the command looked, and the thing that looked was the FIRST read: the task
+// guard worked out which tasks the new body would delete from that body. Letting
+// the second read's usn go out instead renews the promise across a window nobody
+// inspected, so a save that lands between the two reads is silently overwritten
+// rather than refused.
+//
+// The stub makes that window real: the note is bumped after the first read, the
+// way a phone syncing mid-command would bump it.
+func TestSealedMoveKeepsTheCompareAndSetOnTheFirstRead(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	mm := newMoveMock(t, moveNotebooks(), movePlaintextNote())
+	mm.onNoteRead = func(noteID string, reads int) {
+		// The callback runs BEFORE the read is answered, so bumping on the second
+		// one puts the other save squarely between the two: read 1 saw usn 88, read
+		// 2 sees 99.
+		if reads == 2 {
+			mm.notes[noteID]["usn"] = float64(99)
+			mm.notes[noteID]["content"] = "<p>edited from a phone</p>"
+		}
+	}
+
+	_, err := runCLI(t, mm.m, "notes", "update", moveNoteID,
+		"--notebook", nbLocked, "--format", "html", "--content", "<p>Rewritten</p>")
+
+	body := mm.m.bodyOf(t, "PATCH /api/v1/notes/"+moveNoteID)
+	if got, _ := body["base_usn"].(float64); got != 88 {
+		t.Errorf("base_usn = %v, want the FIRST read's 88 — the seal re-based the precondition onto its own later read, "+
+			"so the write that landed in between is overwritten instead of refused", got)
+	}
+	if err == nil {
+		t.Fatal("the note changed under the command and the write landed anyway — the interleaved edit was destroyed")
+	}
+	// The server refused it, so nothing of the other save is lost.
+	if got := str(mm.notes[moveNoteID], "content"); got != "<p>edited from a phone</p>" {
+		t.Errorf("the interleaved edit was overwritten: content = %q", got)
+	}
+	if boolean(mm.notes[moveNoteID], "is_encrypted") {
+		t.Error("a refused write still marked the note encrypted")
+	}
+}
+
+// TestNotesEncryptStillSendsItsOwnBaseUSN is the other half of that fix, and it
+// is what stops it from being a base_usn that is simply never sent. `notes
+// encrypt` establishes no precondition of its own before planEncrypt runs, so
+// there its read IS the only read and its usn is the right one to send.
+func TestNotesEncryptStillSendsItsOwnBaseUSN(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	mm := newMoveMock(t, moveNotebooks(), movePlaintextNote())
+
+	if _, err := runCLI(t, mm.m, "notes", "encrypt", moveNoteID); err != nil {
+		t.Fatalf("notes encrypt: %v", err)
+	}
+	if got, _ := mm.m.bodyOf(t, "PATCH /api/v1/notes/"+moveNoteID)["base_usn"].(float64); got != 88 {
+		t.Errorf("base_usn = %v, want 88 — the conversion stopped sending a precondition at all", got)
+	}
+}
+
+// ===========================================================================
 // The caveats a sealed move inherits
 // ===========================================================================
 
@@ -958,6 +1112,12 @@ func TestSealedMovePrintsTheAttachmentCaveat(t *testing.T) {
 	}
 	if !strings.Contains(said, "Note moved and encrypted") {
 		t.Errorf("the sealed move never said it encrypted anything:\n%s", said)
+	}
+	// The other caveat a sealed move inherits, and it is a separate fact: this note
+	// was plaintext until a moment ago, so its earlier versions are plaintext on the
+	// server and encrypting it now does not un-store them.
+	if !strings.Contains(said, "this does not clear the plaintext already on the server") {
+		t.Errorf("the sealed move never said its earlier versions are still readable:\n%s", said)
 	}
 	// It is a limit, not an apology: the sentence must still be the one the
 	// encrypt command's help text carries.
@@ -991,18 +1151,26 @@ func TestPlainMoveIsQuiet(t *testing.T) {
 // R7 — the server's own backstop
 // ===========================================================================
 
-// TestServerRefusalOfAPlaintextMoveReadsAsEnglish covers the case where the local
-// check was bypassed — an older binary, some other path — and the server refuses
-// instead. Nothing is written and no usn is spent, so the message's job is to say
-// what to do next rather than to translate an error code.
+// TestServerRefusalOfAPlaintextMoveReadsAsEnglish covers the server's backstop
+// firing where the local guard did not. Nothing is written and no usn is spent,
+// so the message's job is to say what to do next rather than to translate an
+// error code.
+//
+// Note how it has to be reached: the destination the CLI READ says it does not
+// encrypt, so the local guard passes the move through, and the server — which
+// sees the notebook as it is NOW — refuses it. That is the only shape this 422
+// still has once the local guard exists, and it is why the fixture moves into
+// the ordinary notebook rather than the encrypting one.
 func TestServerRefusalOfAPlaintextMoveReadsAsEnglish(t *testing.T) {
-	unlockedSession(t, newMasterKey(t))
-	mm := newMoveMock(t, moveNotebooks(), movePlaintextNote())
+	lockedSession(t)
+	note := movePlaintextNote()
+	note["notebook_id"] = nbLocked
+	mm := newMoveMock(t, moveNotebooks(), note)
 	mm.patchStatus = 422
 	mm.patchBody = apiErrorBody("cannot_move_plaintext_into_encrypted",
 		"That notebook keeps its notes encrypted; encrypt the note and move it in the same request.")
 
-	_, err := runCLI(t, mm.m, "notes", "update", moveNoteID, "--notebook", nbLocked)
+	_, err := runCLI(t, mm.m, "notes", "update", moveNoteID, "--notebook", nbPlain)
 
 	if err == nil {
 		t.Fatal("the server refused the move and the CLI reported success")
@@ -1012,6 +1180,36 @@ func TestServerRefusalOfAPlaintextMoveReadsAsEnglish(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), passphraseEnv) {
 		t.Errorf("the refusal never says what to do about it:\n%s", err)
+	}
+}
+
+// TestServerRefusalWithAPassphraseSetBlamesTheRace is the other half of that
+// message, and it is the half a live end-to-end run actually reaches.
+//
+// Once the local guard exists, the realistic way to see this 422 is a notebook
+// whose encrypt-by-default was flipped from another device between this command
+// reading it and writing — not a missing key. Telling someone whose passphrase is
+// already set to "set HARBOR_PASSPHRASE" sends them hunting for a key they are
+// holding, and hides the retry that would actually work.
+func TestServerRefusalWithAPassphraseSetBlamesTheRace(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	note := movePlaintextNote()
+	note["notebook_id"] = nbLocked
+	mm := newMoveMock(t, moveNotebooks(), note)
+	mm.patchStatus = 422
+	mm.patchBody = apiErrorBody("cannot_move_plaintext_into_encrypted",
+		"That notebook keeps its notes encrypted; encrypt the note and move it in the same request.")
+
+	_, err := runCLI(t, mm.m, "notes", "update", moveNoteID, "--notebook", nbPlain)
+
+	if err == nil {
+		t.Fatal("the server refused the move and the CLI reported success")
+	}
+	if strings.Contains(err.Error(), passphraseEnv) {
+		t.Errorf("the passphrase IS set, and the refusal still blames it:\n%s", err)
+	}
+	if !strings.Contains(err.Error(), "run the same command again") {
+		t.Errorf("the refusal never names the retry that would work:\n%s", err)
 	}
 }
 

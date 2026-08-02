@@ -74,7 +74,13 @@ type noteMovePlan struct {
 // against the server's own answer inside planEncrypt.
 //
 // Every return before the seal leaves body exactly as it arrived, so a plain move
-// is still a plain move and this function costs it one notebook lookup.
+// is still a plain move. It is not free, though, and the honest accounting is:
+// every --notebook update now costs a notebook read AND a full note read on top of
+// the PATCH it always cost. The note read is what the encrypted-note fast path and
+// the move-out notice are decided from, so it is not avoidable without dropping
+// one of them; a sealed move pays one more read inside planEncrypt. Moving a note
+// is a deliberate, occasional act, which is the only reason that is an acceptable
+// price.
 func prepareNoteMove(c *client.Client, creds *config.Credentials, noteID string, body, note map[string]any) (noteMovePlan, error) {
 	dest, moving := body["notebook_id"].(string)
 	if !moving {
@@ -146,14 +152,44 @@ func prepareNoteMove(c *client.Client, creds *config.Credentials, noteID string,
 		// sealing it again would wrap the envelope in an envelope.
 		return noteMovePlan{}, nil
 	}
-	for k, v := range seal {
-		body[k] = v
-	}
+	mergeSealIntoUpdate(body, seal)
 	// The body being sent is now an envelope, and a content_format alongside it
 	// would be a claim about bytes the server will never look at. planEncrypt does
 	// not produce one; a --content/--file/--stdin flag on the same command does.
 	delete(body, "content_format")
 	return noteMovePlan{sealed: true}, nil
+}
+
+// mergeSealIntoUpdate folds the seal's write into the update the user asked for,
+// and refuses to let the seal move the compare-and-set forward.
+//
+// THE base_usn MUST STAY ON THE EARLIEST READ ANY DECISION WAS MADE AGAINST.
+// A `notes update --content … --notebook <encrypting>` reads the note twice: once
+// for the task guard, which works out from THAT body which tasks the new one
+// would delete, and again inside planEncrypt, which is the server-authoritative
+// re-read of whether the note is already ciphertext. Both reads are necessary and
+// both stay.
+//
+// What must not happen is the second read's usn replacing the first one's on the
+// way out. base_usn is the promise "nothing has changed since I looked", and the
+// thing that looked — the task guard — looked at the FIRST read. Re-basing onto
+// the second read renews that promise across a window nobody inspected: a save
+// from a phone, another agent or the web app landing between the two reads would
+// be silently overwritten by this write instead of refused, and the task guard
+// would have authorised a write against a body that no longer exists. Keeping the
+// earlier usn means the server answers 409 note_usn_stale and writes nothing,
+// which is the whole point of sending it.
+//
+// planEncrypt still sets base_usn for the caller that established none — that is
+// `notes encrypt`, where its own read is the only read there was.
+func mergeSealIntoUpdate(body, seal map[string]any) {
+	_, callerSetBase := body["base_usn"]
+	for k, v := range seal {
+		if k == "base_usn" && callerSetBase {
+			continue
+		}
+		body[k] = v
+	}
 }
 
 // isNotebookMove reports whether an update's destination is a genuine move away

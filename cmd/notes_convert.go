@@ -232,9 +232,11 @@ func planEncrypt(c *client.Client, key []byte, noteID string, replace map[string
 	// An encrypted note may have an EMPTY title (the server's
 	// validateEncryptedFields allows it) but never a plaintext one, so an empty
 	// title is left alone and anything else is sealed. An empty title the CALLER
-	// asked for is different from one the note already had: it has to be sent, or
-	// the note keeps its old plaintext title under an is_encrypted flag and the
-	// server refuses the whole write.
+	// asked for is different from one the note already had, and is echoed back
+	// explicitly so this function's return is a complete write on its own. Today's
+	// only caller merges it into a body that already carries the same empty title,
+	// so the branch changes nothing for it — it is here so that what planEncrypt
+	// returns does not depend on the caller having done that.
 	title, retitled := replaceField(replace, "title")
 	if !retitled {
 		title = str(note, "title")

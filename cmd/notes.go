@@ -188,7 +188,14 @@ and the same applies if that is the one that encrypts.
 A note that is ALREADY encrypted is moved as it is, in either direction: nothing
 is re-encrypted and nothing is re-keyed. Moving one OUT of an encrypting notebook
 does not decrypt it — encryption is per-note. Use 'harbor notes decrypt' for
-that, which is itself refused while the note is still inside such a notebook.`,
+that, which is itself refused while the note is still inside such a notebook.
+
+What sealing a note does NOT cover, and it is worth knowing BEFORE you move one:
+
+` + bulletCaveat(attachmentCaveat) + `
+
+So a note moved into an encrypting notebook is unreadable, but any file attached
+to it is not. The same caveat is printed after the move.`,
 	Example: `  harbor notes update 9c2e... --title "Plan (final)"
   harbor notes update 9c2e... --file updated.md
   harbor notes update 9c2e... --content "# Rewritten" --keep-tasks
@@ -353,12 +360,21 @@ func mapNoteError(err error) error {
 		case "append_not_supported_encrypted":
 			return errors.New("cannot append to an encrypted note")
 		case "cannot_move_plaintext_into_encrypted":
-			// The server's own backstop on this file's move guard, and reaching it
-			// means the local check was bypassed rather than that it failed — an old
-			// binary, a raw --notebook echoed through some other path. Nothing was
-			// written and no usn was spent, so re-running with a passphrase set is the
-			// whole fix; the message says that rather than repeating the server's
-			// wording, which describes an API contract to a person who typed a command.
+			// The server's own backstop on this CLI's move guard. Nothing was written
+			// and no usn was spent, so re-running is always the fix — but WHY the local
+			// guard did not fire first decides what else to say, and getting that wrong
+			// sends someone hunting for a key they are already holding.
+			//
+			// With a passphrase set, the local guard ran and was told the destination
+			// does not encrypt. That is the race this backstop exists for: the flag was
+			// flipped from another device between this command's notebook read and its
+			// write. Naming the passphrase there is simply wrong. Without one, the
+			// destination genuinely could not be sealed and the passphrase IS the gap —
+			// an old binary, or some other path that skipped the guard.
+			if encryptionEnabled() {
+				return errors.New("that notebook keeps its notes encrypted and this note was still plaintext, so nothing was written and the note was not moved.\n" +
+					"       its encrypt-by-default setting changed after this command read the notebook — run the same command again")
+			}
 			return fmt.Errorf("that notebook keeps its notes encrypted and this note is still plaintext, so nothing was written and the note was not moved.\n"+
 				"       set %s and run the same command again — the note is then sealed and moved in one write", passphraseEnv)
 		case "note_usn_stale":
