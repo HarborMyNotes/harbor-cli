@@ -427,6 +427,30 @@ func TestMoveWithUnreadableDestinationWritesNothing(t *testing.T) {
 	}
 }
 
+// TestMoveToANotebookThatDoesNotExistSaysSo separates the two ways a destination
+// lookup comes back empty-handed. A 404 is settled — the notebook is not there
+// and will not be there on a retry — and telling someone who mistyped an id to
+// "re-run to try again" is advice that cannot work. Both still write nothing.
+func TestMoveToANotebookThatDoesNotExistSaysSo(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	mm := newMoveMock(t, moveNotebooks(), movePlaintextNote())
+
+	_, err := runCLI(t, mm.m, "notes", "update", moveNoteID, "--notebook", "no-such-notebook")
+
+	if err == nil {
+		t.Fatal("a move to a notebook that does not exist was accepted")
+	}
+	if !strings.Contains(err.Error(), "there is no notebook no-such-notebook") {
+		t.Errorf("a missing notebook was reported as an unreadable one:\n%s", err)
+	}
+	if strings.Contains(err.Error(), "re-run to try again") {
+		t.Errorf("the refusal offers a retry that cannot ever work:\n%s", err)
+	}
+	if got := patchesTo(mm, moveNoteID); got != 0 {
+		t.Errorf("the refusal still wrote %d times", got)
+	}
+}
+
 // TestMoveIntoOrdinaryNotebookIsAPlainMove is the common case, and it has to stay
 // cheap and unencumbered: no key, no ciphertext, one PATCH carrying nothing but
 // the move.

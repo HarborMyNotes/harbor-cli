@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
@@ -408,11 +409,17 @@ func warnEncryptionUnknown(notebookID string) {
 // Name is for messages only, never for a decision. It is "" whenever the lookup
 // did not reach a notebook, and the callers that print it fall back to the id
 // (see notebookLabel).
+// Missing separates the one unanswered lookup that is actually an ANSWER. A
+// notebook the server returns 404 for does not exist, and that is settled — it
+// will not be there on a retry, and it cannot have an encryption setting to read.
+// Folding it in with "the read did not work" is how a mistyped id ends up
+// answered with "re-run to try again".
 type notebookEncryption struct {
-	ID    string
-	Name  string
-	Wants bool
-	Known bool
+	ID      string
+	Name    string
+	Wants   bool
+	Known   bool
+	Missing bool
 }
 
 // notebookWantsEncryption reports what the target notebook (or the default
@@ -449,6 +456,8 @@ func notebookWantsEncryption(c *client.Client, notebookID string) notebookEncryp
 		out := notebookEncryption{ID: notebookID}
 		data, err := c.GetNotebook(notebookID, false)
 		if err != nil {
+			var apiErr *client.APIError
+			out.Missing = errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound
 			return out
 		}
 		nb := parseJSON(client.UnwrapData(data))

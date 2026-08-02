@@ -176,9 +176,18 @@ func isNotebookMove(nb notebookEncryption, current string) (move, resolvable boo
 // errMoveEncryptionUnknown is the refusal above: the destination could not be
 // asked whether its notes are encrypted, so the note has not been moved.
 //
+// A destination that came back 404 is answered separately, because it is not the
+// same problem. "Could not read it, re-run to try again" is advice that can never
+// work for a notebook id with a typo in it — and a mistyped id is by far the most
+// likely way anyone arrives here.
+//
 // The second line is indented to sit under the first once renderError has
 // prefixed it with "Error: " (7 characters).
 func errMoveEncryptionUnknown(nb notebookEncryption, dest string) error {
+	if nb.Missing {
+		return fmt.Errorf("there is no notebook %s, so nothing was written and the note has not been moved\n"+
+			"       list them with 'harbor notebooks list'", dest)
+	}
 	return fmt.Errorf("could not read whether notes in %s are encrypted by default, so nothing was written and the note has not been moved\n"+
 		"       moving a plaintext note into a notebook that encrypts has to seal it first, and that is not a\n"+
 		"       decision to make on a guess — re-run to try again",
