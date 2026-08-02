@@ -477,6 +477,33 @@ func TestReSavingANoteAlreadyInAnEncryptingNotebookIsNotAMove(t *testing.T) {
 	}
 }
 
+// TestUnreadableNotebookStillAllowsANoOpEcho is where the two rules above pull
+// against each other, and it is the case a mutation run found nothing asserting.
+//
+// The notebook read fails, so nothing is established about what it wants — and
+// the fail-closed rule says a move into an unanswerable destination is refused.
+// But this is not a move: the id is the one the note is already in, and that is
+// knowable without the read ever succeeding, because a named notebook resolves to
+// itself. Refusing here would break re-saving a note whenever a metadata GET
+// hiccuped, to protect it from going somewhere it was never going.
+func TestUnreadableNotebookStillAllowsANoOpEcho(t *testing.T) {
+	lockedSession(t)
+	note := movePlaintextNote()
+	note["notebook_id"] = nbLocked
+	mm := newMoveMock(t, moveNotebooks(), note)
+	mm.notebookStatus = 500
+
+	if _, err := runCLI(t, mm.m, "notes", "update", moveNoteID, "--notebook", nbLocked, "--author", "you@example.com"); err != nil {
+		t.Fatalf("a note's own notebook_id was refused because the notebook could not be read: %v", err)
+	}
+	if got := patchesTo(mm, moveNoteID); got != 1 {
+		t.Errorf("the update wrote %d times, want the one PATCH it asked for", got)
+	}
+	if _, sealed := mm.m.bodyOf(t, "PATCH /api/v1/notes/"+moveNoteID)["is_encrypted"]; sealed {
+		t.Error("a no-op echo sealed the note")
+	}
+}
+
 // TestEmptyNotebookFlagResolvesToTheDefaultNotebook is the other half of the same
 // scoping rule. `--notebook ""` means "my default notebook", the server resolves
 // it before comparing, and if THAT notebook encrypts then the seal is required.
@@ -841,6 +868,42 @@ func TestSealedMoveSealsTheNewTitleNotTheOldOne(t *testing.T) {
 	}
 	if got != "Quarterly plan (final)" {
 		t.Errorf("the sealed title is %q — the command sealed the note's old title and threw the edit away", got)
+	}
+}
+
+// TestSealedMoveSealsTheNewBodyAndClaimsNoFormat is the same case for the body,
+// and it is the only one that can catch the format claim: a content_format only
+// exists on the wire when a content flag put it there, so an assertion about it
+// on a move that carries no body is asserting about a field that was never going
+// to be present.
+//
+// The server stores an encrypted body verbatim and never renders it, so a format
+// alongside ciphertext is a claim about bytes nothing will look at — and on the
+// way back out it is what a decrypt would use to interpret them.
+func TestSealedMoveSealsTheNewBodyAndClaimsNoFormat(t *testing.T) {
+	key := newMasterKey(t)
+	unlockedSession(t, key)
+	mm := newMoveMock(t, moveNotebooks(), movePlaintextNote())
+
+	if _, err := runCLI(t, mm.m, "notes", "update", moveNoteID,
+		"--notebook", nbLocked, "--format", "html", "--content", "<p>Rewritten</p>"); err != nil {
+		t.Fatalf("notes update --content --notebook: %v", err)
+	}
+
+	body := mm.m.bodyOf(t, "PATCH /api/v1/notes/"+moveNoteID)
+	if _, sent := body["content_format"]; sent {
+		t.Errorf("the write claims a content_format for ciphertext: %v", body)
+	}
+	content, _ := mm.notes[moveNoteID]["content"].(string)
+	if !crypto.IsEnvelope(content) {
+		t.Fatalf("the new body was stored in the clear: %q", content)
+	}
+	got, err := crypto.OpenField(key, moveNoteID, "content", content)
+	if err != nil {
+		t.Fatalf("the sealed body does not open: %v", err)
+	}
+	if got != "<p>Rewritten</p>" {
+		t.Errorf("the sealed body is %q — the command sealed the note's old body and threw the edit away", got)
 	}
 }
 
