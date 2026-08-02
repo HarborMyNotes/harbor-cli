@@ -300,12 +300,18 @@ func TestNotesUpdateSendsTheBaseUSNPrecondition(t *testing.T) {
 
 // A metadata-only update cannot release anything, so it must not pay for the
 // guard's read — and must not send a precondition the user never asked for.
+//
+// --author is used rather than --notebook or --title because those two read the
+// note for reasons of their own — the encryption-on-move check
+// (cmd/notes_move.go) and the re-seal check (encryptUpdateBody) — and a test
+// pinning the TASK guard's cost through one of them would go red the next time an
+// unrelated feature changed. --author touches neither.
 func TestNotesUpdateWithoutContentIsNotGuarded(t *testing.T) {
 	m := newAPIMock(t, map[string]mockReply{
 		"PATCH /api/v1/notes/n1": {Status: 200, Body: `{"note":{"id":"n1","usn":43},"usn":43}`},
 	})
 
-	if _, err := runCLI(t, m, "notes", "update", "n1", "--notebook", "nb2"); err != nil {
+	if _, err := runCLI(t, m, "notes", "update", "n1", "--author", "you@example.com"); err != nil {
 		t.Fatalf("metadata-only update: %v", err)
 	}
 	if len(m.calls()) != 1 {

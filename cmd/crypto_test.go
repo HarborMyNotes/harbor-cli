@@ -27,6 +27,7 @@ func resetSession() {
 	sessionErr = nil
 	decryptWarned = false
 	encryptCheckWarned = false
+	notebookEncryptionLookups = nil
 }
 
 // setupEncryption isolates HOME, writes a cached keystore, and sets the
@@ -203,16 +204,16 @@ func notebookPageMock(t *testing.T) *apiMock {
 func TestNotebookWantsEncryptionFindsADefaultPastTheFirstPage(t *testing.T) {
 	m := notebookPageMock(t)
 
-	wants, known, name := notebookWantsEncryption(client.NewClient(m.baseURL(), "tok"), "")
+	nb := notebookWantsEncryption(client.NewClient(m.baseURL(), "tok"), "")
 
-	if !known {
+	if !nb.Known {
 		t.Fatal("the walk reached the default notebook but reported the answer as unknown")
 	}
-	if !wants {
+	if !nb.Wants {
 		t.Error("the default notebook asks for encryption and the lookup said no — it only read page 1")
 	}
-	if name != "Zed" {
-		t.Errorf("the notebook's name did not come back for the refusal message: %q", name)
+	if nb.Name != "Zed" {
+		t.Errorf("the notebook's name did not come back for the refusal message: %q", nb.Name)
 	}
 }
 
@@ -225,8 +226,8 @@ func TestNotebookWantsEncryptionStopsAtTheDefault(t *testing.T) {
 			`"paging":{"limit":500,"offset":0,"total":900,"has_more":true}}`},
 	})
 
-	if wants, known, _ := notebookWantsEncryption(client.NewClient(m.baseURL(), "tok"), ""); !wants || !known {
-		t.Fatalf("the default notebook on page 1 was not found: wants=%v known=%v", wants, known)
+	if nb := notebookWantsEncryption(client.NewClient(m.baseURL(), "tok"), ""); !nb.Wants || !nb.Known {
+		t.Fatalf("the default notebook on page 1 was not found: wants=%v known=%v", nb.Wants, nb.Known)
 	}
 	if len(m.calls()) != 1 {
 		t.Errorf("kept paging after finding the default: %v", m.calls())
@@ -604,12 +605,12 @@ func TestANotebookListWithNoDefaultIsUnknownNotANo(t *testing.T) {
 			`"paging":{"limit":500,"offset":0,"total":2,"has_more":false}}`},
 	})
 
-	wants, known, _ := notebookWantsEncryption(client.NewClient(m.baseURL(), "tok"), "")
+	nb := notebookWantsEncryption(client.NewClient(m.baseURL(), "tok"), "")
 
-	if known {
+	if nb.Known {
 		t.Error("no default notebook was ever read, and the lookup answered as though one had been")
 	}
-	if wants {
+	if nb.Wants {
 		t.Error("nothing established that the destination encrypts, so the answer cannot be yes")
 	}
 

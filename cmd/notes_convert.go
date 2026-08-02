@@ -194,7 +194,30 @@ func readNoteForConversion(c *client.Client, noteID string) (map[string]any, err
 // means the note is already encrypted and there is nothing to do — not an error,
 // because a sweep re-run over a half-fixed notebook must be able to say so
 // without failing.
-func planEncrypt(c *client.Client, key []byte, noteID string) (map[string]any, error) {
+//
+// THIS IS THE ONLY PLACE PLAINTEXT BECOMES CIPHERTEXT IN PLACE. `notes encrypt`
+// and the sealed move in cmd/notes_move.go both come through here, and that is a
+// requirement rather than a tidiness: the web reference forked this step for its
+// move path and the two copies disagreed — on the already-encrypted recheck and
+// on what a post-commit failure means — inside a single pull request
+// (app.harbor.my#1267, D3). A fork here would have to re-derive the server-
+// authoritative recheck above, the seal-then-open check, and the compare-and-set,
+// and the way that goes wrong is that it re-derives two of the three.
+//
+// THE RE-READ ABOVE IS LOAD-BEARING AND MUST STAY. The caller's copy of the note
+// is a fast path and nothing more; the note this seals is the one the SERVER has
+// right now. Sealing a note another device has already sealed since the caller
+// last looked would wrap ciphertext in a second envelope — a note that decrypts
+// once into more ciphertext — which is exactly the bug the reference shipped and
+// then fixed (commit 117a377).
+//
+// replace, when non-nil, supplies plaintext to seal INSTEAD of what the note
+// currently holds, for the case where one command both edits and seals a note
+// (`notes update --title X --notebook <an encrypting notebook>`). Only "title"
+// and "content" are read from it. Without this the command would have to seal the
+// stored text and then send the user's new text alongside it in the clear, which
+// is not an update and not an encryption.
+func planEncrypt(c *client.Client, key []byte, noteID string, replace map[string]any) (map[string]any, error) {
 	note, err := readNoteForConversion(c, noteID)
 	if err != nil {
 		return nil, err
@@ -208,17 +231,31 @@ func planEncrypt(c *client.Client, key []byte, noteID string) (map[string]any, e
 
 	// An encrypted note may have an EMPTY title (the server's
 	// validateEncryptedFields allows it) but never a plaintext one, so an empty
-	// title is left alone and anything else is sealed.
-	if title := str(note, "title"); title != "" {
+	// title is left alone and anything else is sealed. An empty title the CALLER
+	// asked for is different from one the note already had: it has to be sent, or
+	// the note keeps its old plaintext title under an is_encrypted flag and the
+	// server refuses the whole write.
+	title, retitled := replaceField(replace, "title")
+	if !retitled {
+		title = str(note, "title")
+	}
+	switch {
+	case title != "":
 		sealed, serr := sealAndVerify(key, noteID, "title", title)
 		if serr != nil {
 			return nil, serr
 		}
 		body["title"] = sealed
+	case retitled:
+		body["title"] = ""
 	}
 	// Content is sealed unconditionally, empty body included: the server requires
 	// a well-formed content envelope on every encrypted note.
-	sealed, err := sealAndVerify(key, noteID, "content", str(note, "content"))
+	content, rewritten := replaceField(replace, "content")
+	if !rewritten {
+		content = str(note, "content")
+	}
+	sealed, err := sealAndVerify(key, noteID, "content", content)
 	if err != nil {
 		return nil, err
 	}
@@ -226,6 +263,20 @@ func planEncrypt(c *client.Client, key []byte, noteID string) (map[string]any, e
 	// No content_format: the server stores an encrypted body verbatim and never
 	// renders it, so a format would be a claim about bytes it will not look at.
 	return body, nil
+}
+
+// replaceField reads one of planEncrypt's replacement fields, reporting whether
+// the caller supplied it at all. Presence and emptiness are different answers
+// here — "" means "clear this field", absent means "keep what the note holds" —
+// so a plain type assertion, which cannot tell a missing key from an empty
+// string, would silently blank a title on every ordinary encrypt.
+func replaceField(replace map[string]any, field string) (string, bool) {
+	v, ok := replace[field]
+	if !ok {
+		return "", false
+	}
+	s, ok := v.(string)
+	return s, ok
 }
 
 // planDecrypt reads an encrypted note and builds the PATCH body that writes it
@@ -243,6 +294,13 @@ func planDecrypt(c *client.Client, key []byte, noteID, format string, allowTaskL
 	}
 	if !boolean(note, "is_encrypted") {
 		return nil, nil
+	}
+	// A note that lives in a notebook whose notes are always encrypted cannot be
+	// opened where it stands, and the refusal comes BEFORE anything is read out of
+	// the envelope. Checked per note rather than once per run because the ids a
+	// user names can be spread across any number of notebooks.
+	if err := guardDecryptInEncryptedNotebook(c, noteID, note); err != nil {
+		return nil, err
 	}
 
 	content := str(note, "content")
@@ -549,9 +607,7 @@ Two things encrypting does NOT do, both worth knowing before you rely on it:
     single row — a coincidence of timing, not a feature, and every older version
     is untouched. Treat anything that was saved in the clear as having been
     stored in the clear.
-  • It does not encrypt the BYTES of attached files. The note's body — including
-    the references to them — becomes ciphertext, but the attachments themselves
-    are stored as they were, and can still be downloaded and read in full.
+` + bulletCaveat(attachmentCaveat) + `
 
 While a note is encrypted the server cannot read it: it is excluded from search,
 and its tasks, links and attachment references stop being reconciled until it is
@@ -577,7 +633,7 @@ decrypted again.`,
 		}
 		sealed := 0
 		err = runConversion(ids, complete, "encrypted", func(id string) (bool, error) {
-			body, perr := planEncrypt(c, key, id)
+			body, perr := planEncrypt(c, key, id, nil)
 			if perr != nil || body == nil {
 				return false, perr
 			}
@@ -694,6 +750,38 @@ func notesConfirmDecrypt(count int, yes bool) error {
 		fmt.Printf("About to decrypt %d %s.\n", count, pluralize(count, "note", "notes"))
 	}
 	return confirmDestructive(notesDecryptConfirmation, jsonOutput, stdinIsInteractive(), yes, askLine)
+}
+
+// attachmentCaveat is what sealing a note does NOT cover, and it lives in one
+// place because two commands have to say it in the same words.
+//
+// `notes encrypt` has always documented it in its help text. The sealed move
+// (cmd/notes_move.go) inherits exactly the same limit and PRINTS it, because
+// there the encryption is a side effect of a command the user ran for another
+// reason — nobody reads `notes update --help` looking for what encryption covers.
+// Two hand-written versions of this sentence would be two versions to keep true;
+// worse, the honest one would be the one nobody was looking at.
+//
+// It is also not a CLI-only apology. Every Harbor client leaves some attachment
+// bytes readable — even the web app, which does re-encrypt them, misses the ones
+// an ENEX import attached (app.harbor.my#1260). So it is worded as the limit it
+// is, and it is not softened.
+const attachmentCaveat = "It does not encrypt the BYTES of attached files. The note's body — including\n" +
+	"the references to them — becomes ciphertext, but the attachments themselves\n" +
+	"are stored as they were, and can still be downloaded and read in full."
+
+// bulletCaveat renders a caveat as one of the "  • " bullets the encrypt help
+// text is built from, indenting its continuation lines to line up under the
+// first. It is what lets the same sentence be both help text and a printed
+// warning without being typed twice.
+func bulletCaveat(s string) string {
+	return "  • " + strings.ReplaceAll(s, "\n", "\n    ")
+}
+
+// printAttachmentCaveat says the attachment limit out loud, on stderr so it
+// cannot corrupt a piped --json stdout.
+func printAttachmentCaveat() {
+	fmt.Fprintln(os.Stderr, dim(attachmentCaveat))
 }
 
 // printHistoryCaveat says what encrypting does NOT do to the plaintext already on
