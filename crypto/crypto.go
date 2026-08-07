@@ -30,6 +30,7 @@
 package crypto
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -304,6 +305,87 @@ func OpenField(masterKey []byte, recordID, fieldName, envelope string) (string, 
 func IsEnvelope(s string) bool {
 	_, _, err := splitEnvelope(s)
 	return err == nil
+}
+
+// BinaryEnvelopeMinBytes is the smallest possible HRBC2 binary envelope: the
+// 5-byte magic, a 12-byte nonce and a 16-byte GCM tag, wrapping zero bytes of
+// plaintext.
+//
+// Exported because sniffing fewer bytes than this makes IsBinaryEnvelope answer
+// false for EVERY input, which silently turns "skip the ones already encrypted"
+// into "skip all of them". That exact bug has shipped on another Harbor client
+// before; read at least this many bytes before sniffing.
+const BinaryEnvelopeMinBytes = len(EnvelopeVersion) + nonceLen + tagLen
+
+// SealBytes encrypts raw bytes into the HRBC2 BINARY envelope used for
+// attachments:
+//
+//	"HRBC2"(5 ASCII) ‖ iv(12) ‖ ciphertext ‖ tag(16)
+//
+// AES-256-GCM under the master key with a fresh random nonce, and — unlike the
+// string envelope used for note fields — **no AAD**. That is not an oversight:
+// web, macOS/iOS, Android and Windows all pass no AAD here, because an
+// attachment's integrity is bound instead by its content address, which the
+// server computes as sha256 over this whole envelope. Adding AAD would make
+// files written here unreadable everywhere else. See crypto/README.md.
+func SealBytes(masterKey, plaintext []byte) ([]byte, error) {
+	nonce := make([]byte, nonceLen)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("generating nonce: %w", err)
+	}
+	return sealBytesWithNonce(masterKey, plaintext, nonce)
+}
+
+// sealBytesWithNonce is SealBytes with the nonce supplied rather than generated,
+// so tests can reproduce the pinned binary known-answer vector byte for byte.
+// Production code must always use SealBytes: reusing a nonce under the same key
+// breaks AES-GCM catastrophically.
+func sealBytesWithNonce(masterKey, plaintext, nonce []byte) ([]byte, error) {
+	if len(nonce) != nonceLen {
+		return nil, fmt.Errorf("nonce must be %d bytes, got %d", nonceLen, len(nonce))
+	}
+	aead, err := newAEAD(masterKey)
+	if err != nil {
+		return nil, err
+	}
+	// Seal appends ciphertext‖tag to the destination, so starting from the magic
+	// plus the nonce builds the whole envelope in one allocation.
+	env := make([]byte, 0, BinaryEnvelopeMinBytes+len(plaintext))
+	env = append(env, EnvelopeVersion...)
+	env = append(env, nonce...)
+	return aead.Seal(env, nonce, plaintext, nil), nil
+}
+
+// OpenBytes reverses SealBytes, returning the original plaintext. It returns
+// ErrNotEnvelope when the input is not structurally an HRBC2 binary envelope
+// (so a caller can tell "this file was never encrypted" apart from "this file
+// will not open"), and ErrDecrypt when authentication fails.
+func OpenBytes(masterKey, envelope []byte) ([]byte, error) {
+	if !IsBinaryEnvelope(envelope) {
+		return nil, ErrNotEnvelope
+	}
+	aead, err := newAEAD(masterKey)
+	if err != nil {
+		return nil, err
+	}
+	magic := len(EnvelopeVersion)
+	nonce := envelope[magic : magic+nonceLen]
+	pt, err := aead.Open(nil, nonce, envelope[magic+nonceLen:], nil)
+	if err != nil {
+		return nil, ErrDecrypt
+	}
+	return pt, nil
+}
+
+// IsBinaryEnvelope reports whether b begins an HRBC2 binary envelope and is long
+// enough to be one. It never decrypts, so a false positive is possible in
+// principle — arbitrary bytes starting with "HRBC2" — but the magic makes that
+// vanishingly unlikely for real files, and OpenBytes fails closed regardless.
+//
+// b may be a prefix of the file rather than the whole of it, but it must be at
+// least BinaryEnvelopeMinBytes long or this returns false for everything.
+func IsBinaryEnvelope(b []byte) bool {
+	return len(b) >= BinaryEnvelopeMinBytes && bytes.HasPrefix(b, []byte(EnvelopeVersion))
 }
 
 // splitEnvelope parses and validates an HRBC2 envelope's structure, returning the

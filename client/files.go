@@ -4,6 +4,7 @@
 package client
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"mime"
@@ -55,6 +56,24 @@ func (c *Client) UploadFile(path, mimeType, filename string, isEncrypted bool) (
 	if mimeType == "" {
 		mimeType = detectMIME(path, f)
 	}
+	return c.uploadMultipart(f, mimeType, filename, isEncrypted)
+}
+
+// UploadBytes uploads content already held in memory. It exists for the
+// client-side-encryption path: the bytes on the wire are the HRBC2 envelope, not
+// what is on disk, so there is no file to stream and the caller has already
+// resolved the MIME type and filename from the original.
+//
+// Those two stay PLAINTEXT on the resource record, matching every other Harbor
+// client — an accepted metadata leak. The server hashes whatever it receives, so
+// the resulting content address covers the ciphertext.
+func (c *Client) UploadBytes(content []byte, mimeType, filename string, isEncrypted bool) ([]byte, error) {
+	return c.uploadMultipart(bytes.NewReader(content), mimeType, filename, isEncrypted)
+}
+
+// uploadMultipart is the shared body of UploadFile and UploadBytes: build the
+// form fields and POST the multipart request.
+func (c *Client) uploadMultipart(content io.Reader, mimeType, filename string, isEncrypted bool) ([]byte, error) {
 	fields := map[string]string{"filename": filename}
 	if mimeType != "" {
 		fields["mime"] = mimeType
@@ -62,7 +81,20 @@ func (c *Client) UploadFile(path, mimeType, filename string, isEncrypted bool) (
 	if isEncrypted {
 		fields["is_encrypted"] = "true"
 	}
-	return c.doMultipart("/files/upload", fields, "file", filename, f)
+	return c.doMultipart("/files/upload", fields, "file", filename, content)
+}
+
+// DetectMIME resolves a path's MIME type exactly as UploadFile would, so a
+// caller that transforms the bytes before upload (client-side encryption) can
+// still record the ORIGINAL type rather than the ciphertext's. Returns "" when
+// it cannot do better than application/octet-stream.
+func DetectMIME(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	return detectMIME(path, f)
 }
 
 // detectMIME guesses a file's MIME type: first by extension (covers png, jpg,

@@ -274,7 +274,16 @@ Content-addressed (sha256) blobs.
 | `harbor files list` | List with linked notes | `--mime`, `--note-id`, `--ocr-status`, `--encrypted`, `--updated-since`, paging |
 | `harbor files get <hash>` | Presigned URL + metadata (no bytes) | |
 | `harbor files check` | Does a blob exist? | `--hash` (+`--size`) or `--file` (hash computed locally) |
-| `harbor files download <hash>` | Download bytes | `--output` (`-` = stdout), `--raw` |
+| `harbor files download <hash>` | Download bytes | `--output` (`-` = stdout), `--raw`, `--ciphertext` |
+
+**Encrypted attachments.** `files upload --encrypted` seals the bytes on this
+machine (HRBC2 binary envelope, master key) before uploading — it needs
+`HARBOR_PASSPHRASE` and refuses rather than uploading in the clear. `files
+download` detects an encrypted blob and decrypts it automatically when the
+passphrase is set; without it the download is refused, and `--ciphertext` writes
+the raw envelope instead. Filename and MIME stay plaintext on the record; the
+stored size is 33 bytes larger than the original, and `files check --file` can
+never match an encrypted upload because the content hash covers the ciphertext.
 
 ---
 

@@ -4,15 +4,19 @@
 package cmd
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
+	"github.com/HarborMyNotes/harbor-cli/config"
+	"github.com/HarborMyNotes/harbor-cli/crypto"
 	"github.com/spf13/cobra"
 )
 
@@ -66,7 +70,14 @@ var filesListCmd = &cobra.Command{
 var filesCheckCmd = &cobra.Command{
 	Use:   "check",
 	Short: "Check whether a blob already exists",
-	Long:  "Check by --hash (and optional --size), or pass --file to compute the sha256 and size locally.",
+	Long: `Check by --hash (and optional --size), or pass --file to compute the sha256 and
+size locally.
+
+--file hashes the file as it sits on disk, so it only answers for uploads that
+were NOT encrypted. An encrypted blob is stored as an HRBC2 envelope and its
+content address covers that ciphertext, which carries a fresh nonce every time —
+so a file uploaded with 'files upload --encrypted' will always report "does not
+exist" here, and encrypted uploads never deduplicate.`,
 	Example: `  harbor files check --hash e3b0c442...b855
   harbor files check --file diagram.png`,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -100,20 +111,83 @@ var filesUploadCmd = &cobra.Command{
 	Use:   "upload <path>",
 	Short: "Upload a file",
 	Args:  cobra.ExactArgs(1),
+	Long: `Upload a file and get back its content-addressed resource record.
+
+With --encrypted the bytes are sealed on this machine before they leave it: the
+file is wrapped in an HRBC2 binary envelope under your master key, and the server
+only ever sees ciphertext. It needs HARBOR_PASSPHRASE and refuses rather than
+uploading anything in the clear.
+
+The filename and MIME type are recorded as they were, in plaintext — the same
+accepted trade every other Harbor client makes, so the file stays recognisable in
+listings. The stored size is the envelope's (33 bytes larger than the original),
+and because the content hash covers the ciphertext, an encrypted upload can never
+deduplicate against an existing blob.`,
 	Example: `  harbor files upload diagram.png
-  harbor files upload report.pdf --mime application/pdf`,
+  harbor files upload report.pdf --mime application/pdf
+  harbor files upload secrets.pdf --encrypted`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, _, err := loadClientFromConfig()
+		c, creds, err := loadClientFromConfig()
 		if err != nil {
 			return err
 		}
-		data, err := c.UploadFile(args[0], stringFlag(cmd, "mime"), stringFlag(cmd, "filename"), boolFlag(cmd, "encrypted"))
+		path, mimeType, filename := args[0], stringFlag(cmd, "mime"), stringFlag(cmd, "filename")
+
+		if !boolFlag(cmd, "encrypted") {
+			data, uerr := c.UploadFile(path, mimeType, filename, false)
+			if uerr != nil {
+				return mapFileError(uerr)
+			}
+			printResult(data, displayResource)
+			return nil
+		}
+
+		// Fail closed: without the key we would otherwise upload the file in the
+		// clear while stamping it is_encrypted, which is worse than not uploading.
+		key, err := filesKey(c, creds)
 		if err != nil {
-			return mapFileError(err)
+			return err
+		}
+		data, err := uploadEncrypted(c, key, path, mimeType, filename)
+		if err != nil {
+			return err
 		}
 		printResult(data, displayResource)
 		return nil
 	},
+}
+
+// uploadEncrypted seals a file on this machine and uploads the envelope, so the
+// server never receives the plaintext.
+//
+// It is a named function rather than inline RunE so a test can point it at a
+// mock server and assert what actually goes on the wire. That matters more here
+// than usual: the bug this replaced was an upload that stamped the resource
+// is_encrypted while sending the file in the clear, and every unit test still
+// passed. Asserting the multipart body carries the envelope and NOT the
+// plaintext is the only check that catches a regression to it.
+func uploadEncrypted(c *client.Client, key []byte, path, mimeType, filename string) ([]byte, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read file: %w", err)
+	}
+	// Resolve both from the ORIGINAL file, before sealing — sniffing the
+	// envelope would record every encrypted upload as octet-stream.
+	if filename == "" {
+		filename = filepath.Base(path)
+	}
+	if mimeType == "" {
+		mimeType = client.DetectMIME(path)
+	}
+	sealed, err := crypto.SealBytes(key, content)
+	if err != nil {
+		return nil, fmt.Errorf("encrypting %s: %w", filepath.Base(path), err)
+	}
+	data, err := c.UploadBytes(sealed, mimeType, filename, true)
+	if err != nil {
+		return nil, mapFileError(err)
+	}
+	return data, nil
 }
 
 // filesGetCmd shows the presigned download URL + basic metadata for a blob.
@@ -141,11 +215,18 @@ var filesDownloadCmd = &cobra.Command{
 	Use:   "download <hash>",
 	Short: "Download a file's bytes",
 	Args:  cobra.ExactArgs(1),
-	Long:  "Download a blob. By default it follows a presigned URL; --raw streams through the API instead. Writes to --output (default: the stored filename, or - for stdout).",
+	Long: `Download a blob. By default it follows a presigned URL; --raw streams through
+the API instead. Writes to --output (default: the stored filename, or - for stdout).
+
+Encrypted files are decrypted automatically when HARBOR_PASSPHRASE is set. When
+it is not, the download is refused rather than writing ciphertext you cannot use
+— pass --ciphertext to write the raw envelope anyway (for backups or moving bytes
+between machines).`,
 	Example: `  harbor files download e3b0... --output diagram.png
-  harbor files download e3b0... --raw --output -`,
+  harbor files download e3b0... --raw --output -
+  harbor files download e3b0... --ciphertext --output sealed.bin`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, _, err := loadClientFromConfig()
+		c, creds, err := loadClientFromConfig()
 		if err != nil {
 			return err
 		}
@@ -184,7 +265,11 @@ var filesDownloadCmd = &cobra.Command{
 		if out == "" {
 			out = suggestedName
 		}
-		n, err := writeOutput(out, body)
+		content, err := decryptDownload(c, creds, body, boolFlag(cmd, "ciphertext"))
+		if err != nil {
+			return err
+		}
+		n, err := writeOutput(out, content)
 		if err != nil {
 			return err
 		}
@@ -193,6 +278,91 @@ var filesDownloadCmd = &cobra.Command{
 		}
 		return nil
 	},
+}
+
+// filesKey unlocks the master key for an encrypted upload, turning the two
+// sentinel unlock failures into actionable refusals. It fails closed on purpose:
+// the alternative is uploading a file in the clear while stamping the resource
+// is_encrypted, which leaves the user believing a plaintext blob is sealed.
+func filesKey(c *client.Client, creds *config.Credentials) ([]byte, error) {
+	key, err := unlockMasterKey(c, creds)
+	if err == nil {
+		return key, nil
+	}
+	switch {
+	case errors.Is(err, errPassphraseNotSet):
+		return nil, fmt.Errorf("--encrypted needs your encryption passphrase and %s is not set, so nothing was uploaded.\n\n"+
+			"  export %s=$(op read \"op://Vault/Harbor/passphrase\")\n\n"+
+			"Uploading anyway would put the file on the server in the clear while marking it encrypted",
+			passphraseEnv, passphraseEnv)
+	case errors.Is(err, errNoKeystore):
+		return nil, errors.New("this account has no encryption keys yet, so nothing was uploaded — run 'harbor crypto setup' first (or 'harbor crypto sync' if you set them up on another device)")
+	}
+	return nil, fmt.Errorf("could not unlock encryption, so nothing was uploaded: %w", err)
+}
+
+// decryptDownload transparently unwraps an encrypted blob on its way to disk.
+//
+// It sniffs the leading bytes for the HRBC2 binary magic rather than trusting
+// resource metadata, because the presigned-download path returns no is_encrypted
+// field — and sniffing is what the other clients do too. A plaintext blob is
+// passed straight through as a stream, so ordinary downloads keep their memory
+// profile; only an envelope is buffered, which AES-GCM requires anyway since the
+// authentication tag lives at the end.
+//
+// With no passphrase it REFUSES rather than writing ciphertext into a file the
+// user will think is their document. That matches web and macOS/iOS, which both
+// decline to hand over bytes they cannot read. Android and Windows still have
+// surfaces that pass the raw envelope through (Android opens the presigned URL
+// in a browser; Windows' in-note save path writes ciphertext even when
+// unlocked) — those are bugs on those clients, not a different design, so
+// refusing here is the parity-correct behaviour rather than a deviation.
+// wantCiphertext is the explicit opt-out for backups and moving bytes between
+// machines.
+func decryptDownload(c *client.Client, creds *config.Credentials, body io.Reader, wantCiphertext bool) (io.Reader, error) {
+	head := make([]byte, crypto.BinaryEnvelopeMinBytes)
+	n, err := io.ReadFull(body, head)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return nil, err
+	}
+	head = head[:n]
+	rest := io.MultiReader(bytes.NewReader(head), body)
+
+	if !crypto.IsBinaryEnvelope(head) {
+		return rest, nil
+	}
+	if wantCiphertext {
+		fmt.Fprintln(os.Stderr, dim("This file is encrypted; writing the raw envelope as asked (--ciphertext)."))
+		return rest, nil
+	}
+
+	key, err := unlockMasterKey(c, creds)
+	if err != nil {
+		switch {
+		case errors.Is(err, errPassphraseNotSet):
+			return nil, fmt.Errorf("this file is encrypted and %s is not set, so nothing was written.\n\n"+
+				"  export %s=$(op read \"op://Vault/Harbor/passphrase\")\n\n"+
+				"Re-run with --ciphertext to write the sealed bytes instead",
+				passphraseEnv, passphraseEnv)
+		case errors.Is(err, errNoKeystore):
+			return nil, errors.New("this file is encrypted but this account has no encryption keys cached — run 'harbor crypto sync' first, or re-run with --ciphertext to write the sealed bytes")
+		}
+		return nil, fmt.Errorf("this file is encrypted and the key could not be unlocked, so nothing was written: %w", err)
+	}
+
+	sealed, err := io.ReadAll(rest)
+	if err != nil {
+		return nil, err
+	}
+	plain, err := crypto.OpenBytes(key, sealed)
+	if err != nil {
+		// Also reachable for a plaintext file that happens to begin with the
+		// ASCII bytes "HRBC2" — magic-sniffing cannot tell those apart, so name
+		// the escape hatch rather than insisting the key is wrong.
+		return nil, fmt.Errorf("this file did not decrypt with your key, so nothing was written "+
+			"(if it was never encrypted, re-run with --ciphertext to write it as stored): %w", err)
+	}
+	return bytes.NewReader(plain), nil
 }
 
 // mapFileError gives friendly messages for file-specific codes.
@@ -351,10 +521,11 @@ func init() {
 
 	filesUploadCmd.Flags().String("mime", "", "MIME type (server sniffs when omitted)")
 	filesUploadCmd.Flags().String("filename", "", "Stored filename (defaults to the base name)")
-	filesUploadCmd.Flags().Bool("encrypted", false, "Mark the upload as client-encrypted (opaque bytes)")
+	filesUploadCmd.Flags().Bool("encrypted", false, "Encrypt the bytes on this machine before uploading (requires HARBOR_PASSPHRASE)")
 
 	filesDownloadCmd.Flags().String("output", "", "Output path, or - for stdout (default: the stored filename)")
 	filesDownloadCmd.Flags().Bool("raw", false, "Stream through the API instead of following a presigned URL")
+	filesDownloadCmd.Flags().Bool("ciphertext", false, "Write an encrypted file's raw envelope instead of decrypting it")
 
 	filesCmd.AddCommand(filesListCmd, filesCheckCmd, filesUploadCmd, filesGetCmd, filesDownloadCmd)
 	rootCmd.AddCommand(filesCmd)
