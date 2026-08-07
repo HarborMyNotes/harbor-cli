@@ -736,8 +736,14 @@ func TestVersionFromBuildInfo(t *testing.T) {
 		"":                                      devVersion,
 		"(devel)":                               devVersion,
 		"v0.1.31-0.20260807051754-b683a4a261ad": devVersion, // untagged commit
-		"v0.1.31-0.20260807051754-b683a4a261ad+dirty": devVersion, // modified tree
+		"v0.1.31-0.20260807051754-b683a4a261ad+dirty": devVersion, // untagged + modified
 		"v0.0.0-20260807051754-b683a4a261ad":          devVersion, // never-tagged module
+		// A clean TAG with a dirty tree. There is no pseudo-version component
+		// here, so the regex never sees it and only the +dirty check catches it
+		// — which is why this case has to exist: without it, deleting that check
+		// left the suite green while a maintainer with a modified tree at a
+		// release tag would report "v0.1.30+dirty", a number nobody can install.
+		"v0.1.30+dirty": devVersion,
 	}
 	for in, want := range cases {
 		if got := versionFromBuildInfo(in); got != want {
@@ -806,6 +812,27 @@ func TestVersionFallbackIsReached(t *testing.T) {
 	readBuildInfo = fake("v0.1.27")
 	if got := resolveVersion(); got != "v0.1.27" {
 		t.Errorf("resolveVersion() = %q, want v0.1.27 — it does not use the build-info fallback", got)
+	}
+}
+
+// TestSupportBundleReportsTheResolvedVersion covers the wiring behaviourally
+// rather than by grep.
+//
+// The support bundle exists for triage, so it is the worst place for the version
+// to disagree with --version: under `go install` it would report "dev" while the
+// same binary's --version reported the real tag. The source check below cannot
+// see a call site that is renamed or moved, so this drives the real function
+// with the reader swapped.
+func TestSupportBundleReportsTheResolvedVersion(t *testing.T) {
+	origVersion, origReader := version, readBuildInfo
+	t.Cleanup(func() { version, readBuildInfo = origVersion, origReader })
+	version = devVersion
+	readBuildInfo = func() (*debug.BuildInfo, bool) {
+		return &debug.BuildInfo{Main: debug.Module{Version: "v0.1.27"}}, true
+	}
+
+	if got := supportMetadata()["app_version"]; got != "v0.1.27" {
+		t.Errorf("support bundle app_version = %v, want v0.1.27 — it reads the raw variable, so a go-install build reports \"dev\" for triage", got)
 	}
 }
 

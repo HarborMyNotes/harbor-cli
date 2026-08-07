@@ -63,7 +63,10 @@ var version = devVersion
 //     synthesizes for a commit that is not a release tag. It looks like a
 //     version and is not one, so passing it through would put a number nobody
 //     can install into bug reports;
-//   - the same with a "+dirty" suffix, from a modified working tree.
+//   - a "+dirty" suffix, from a modified working tree. This is its OWN shape,
+//     not a variant of the one above: a dirty tree at a clean release tag
+//     stamps "v0.1.30+dirty", which has no pseudo-version component at all, so
+//     the regex never sees it and only the suffix check catches it.
 //
 // Only a real tag is reported, which is what `go install pkg@vX.Y.Z` embeds.
 // A "+incompatible" tag would pass through verbatim; that is unreachable while
