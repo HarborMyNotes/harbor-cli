@@ -332,7 +332,7 @@ func installSkillTarget(tgt skillTarget, force bool, now time.Time) (skillInstal
 // otherwise any existing directory is renamed to a timestamped backup before the
 // fresh files are written.
 func installSkillDir(dest string, force bool, now time.Time) (skillInstallResult, error) {
-	res := skillInstallResult{Path: dest, SkillVersion: skillVersion, CLIVersion: version}
+	res := skillInstallResult{Path: dest, SkillVersion: skillVersion, CLIVersion: resolveVersion()}
 
 	current, err := skillDirUpToDate(dest)
 	if err != nil {
@@ -374,7 +374,7 @@ func installSkillInto(root string, force bool, now time.Time) (skillInstallResul
 // own. An existing file is renamed to a backup before the fresh content is
 // written; identical content is a no-op unless force.
 func installSingleDoc(path string, force bool, now time.Time) (skillInstallResult, error) {
-	res := skillInstallResult{Path: path, SkillVersion: skillVersion, CLIVersion: version}
+	res := skillInstallResult{Path: path, SkillVersion: skillVersion, CLIVersion: resolveVersion()}
 
 	content, err := renderCursorRule()
 	if err != nil {
@@ -412,7 +412,7 @@ func installSingleDoc(path string, force bool, now time.Time) (skillInstallResul
 // preserving the rest of the file. The prior file (if any) is copied to a backup
 // before the new content is written; an unchanged result is a no-op unless force.
 func installManagedDoc(path string, force bool, now time.Time) (skillInstallResult, error) {
-	res := skillInstallResult{Path: path, SkillVersion: skillVersion, CLIVersion: version}
+	res := skillInstallResult{Path: path, SkillVersion: skillVersion, CLIVersion: resolveVersion()}
 
 	block, err := renderCodexBlock()
 	if err != nil {

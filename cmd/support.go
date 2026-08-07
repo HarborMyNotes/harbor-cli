@@ -352,7 +352,7 @@ func attachmentMIME(path string, data []byte) string {
 // omitted. Field names follow the shared Contact Support metadata contract.
 func supportMetadata() map[string]any {
 	meta := map[string]any{
-		"app_version":  version,           // CLI version (ldflags), "dev" locally
+		"app_version":  resolveVersion(),  // ldflags, else the go-install tag, else "dev"
 		"app_build":    runtime.Version(), // Go toolchain the binary was built with
 		"os":           runtime.GOOS,      // darwin / linux / windows
 		"device_model": runtime.GOARCH,    // amd64 / arm64 — the CLI's "device"

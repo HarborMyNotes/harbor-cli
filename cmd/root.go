@@ -13,6 +13,8 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"regexp"
+	"runtime/debug"
 	"strings"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
@@ -34,10 +36,86 @@ var (
 	apiURLFlag string
 )
 
+// devVersion is the sentinel a build carries when nothing injected a version.
+const devVersion = "dev"
+
 // version is the CLI version, injected at build time via
 // -ldflags "-X github.com/HarborMyNotes/harbor-cli/cmd.version=vX.Y.Z".
-// It defaults to "dev" for local builds.
-var version = "dev"
+// It defaults to devVersion for local builds; resolveVersion recovers the real
+// one for a `go install` build, which does no injection.
+var version = devVersion
+
+// resolveVersion returns the version to report.
+//
+// The ldflags value wins whenever it is set, so a release binary reports exactly
+// what the workflow stamped and this function changes nothing about it.
+//
+// The fallback exists for `go install github.com/HarborMyNotes/harbor-cli@latest`
+// — a documented install route that does no ldflags injection, so it used to
+// report "dev" no matter which tag you asked for. Go embeds the module version
+// in the binary, so it can simply be read back.
+//
+// A local build is reported as "dev" rather than passed through, and there are
+// three shapes of that — which is more than it looks:
+//
+//   - "(devel)", from a build with no VCS stamping;
+//   - a PSEUDO-VERSION like v0.1.31-0.20260807051754-b683a4a261ad, which Go
+//     synthesizes for a commit that is not a release tag. It looks like a
+//     version and is not one, so passing it through would put a number nobody
+//     can install into bug reports;
+//   - a "+dirty" suffix, from a modified working tree. This is its OWN shape,
+//     not a variant of the one above: a dirty tree at a clean release tag
+//     stamps "v0.1.30+dirty", which has no pseudo-version component at all, so
+//     the regex never sees it and only the suffix check catches it.
+//
+// Only a real tag is reported, which is what `go install pkg@vX.Y.Z` embeds.
+// A "+incompatible" tag would pass through verbatim; that is unreachable while
+// this module is v0/v1, and worth revisiting if it ever goes v2.
+// One consequence worth knowing: a `go build` at a CLEAN checkout of an exact
+// release tag reports that tag rather than "dev", because that is genuinely what
+// Go stamps. The common local case — an untagged or dirty tree — still reads
+// "dev".
+func resolveVersion() string {
+	return resolveVersionFrom(version, readBuildInfo)
+}
+
+// readBuildInfo is debug.ReadBuildInfo as a variable so a test can substitute
+// it. Grepping the source for the call is not a substitute: it passes just as
+// happily once the call is gone. Swapping this variable is what lets a test
+// prove the fallback is actually reached from resolveVersion, rather than only
+// that it computes the right answer when called directly.
+var readBuildInfo = debug.ReadBuildInfo
+
+// resolveVersionFrom is resolveVersion with both inputs supplied: the injected
+// version and the build-info reader. Splitting it out is what lets a test prove
+// the fallback is actually REACHED, rather than merely that it computes the
+// right answer when called directly.
+func resolveVersionFrom(injected string, read func() (*debug.BuildInfo, bool)) string {
+	if injected != devVersion {
+		return injected
+	}
+	info, ok := read()
+	if !ok || info == nil {
+		return devVersion
+	}
+	return versionFromBuildInfo(info.Main.Version)
+}
+
+// versionFromBuildInfo decides whether an embedded module version is a real
+// release tag worth reporting, or a local build that should read "dev". It is
+// split out from resolveVersion so every shape can be tested directly rather
+// than by building binaries.
+func versionFromBuildInfo(v string) string {
+	if v == "" || v == "(devel)" || strings.HasSuffix(v, "+dirty") || pseudoVersionRe.MatchString(v) {
+		return devVersion
+	}
+	return v
+}
+
+// pseudoVersionRe matches the timestamp-and-hash core Go puts in every
+// pseudo-version (yyyymmddhhmmss-<12 hex>), which is what separates "built from
+// some commit" from "installed from a release tag".
+var pseudoVersionRe = regexp.MustCompile(`[0-9]{14}-[0-9a-f]{12}`)
 
 // Command group annotations, so `harbor --help` clusters related commands.
 const (
@@ -70,7 +148,7 @@ Get started:
 Credentials are stored in ~/.config/harbor/credentials.json (0600) as a
 non-expiring token, so you stay signed in. Set HARBOR_TOKEN to use a token for a
 single command without logging in. Every command honors --json.`,
-	Version:       version,
+	Version:       resolveVersion(),
 	SilenceErrors: true, // we render errors ourselves in Execute
 	SilenceUsage:  true,
 }
@@ -144,6 +222,13 @@ func prepareCommandTree() {
 	rootCmd.InitDefaultHelpCmd()
 	rootCmd.InitDefaultCompletionCmd(os.Args[1:]...)
 	enforceArgContract(rootCmd)
+	// Re-assert the version here, not only in the struct literal, so that what
+	// `--version` prints is guarded by BEHAVIOUR rather than by a test grepping
+	// the literal. The grep is alignment-dependent: add a longer field to the
+	// literal, gofmt re-aligns it, and the grepped string silently matches
+	// nothing — after which a revert to the raw variable goes unnoticed.
+	// Idempotent like the rest of this function.
+	rootCmd.Version = resolveVersion()
 }
 
 // enforceArgContract walks the command tree and closes the two ways a command

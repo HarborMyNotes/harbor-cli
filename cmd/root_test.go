@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"testing"
 
@@ -714,5 +715,162 @@ func TestSavedSessionIsStillCached(t *testing.T) {
 	}
 	if saved["user_id"] != "u1" {
 		t.Errorf("a saved session no longer caches its resolved user id:\n%s", body)
+	}
+}
+
+// TestVersionFromBuildInfo pins which embedded module versions are real releases
+// worth reporting and which are local builds.
+//
+// The distinction is not obvious: a plain `go build` in this repo does NOT embed
+// "(devel)" — because the tree has release tags, Go synthesizes a PSEUDO-VERSION
+// like v0.1.31-0.20260807051754-b683a4a261ad, which looks like a version and is
+// not one. Reporting it would put a number nobody can install into bug reports.
+func TestVersionFromBuildInfo(t *testing.T) {
+	cases := map[string]string{
+		// Real release tags — what `go install pkg@vX.Y.Z` embeds.
+		"v0.1.27":    "v0.1.27",
+		"v1.0.0":     "v1.0.0",
+		"v0.2.0-rc1": "v0.2.0-rc1",
+
+		// Local builds, in every shape they come in.
+		"":                                      devVersion,
+		"(devel)":                               devVersion,
+		"v0.1.31-0.20260807051754-b683a4a261ad": devVersion, // untagged commit
+		"v0.1.31-0.20260807051754-b683a4a261ad+dirty": devVersion, // untagged + modified
+		"v0.0.0-20260807051754-b683a4a261ad":          devVersion, // never-tagged module
+		// A clean TAG with a dirty tree. There is no pseudo-version component
+		// here, so the regex never sees it and only the +dirty check catches it
+		// — which is why this case has to exist: without it, deleting that check
+		// left the suite green while a maintainer with a modified tree at a
+		// release tag would report "v0.1.30+dirty", a number nobody can install.
+		"v0.1.30+dirty": devVersion,
+	}
+	for in, want := range cases {
+		if got := versionFromBuildInfo(in); got != want {
+			t.Errorf("versionFromBuildInfo(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestResolveVersionPrefersLdflags proves the injected value always wins, so a
+// release binary reports exactly what the workflow stamped and the build-info
+// fallback cannot change it.
+func TestResolveVersionPrefersLdflags(t *testing.T) {
+	original := version
+	t.Cleanup(func() { version = original })
+
+	version = "v9.9.9"
+	if got := resolveVersion(); got != "v9.9.9" {
+		t.Errorf("resolveVersion() = %q, want the injected v9.9.9", got)
+	}
+}
+
+// TestVersionFallbackIsReached proves the build-info fallback is actually WIRED,
+// not merely correct when called directly.
+//
+// The gap was real and took three attempts to close, each time one level up:
+// reverting cobra's Version field, then gutting resolveVersionFrom's fallback,
+// then gutting resolveVersion itself — every one of them left the suite green
+// while `go install` silently regressed to reporting "dev". A grep for the call
+// is no better than none, since it passes once the call is gone. So the reader
+// is a seam, driven here both as a parameter and by swapping the package
+// variable, which is the only way the production entry point is covered.
+func TestVersionFallbackIsReached(t *testing.T) {
+	fake := func(v string) func() (*debug.BuildInfo, bool) {
+		return func() (*debug.BuildInfo, bool) {
+			return &debug.BuildInfo{Main: debug.Module{Version: v}}, true
+		}
+	}
+
+	// Nothing injected: the answer must come from build info.
+	if got := resolveVersionFrom(devVersion, fake("v0.1.27")); got != "v0.1.27" {
+		t.Errorf("with no ldflags, resolveVersionFrom = %q, want the go-install tag v0.1.27", got)
+	}
+	// Injected: build info must be ignored entirely, so a release binary reports
+	// exactly what the workflow stamped.
+	if got := resolveVersionFrom("v9.9.9", fake("v0.1.27")); got != "v9.9.9" {
+		t.Errorf("ldflags did not win: %q", got)
+	}
+	// A local build still reads "dev" through the real path, not just the helper.
+	if got := resolveVersionFrom(devVersion, fake("v0.1.31-0.20260807051754-b683a4a261ad")); got != devVersion {
+		t.Errorf("a pseudo-version leaked through the wired path: %q", got)
+	}
+	// No build info at all (a stripped or non-module binary).
+	if got := resolveVersionFrom(devVersion, func() (*debug.BuildInfo, bool) { return nil, false }); got != devVersion {
+		t.Errorf("missing build info should read %q, got %q", devVersion, got)
+	}
+	// And the PRODUCTION entry point goes through the seam. This is the
+	// assertion two earlier attempts got wrong: comparing resolveVersion()
+	// against resolveVersionFrom(version, readBuildInfo) is a tautology, because
+	// in a test binary both sides evaluate to "dev" no matter what the function
+	// does. Swap the package-level reader instead, so gutting resolveVersion to
+	// `return version` — which regresses go install and every other surface —
+	// actually fails.
+	origVersion, origReader := version, readBuildInfo
+	t.Cleanup(func() { version, readBuildInfo = origVersion, origReader })
+	version = devVersion
+	readBuildInfo = fake("v0.1.27")
+	if got := resolveVersion(); got != "v0.1.27" {
+		t.Errorf("resolveVersion() = %q, want v0.1.27 — it does not use the build-info fallback", got)
+	}
+}
+
+// TestSupportBundleReportsTheResolvedVersion covers the wiring behaviourally
+// rather than by grep.
+//
+// The support bundle exists for triage, so it is the worst place for the version
+// to disagree with --version: under `go install` it would report "dev" while the
+// same binary's --version reported the real tag. The source check below cannot
+// see a call site that is renamed or moved, so this drives the real function
+// with the reader swapped.
+func TestSupportBundleReportsTheResolvedVersion(t *testing.T) {
+	origVersion, origReader := version, readBuildInfo
+	t.Cleanup(func() { version, readBuildInfo = origVersion, origReader })
+	version = devVersion
+	readBuildInfo = func() (*debug.BuildInfo, bool) {
+		return &debug.BuildInfo{Main: debug.Module{Version: "v0.1.27"}}, true
+	}
+
+	if got := supportMetadata()["app_version"]; got != "v0.1.27" {
+		t.Errorf("support bundle app_version = %v, want v0.1.27 — it reads the raw variable, so a go-install build reports \"dev\" for triage", got)
+	}
+}
+
+// TestVersionIsWiredEverywhere pins that every surface reports the SAME version.
+//
+// The failure mode is a new call site reading the raw variable — under
+// `go install` that surface reports "dev" while --version reports the real tag.
+// Support metadata exists for triage, so it is the worst place for the two to
+// disagree. A source check is the only thing that catches a call site nothing
+// else exercises; it is exact-string and covers the three files that surface a
+// version today, so treat it as a guard, not a proof.
+func TestVersionIsWiredEverywhere(t *testing.T) {
+	// Behavioural, not a comparison of two expressions that are equal by
+	// construction: with the reader swapped, what --version would print must be
+	// the fake's tag. `rootCmd.Version != resolveVersion()` reads like a check
+	// and is not one — in a test binary both sides are "dev" regardless.
+	origVersion, origReader, origCobra := version, readBuildInfo, rootCmd.Version
+	t.Cleanup(func() {
+		version, readBuildInfo, rootCmd.Version = origVersion, origReader, origCobra
+	})
+	version = devVersion
+	readBuildInfo = func() (*debug.BuildInfo, bool) {
+		return &debug.BuildInfo{Main: debug.Module{Version: "v0.1.27"}}, true
+	}
+	prepareCommandTree()
+	if rootCmd.Version != "v0.1.27" {
+		t.Errorf("--version would print %q, want v0.1.27 — cobra bypasses the resolver", rootCmd.Version)
+	}
+
+	for _, f := range []string{"support.go", "skill.go", "root.go"} {
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, bad := range []string{"CLIVersion: version", `"app_version":  version`, "Version:       version,"} {
+			if strings.Contains(string(src), bad) {
+				t.Errorf("%s surfaces the raw version variable (%q) instead of resolveVersion(), so it reports \"dev\" under go install", f, bad)
+			}
+		}
 	}
 }

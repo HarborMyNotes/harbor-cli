@@ -57,6 +57,22 @@ jobs:
           echo "Next version: $NEXT_VERSION"
           echo "version=$NEXT_VERSION" >> "$GITHUB_OUTPUT"
 
+      # ---------------------------------------------------------------------
+      # THE FIVE ASSET NAMES BELOW ARE A PUBLIC CONTRACT. Renaming one does not
+      # break this build — it breaks whatever downloads the old name, which only
+      # surfaces as user reports days later. Update every consumer in the SAME
+      # change.
+      #
+      # Consumers, as of this writing:
+      #   - Formula/harbor.rb    downloads named assets (the four non-Windows
+      #                          ones). It does NOT yet pin a
+      #                          sha256; issue #85 moves it to a real tap and
+      #                          adds that pin, which is what checksums.txt is
+      #                          groundwork for.
+      #   - harbor.my/install.sh does not exist yet (harbor.my#49). It is
+      #                          specified to fetch checksums.txt and verify the
+      #                          binary against it.
+      # ---------------------------------------------------------------------
       - name: Build binaries
         run: |
           VERSION=${{ steps.version.outputs.version }}
@@ -67,6 +83,34 @@ jobs:
           GOOS=linux   GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/harbor-linux-amd64 .
           GOOS=linux   GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/harbor-linux-arm64 .
           GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/harbor-windows-amd64.exe .
+
+      # Publishes a SHA-256 manifest so a download can be verified. Nothing
+      # consumes it yet — it is the prerequisite for the tap's sha256 pin (#85)
+      # and for install.sh (harbor.my#49), neither of which can verify a
+      # download until this file exists.
+      - name: Generate checksums
+        run: |
+          cd dist
+          # Bare filenames, no dist/ prefix, so `sha256sum -c checksums.txt`
+          # works from a directory of downloaded release assets.
+          #
+          # The glob is `harbor-*`, NOT `*`. Expansion precedes redirection, so a
+          # bare `*` is fine on a FIRST run — but on any run where checksums.txt
+          # already exists it lists that file in its own manifest, which then
+          # fails `-c`. A fresh runner means it cannot happen here; `harbor-*` is
+          # simply the glob that stays correct anywhere, and it says what it
+          # means.
+          #
+          # It is also narrower than the `files: dist/*` upload below: an asset
+          # not named harbor-* would be published WITHOUT a checksum. Add it here
+          # too if that ever happens.
+          sha256sum harbor-* > checksums.txt
+          echo "--- checksums.txt ---"
+          cat checksums.txt
+          # A cheap self-check, not a security guarantee: it re-hashes the same
+          # files seconds later on the same disk, so only a truncated write or
+          # bad hardware makes it fail. It does NOT verify the uploaded assets.
+          sha256sum -c checksums.txt
 
       - name: Create tag
         run: |
@@ -97,4 +141,9 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/harbor.rb
           git commit -m "Update Homebrew formula to ${VERSION}"
+          # This push MUST use the default GITHUB_TOKEN. A push authenticated by
+          # that token does not trigger workflows, which is the only thing
+          # stopping this commit from starting another release — and so on
+          # forever. Switching to a PAT or a deploy key here creates an infinite
+          # release loop that burns a version number every few minutes.
           git push origin main
