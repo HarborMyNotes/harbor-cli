@@ -4,6 +4,8 @@
 package cmd
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,10 +14,12 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
+	"github.com/HarborMyNotes/harbor-cli/config"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -540,5 +544,175 @@ func TestPreparingTheCommandTreeTwiceChangesNothing(t *testing.T) {
 	}
 	if firstErr == nil || !strings.Contains(firstErr.Error(), "Did you mean this?") {
 		t.Errorf("an unknown subcommand should still suggest the real one: %v", firstErr)
+	}
+}
+
+// TestEnvDeviceIDIsStableAndSecret pins the three properties a derived device id
+// must have: the same token always yields the same device (a fresh id per run
+// would register a new device on every CI job and hold back the sync GC floor),
+// different tokens yield different devices, and no part of the token survives
+// into the id that is sent to the server on every push.
+func TestEnvDeviceIDIsStableAndSecret(t *testing.T) {
+	const token = "hbp_super-secret-token-value-not-real"
+
+	first, second := envDeviceID(token), envDeviceID(token)
+	if first != second {
+		t.Fatalf("not stable across calls: %q vs %q", first, second)
+	}
+	if other := envDeviceID(token + "x"); other == first {
+		t.Error("two different tokens produced the same device id")
+	}
+	if !strings.HasPrefix(first, "cli-env-") {
+		t.Errorf("device id = %q, want a cli-env- prefix so it is recognisable in the device list", first)
+	}
+	// The id is hex, so a substring check for the token can never fire and would
+	// assert nothing. Prove the real property instead: it is exactly the
+	// truncated digest, which is one-way.
+	sum := sha256.Sum256([]byte(token))
+	if want := "cli-env-" + hex.EncodeToString(sum[:])[:12]; first != want {
+		t.Errorf("device id = %q, want the truncated sha256 %q", first, want)
+	}
+	// Long enough not to collide, short enough to read in a device list.
+	if got := len(first); got != len("cli-env-")+12 {
+		t.Errorf("device id length = %d, want %d", got, len("cli-env-")+12)
+	}
+}
+
+// TestEnvTokenSessionCarriesADeviceID is the regression guard for the half of
+// #88 that made 'harbor crypto setup' unusable headlessly: the synthesized
+// credentials had no device, and sync/push rejects an empty one — so encryption
+// could not be set up in CI at all.
+func TestEnvTokenSessionCarriesADeviceID(t *testing.T) {
+	t.Setenv("HARBOR_TOKEN", "hbp_test-token")
+	t.Setenv("HARBOR_API_URL", "https://example.invalid/api/v1")
+	t.Setenv("HOME", t.TempDir())
+
+	_, creds, err := loadClientFromConfig()
+	if err != nil {
+		t.Fatalf("loadClientFromConfig: %v", err)
+	}
+	if creds.DeviceID == "" {
+		t.Fatal("a HARBOR_TOKEN session has no device id — sync/push will reject every write")
+	}
+	if creds.DeviceName == "" {
+		t.Error("a HARBOR_TOKEN session has no device name, so it is anonymous in the device list")
+	}
+	if creds.AccessToken != "hbp_test-token" {
+		t.Errorf("access token = %q", creds.AccessToken)
+	}
+}
+
+// TestEnvTokenSessionMatchesWhoami pins that whoami and the client loader agree
+// about what a token session is. They are two code paths over one concept, and
+// the bug in #88 was precisely that they disagreed.
+func TestEnvTokenSessionMatchesWhoami(t *testing.T) {
+	t.Setenv("HARBOR_TOKEN", "hbp_test-token")
+	t.Setenv("HARBOR_API_URL", "https://example.invalid/api/v1")
+	t.Setenv("HOME", t.TempDir())
+
+	_, loaded, err := loadClientFromConfig()
+	if err != nil {
+		t.Fatalf("loadClientFromConfig: %v", err)
+	}
+	seen, ok := envTokenSession()
+	if !ok {
+		t.Fatal("envTokenSession did not see HARBOR_TOKEN")
+	}
+	if seen.DeviceID != loaded.DeviceID || seen.AccessToken != loaded.AccessToken || seen.BaseURL() != loaded.BaseURL() {
+		t.Errorf("whoami and the client loader disagree about the session:\n whoami: %+v\n loader: %+v", seen, loaded)
+	}
+
+	// And with no token set, it must not claim a session exists.
+	t.Setenv("HARBOR_TOKEN", "")
+	if _, ok := envTokenSession(); ok {
+		t.Error("envTokenSession reported a session with HARBOR_TOKEN unset")
+	}
+}
+
+// TestEnvTokenSessionIsNeverPersisted pins HARBOR_TOKEN's own promise: the token
+// is used "for this process only: never persisted".
+//
+// Two callers opportunistically cache a resolved user id back to disk. For a
+// synthesized env session that wrote a credentials.json containing the bearer
+// token — so a headless 'crypto setup' on a persistent CI runner left a working
+// standing session behind, outliving the environment variable that authorized
+// it. Found end-to-end while verifying #88.
+//
+// It drives the REAL resolvers rather than calling cacheCredentials directly.
+// Testing the helper alone passes even when a call site goes back to a bare
+// config.Save, which is the mistake that put the token on disk in the first
+// place — the leak was never in the helper.
+func TestEnvTokenSessionIsNeverPersisted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"u1","email":"you@example.com"}`))
+	}))
+	defer srv.Close()
+
+	resolvers := map[string]func(*client.Client, *config.Credentials) (string, error){
+		"crypto.resolveScopeIDValue": resolveScopeIDValue,
+		"sync.resolveScopeID": func(c *client.Client, creds *config.Credentials) (string, error) {
+			return resolveScopeID(c, creds, syncPushCmd)
+		},
+	}
+	for name, resolve := range resolvers {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("HARBOR_TOKEN", "hbp_ephemeral-token")
+			t.Setenv("HARBOR_API_URL", srv.URL)
+			resetCommandState(t)
+
+			_, creds, err := loadClientFromConfig()
+			if err != nil {
+				t.Fatalf("loadClientFromConfig: %v", err)
+			}
+			if _, err := resolve(client.NewClient(srv.URL, creds.AccessToken), creds); err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+
+			path := filepath.Join(home, ".config", "harbor", "credentials.json")
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				body, _ := os.ReadFile(path)
+				t.Fatalf("%s wrote credentials to disk for a HARBOR_TOKEN run:\n%s", name, body)
+			}
+		})
+	}
+}
+
+// TestSavedSessionIsStillCached proves the gate did not break the case it must
+// not: a real logged-in session still caches its resolved user id, which is the
+// whole point of that write.
+func TestSavedSessionIsStillCached(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("HARBOR_TOKEN", "")
+
+	dir := filepath.Join(home, ".config", "harbor")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "credentials.json")
+	if err := os.WriteFile(path, []byte(`{"email":"you@example.com","access_token":"hbp_saved","expires_at":0}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	creds, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	creds.UserID = "u1"
+	cacheCredentials(creds)
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved map[string]any
+	if err := json.Unmarshal(body, &saved); err != nil {
+		t.Fatalf("credentials.json is not valid JSON: %v\n%s", err, body)
+	}
+	if saved["user_id"] != "u1" {
+		t.Errorf("a saved session no longer caches its resolved user id:\n%s", body)
 	}
 }

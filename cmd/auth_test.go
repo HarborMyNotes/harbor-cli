@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -386,5 +388,261 @@ func TestLoginWithTokenPersistsPAT(t *testing.T) {
 	}
 	if !isNonExpiring(creds) {
 		t.Error("a pasted PAT should store as a non-expiring credential")
+	}
+}
+
+// TestWhoamiUnderEnvTokenReportsTheSession is the other half of #88: whoami read
+// only the saved session, so a perfectly working HARBOR_TOKEN run was told "not
+// logged in — run 'harbor login' first". It is the first command anyone runs when
+// scripting the CLI, which made it the most misleading answer in the tool.
+func TestWhoamiUnderEnvTokenReportsTheSession(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer hbp_env-token" {
+			t.Errorf("profile fetched without the env token: %q", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"u1","email":"you@example.com","name":"Test User"}`))
+	}))
+	defer srv.Close()
+
+	t.Setenv("HOME", t.TempDir()) // no saved session at all
+	t.Setenv("HARBOR_TOKEN", "hbp_env-token")
+	t.Setenv("HARBOR_API_URL", srv.URL)
+	resetCommandState(t)
+
+	out := captureStdout(t, func() {
+		if err := runWhoami(whoamiCmd, nil); err != nil {
+			t.Fatalf("whoami: %v", err)
+		}
+	})
+	for _, want := range []string{"HARBOR_TOKEN", "you@example.com", srv.URL} {
+		if !strings.Contains(out, want) {
+			t.Errorf("whoami output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "not logged in") {
+		t.Errorf("whoami still claims the user is not logged in:\n%s", out)
+	}
+	if strings.Contains(out, "hbp_env-token") {
+		t.Errorf("whoami printed the token without --show-token:\n%s", out)
+	}
+}
+
+// TestWhoamiTokenVerdicts pins the three answers one profile probe can honestly
+// give, and in particular that "could not tell" is NOT reported as "rejected".
+//
+// The scope case is the one that matters: a PAT minted for CI is typically
+// scoped down — the server's own example is {"scopes": ["notes","files"]}, with
+// no "profile" — so the probe 403s on a token that works perfectly for the job
+// it was made for. Calling that rejected sends someone off to rotate a good
+// credential. An unreachable server is the same mistake pointed the other way.
+func TestWhoamiTokenVerdicts(t *testing.T) {
+	cases := []struct {
+		name       string
+		status     int
+		body       string
+		wantMark   string
+		wantSays   string
+		wantAvoids string
+		// wantErr is the exit-code contract: non-nil ONLY for a definite
+		// rejection, so 'harbor whoami || exit 1' as a CI preflight catches a
+		// revoked token but is not tripped by a VPN blip or a scoped-down token.
+		wantErr bool
+	}{
+		{"a working token", 200, `{"id":"u1","email":"you@example.com"}`, "✓", "", "rejected", false},
+		// boolMark(false) is the repo's dim "·"; the distinguishing signal is the
+		// sentence underneath, and that "?" is reserved for "could not tell".
+		{"a revoked token", 401, `{"error":{"code":"invalid_token","message":"The access token is invalid."}}`, "·", "rejected", "Could not check", true},
+		{"a token without profile scope", 403, `{"error":{"code":"insufficient_scope","message":"This token lacks the profile scope."}}`, "?", "Could not check", "rejected this token", false},
+		{"a server error", 500, `{"error":{"code":"internal","message":"boom"}}`, "?", "Could not check", "rejected this token", false},
+		// A 200 that is not a profile — an intercepting proxy, or a base URL
+		// pointing at something that is not the API. "No error" is not proof the
+		// token works, and saying so confidently is this command's cardinal sin.
+		{"a 200 that is not a profile", 200, `<html><body>hello</body></html>`, "?", "Could not check", "rejected this token", false},
+		// A bare 401 with no Harbor error code is a proxy's, not the API's: with
+		// a bearer present Harbor answers 401 only with invalid_token.
+		{"a gateway 401", 401, `<html>401 Authorization Required</html>`, "?", "Could not check", "rejected this token", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("HARBOR_TOKEN", "hbp_probe")
+			t.Setenv("HARBOR_API_URL", srv.URL)
+			resetCommandState(t)
+
+			var err error
+			out := captureStdout(t, func() { err = runWhoami(whoamiCmd, nil) })
+			if tc.wantErr && err == nil {
+				t.Error("a rejected token exited 0 — a CI preflight would sail past it")
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("whoami must report, not fail: %v", err)
+			}
+			if !strings.Contains(out, tc.wantMark) {
+				t.Errorf("Token valid mark %q missing:\n%s", tc.wantMark, out)
+			}
+			if tc.wantSays != "" && !strings.Contains(out, tc.wantSays) {
+				t.Errorf("output does not say %q:\n%s", tc.wantSays, out)
+			}
+			if tc.wantAvoids != "" && strings.Contains(out, tc.wantAvoids) {
+				t.Errorf("output wrongly says %q:\n%s", tc.wantAvoids, out)
+			}
+		})
+	}
+}
+
+// TestWhoamiUnreachableServerIsNotARejection covers the fourth case, which needs
+// no server at all: a VPN blip must not be reported as a bad credential, or
+// token_valid:false lands in a CI log as a token problem.
+func TestWhoamiUnreachableServerIsNotARejection(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("HARBOR_TOKEN", "hbp_probe")
+	t.Setenv("HARBOR_API_URL", "http://127.0.0.1:1/api/v1") // nothing listens here
+	resetCommandState(t)
+
+	out := captureStdout(t, func() {
+		if err := runWhoami(whoamiCmd, nil); err != nil {
+			t.Fatalf("whoami must report, not fail: %v", err)
+		}
+	})
+	if strings.Contains(out, "rejected this token") {
+		t.Errorf("an unreachable server was reported as a bad token:\n%s", out)
+	}
+	if !strings.Contains(out, "Could not check") {
+		t.Errorf("output does not say the check was inconclusive:\n%s", out)
+	}
+}
+
+// TestWhoamiJSONVerdictIsTriState pins the machine-readable side: null means
+// "could not tell", so a script cannot read a transient failure as a bad token.
+func TestWhoamiJSONVerdictIsTriState(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		want   any
+	}{
+		{"works", 200, `{"id":"u1","email":"you@example.com"}`, true},
+		{"rejected", 401, `{"error":{"code":"invalid_token","message":"nope"}}`, false},
+		{"unknown", 403, `{"error":{"code":"insufficient_scope","message":"nope"}}`, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("HARBOR_TOKEN", "hbp_probe")
+			t.Setenv("HARBOR_API_URL", srv.URL)
+			resetCommandState(t)
+			jsonOutput = true
+			t.Cleanup(func() { jsonOutput = false })
+
+			var runErr error
+			out := captureStdout(t, func() { runErr = runWhoami(whoamiCmd, nil) })
+			// The JSON body is printed either way; only a definite rejection
+			// also sets the exit code, exactly as the table form does.
+			if wantErr := tc.want == false; wantErr != (runErr != nil) {
+				t.Errorf("exit contract differs from the table form: err = %v, want error = %v", runErr, wantErr)
+			}
+			var got map[string]any
+			if err := json.Unmarshal([]byte(out), &got); err != nil {
+				t.Fatalf("not valid JSON: %v\n%s", err, out)
+			}
+			if got["token_valid"] != tc.want {
+				t.Errorf("token_valid = %v (%T), want %v", got["token_valid"], got["token_valid"], tc.want)
+			}
+			// never_expires was a flat assertion about credential lifetime that
+			// nothing checked — PATs can be minted with an expiry.
+			if _, present := got["never_expires"]; present {
+				t.Error("never_expires is asserted without being checked")
+			}
+		})
+	}
+}
+
+// TestWhoamiUnderEnvTokenJSON pins the machine-readable shape, including the
+// source field that tells a script where the session came from.
+func TestWhoamiUnderEnvTokenJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"u1","email":"you@example.com","name":"Test User"}`))
+	}))
+	defer srv.Close()
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("HARBOR_TOKEN", "hbp_env-token")
+	t.Setenv("HARBOR_API_URL", srv.URL)
+	resetCommandState(t)
+	jsonOutput = true
+	t.Cleanup(func() { jsonOutput = false })
+
+	out := captureStdout(t, func() {
+		if err := runWhoami(whoamiCmd, nil); err != nil {
+			t.Fatalf("whoami: %v", err)
+		}
+	})
+	var got map[string]any
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("whoami --json is not valid JSON: %v\n%s", err, out)
+	}
+	if got["source"] != "HARBOR_TOKEN" {
+		t.Errorf("source = %v, want HARBOR_TOKEN", got["source"])
+	}
+	if got["email"] != "you@example.com" {
+		t.Errorf("email = %v", got["email"])
+	}
+	if got["token_valid"] != true {
+		t.Errorf("token_valid = %v, want true", got["token_valid"])
+	}
+	if _, leaked := got["access_token"]; leaked {
+		t.Error("--json leaked the access token without --show-token")
+	}
+}
+
+// TestWhoamiWithoutEnvTokenStillReadsTheSavedSession proves the saved-session
+// path is untouched — and in particular that it stays OFFLINE. It is a local
+// state inspector; only the token session needs the network, because a bare
+// token carries no identity.
+func TestWhoamiWithoutEnvTokenStillReadsTheSavedSession(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("whoami hit the network for a saved session")
+	}))
+	defer srv.Close()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("HARBOR_TOKEN", "")
+	t.Setenv("HARBOR_API_URL", srv.URL)
+	resetCommandState(t)
+
+	if err := os.MkdirAll(filepath.Join(home, ".config", "harbor"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	saved := `{"api_url":"` + srv.URL + `","email":"saved@example.com","access_token":"hbp_saved","token_type":"Bearer","expires_at":0,"device_id":"cli-abc","device_name":"laptop"}`
+	if err := os.WriteFile(filepath.Join(home, ".config", "harbor", "credentials.json"), []byte(saved), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	out := captureStdout(t, func() {
+		if err := runWhoami(whoamiCmd, nil); err != nil {
+			t.Fatalf("whoami: %v", err)
+		}
+	})
+	if !strings.Contains(out, "saved@example.com") {
+		t.Errorf("the saved session was not reported:\n%s", out)
+	}
+	if strings.Contains(out, "HARBOR_TOKEN") {
+		t.Errorf("a saved session was reported as an env-token session:\n%s", out)
 	}
 }

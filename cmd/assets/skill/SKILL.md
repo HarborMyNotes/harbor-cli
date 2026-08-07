@@ -317,16 +317,19 @@ harbor notes get "$NOTE_ID" --json | jq -r '.content'   # auto-decrypted
 
 **Creating a note in a `default_encrypt` notebook needs the passphrase.** Without
 it the create is **refused** and nothing is written — the CLI will not put a
-plaintext note in a notebook that asked to be encrypted. That includes the
-account's default notebook when it carries the flag. Pass `--plaintext` to create
-an unencrypted note there on purpose.
+plaintext note in a notebook that asked to be encrypted. Pass `--plaintext` to
+create an unencrypted note there on purpose. The account's **default** notebook
+can never carry the flag — forwarded email, imports and notes with no notebook
+land there, and none of those can encrypt — so notes created with no `--notebook`
+are never affected by this.
 
 With `HARBOR_PASSPHRASE` set, `notes get/list`, `trash list`, and `reminders
 list` all show plaintext; without it (or with the wrong one) you see ciphertext,
-never an error. As an agent you generally **cannot** run `crypto setup`
-interactively — if `harbor crypto status` shows no keystore, ask the user to set
-it up. Full command list: `reference.md` → Encryption. Interop format:
-`crypto/README.md`.
+never an error. `crypto setup` works headlessly when both `HARBOR_PASSPHRASE`
+and a token are set (it prompts only when the passphrase is missing) — but
+**generating a passphrase on the user's behalf is not yours to do**: it cannot be
+recovered, so if `harbor crypto status` shows no keystore, ask them. Full command
+list: `reference.md` → Encryption. Interop format: `crypto/README.md`.
 
 ### Trash, restore, and history
 

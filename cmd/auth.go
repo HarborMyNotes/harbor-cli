@@ -67,6 +67,187 @@ func loginSummaryJSON(creds *config.Credentials, showToken bool, token string) [
 	return out
 }
 
+// envTokenSession returns the credentials a HARBOR_TOKEN run authenticates with,
+// and whether the environment supplied one at all. It mirrors the branch in
+// loadClientFromConfig so the two can never disagree about what a token session
+// looks like.
+func envTokenSession() (*config.Credentials, bool) {
+	tok := strings.TrimSpace(os.Getenv("HARBOR_TOKEN"))
+	if tok == "" {
+		return nil, false
+	}
+	return &config.Credentials{
+		AccessToken: tok,
+		ClientID:    cliClientID,
+		APIURL:      resolveBaseURL(nil),
+		DeviceID:    envDeviceID(tok),
+		DeviceName:  "harbor-cli (HARBOR_TOKEN)",
+	}, true
+}
+
+// tokenVerdict is what one profile probe can honestly conclude about a token.
+//
+// Two states are not enough, and the missing one is the case this whole feature
+// exists for. A PAT minted for CI is typically scoped down — the server's own
+// example is {"scopes": ["notes", "files"]}, with no "profile" — so the probe
+// gets a 403 from a token that works perfectly for the job it was made for.
+// Calling that "rejected" would send someone off to rotate a good credential.
+// An unreachable server and a 500 are the same mistake pointed the other way.
+type tokenVerdict int
+
+const (
+	// tokenWorks: the server answered, so the token authenticated.
+	tokenWorks tokenVerdict = iota
+	// tokenRejected: the server said this token is not valid (401 invalid_token).
+	tokenRejected
+	// tokenUnknown: nothing was learned — unreachable, a 5xx, or a token whose
+	// scopes do not include reading the profile.
+	tokenUnknown
+)
+
+// classifyTokenProbe turns the profile call's outcome into a verdict.
+//
+// gotIdentity says whether the response actually carried a profile. A bare
+// "no error" is not enough: an intercepting proxy, or a base URL pointing at
+// something that is not the API, can answer 200 with HTML — and reporting that
+// as a working token would be exactly the confident-but-wrong answer this
+// command exists to stop giving.
+func classifyTokenProbe(err error, gotIdentity bool) tokenVerdict {
+	if err == nil {
+		if !gotIdentity {
+			return tokenUnknown
+		}
+		return tokenWorks
+	}
+	if isNetworkError(err) {
+		return tokenUnknown
+	}
+	var apiErr *client.APIError
+	if errors.As(err, &apiErr) {
+		// Only the server saying "this token is not valid" is a rejection, and it
+		// is identified by CODE rather than by status: with a bearer present the
+		// API answers 401 only with invalid_token, so a bare 401 is a proxy's,
+		// not Harbor's. A scope refusal proves the opposite of a rejection — the
+		// token authenticated, then was denied this one endpoint.
+		if apiErr.Code == "invalid_token" {
+			return tokenRejected
+		}
+		return tokenUnknown
+	}
+	return tokenUnknown
+}
+
+// whoamiEnvToken reports a HARBOR_TOKEN session.
+//
+// Unlike the saved-session path this makes ONE network call, because a bare
+// token carries no identity: the email, the scopes and the account all live on
+// the server. Answering "you are authenticated" without saying as whom would be
+// only marginally better than the "not logged in" it replaces.
+//
+// The call's outcome is reported, never returned as an error. Whether the token
+// works is exactly what the command was asked, so "here is your session, and
+// the server rejected it" is the answer — not a stack of plumbing. See
+// tokenVerdict for why "could not tell" is a distinct answer from "rejected".
+func whoamiEnvToken(cmd *cobra.Command, creds *config.Credentials) error {
+	showToken, _ := cmd.Flags().GetBool("show-token")
+
+	c := client.NewClient(creds.BaseURL(), creds.AccessToken)
+	c.Verbose = verboseFlag
+	var email, name string
+	data, err := c.GetProfile()
+	if err == nil {
+		p := parseJSON(client.UnwrapData(data))
+		email, name = str(p, "email"), str(p, "name")
+	}
+	verdict := classifyTokenProbe(err, email != "" || name != "")
+
+	if jsonOutput {
+		m := map[string]any{
+			"api_url":     creds.BaseURL(),
+			"device_id":   creds.DeviceID,
+			"device_name": creds.DeviceName,
+			"source":      "HARBOR_TOKEN",
+		}
+		if email != "" {
+			m["email"] = email
+		}
+		// token_valid is a tri-state here, so null means "could not tell" rather
+		// than a script reading a transient network blip as a bad credential.
+		switch verdict {
+		case tokenWorks:
+			m["token_valid"] = true
+		case tokenRejected:
+			m["token_valid"] = false
+		default:
+			m["token_valid"] = nil
+		}
+		if err != nil {
+			m["error"] = err.Error()
+		}
+		if showToken {
+			m["access_token"] = creds.AccessToken
+		}
+		out, _ := json.Marshal(m)
+		printResult(out, func([]byte) {})
+		// Same exit contract as the table form below. Returning nil here would
+		// make 'harbor whoami --json || exit 1' sail past a revoked token while
+		// the human form caught it — the two must not disagree.
+		return rejectedTokenError(verdict)
+	}
+
+	pairs := [][2]string{{"Session", "HARBOR_TOKEN (environment)"}}
+	if email != "" {
+		pairs = append(pairs, [2]string{"Email", email})
+	}
+	if name != "" {
+		pairs = append(pairs, [2]string{"Name", name})
+	}
+	valid := map[tokenVerdict]string{
+		tokenWorks:    boolMark(true),
+		tokenRejected: boolMark(false),
+		tokenUnknown:  "?",
+	}[verdict]
+	pairs = append(pairs,
+		[2]string{"API URL", creds.BaseURL()},
+		[2]string{"Token valid", valid},
+		[2]string{"Device", fmt.Sprintf("%s (%s)", creds.DeviceName, creds.DeviceID)},
+	)
+	if showToken {
+		pairs = append(pairs, [2]string{"Access token", creds.AccessToken})
+	}
+	printKV(pairs)
+
+	switch verdict {
+	case tokenRejected:
+		fmt.Println(dim("The server rejected this token: " + err.Error()))
+	case tokenUnknown:
+		detail := "the server's answer did not look like a profile"
+		if err != nil {
+			detail = err.Error()
+		}
+		fmt.Println(dim("Could not check this token — " + detail + "\n" +
+			"That is not the same as the token being bad: a token scoped without 'profile'\n" +
+			"cannot read this endpoint yet works for everything it was granted."))
+	}
+
+	return rejectedTokenError(verdict)
+}
+
+// rejectedTokenError is whoami's exit contract, shared by the table and --json
+// paths so the two can never disagree.
+//
+// Non-zero ONLY for a definite rejection, and only after the output, matching
+// 'harbor status': a script running 'harbor whoami || exit 1' as a preflight
+// must not sail past a revoked token. "Could not tell" deliberately stays 0 —
+// failing a build over a VPN blip, or over a token merely scoped without
+// 'profile', would be the same false alarm in a different costume.
+func rejectedTokenError(v tokenVerdict) error {
+	if v == tokenRejected {
+		return errors.New("the server rejected this token")
+	}
+	return nil
+}
+
 // isNonExpiring reports whether the saved session is a long-lived credential
 // (a Personal Access Token) that never expires and has no refresh token.
 func isNonExpiring(creds *config.Credentials) bool {
@@ -668,8 +849,20 @@ var whoamiCmd = &cobra.Command{
 	Use:     "whoami",
 	Short:   "Show the current session (alias: auth status)",
 	GroupID: groupAuth,
-	Long:    "Displays the logged-in email, API target, granted scopes, token expiry, and device identity.",
-	RunE:    runWhoami,
+	Long: `Displays the logged-in email, API target, granted scopes, token expiry, and
+device identity.
+
+Reads the saved session offline. When HARBOR_TOKEN is set that token is the
+session instead, and since a bare token carries no identity, whoami asks the
+server who it belongs to — so this is the one case where the command makes a
+network call.
+
+The answer is always printed, and the exit code is non-zero only when the server
+actually rejected the token. "Could not tell" — an unreachable server, a 5xx, or
+a token scoped without 'profile' (common for CI tokens, which work fine for what
+they were granted) — is reported as unknown and exits 0, so a preflight check
+does not fail a build over a network blip.`,
+	RunE: runWhoami,
 }
 
 // authStatusCmd is the `auth status` alias of whoami.
@@ -679,8 +872,20 @@ var authStatusCmd = &cobra.Command{
 	RunE:  runWhoami,
 }
 
-// runWhoami renders the saved session details (offline; no network call).
+// runWhoami reports the current session.
+//
+// The saved-session path is offline — it is a local state inspector. A
+// HARBOR_TOKEN session is not: a bare token carries no identity, so that branch
+// asks the server whose it is. See whoamiEnvToken.
 func runWhoami(cmd *cobra.Command, args []string) error {
+	// HARBOR_TOKEN authenticates every other command, so reading only the saved
+	// session made whoami answer "not logged in — run 'harbor login' first" for a
+	// session that works perfectly (issue #88). whoami is the first thing anyone
+	// runs when scripting the CLI, so that was the single most misleading answer
+	// in the tool.
+	if creds, ok := envTokenSession(); ok {
+		return whoamiEnvToken(cmd, creds)
+	}
 	creds, err := config.Load()
 	if err != nil {
 		return err

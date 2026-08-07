@@ -6,6 +6,8 @@
 package cmd
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -299,6 +301,58 @@ func newAnonymousClient() *client.Client {
 	return c
 }
 
+// usingEnvToken reports whether this run is authenticated by HARBOR_TOKEN rather
+// than a saved session.
+func usingEnvToken() bool {
+	return strings.TrimSpace(os.Getenv("HARBOR_TOKEN")) != ""
+}
+
+// cacheCredentials writes back an opportunistic credential update — a resolved
+// user id, a refreshed token — and is a NO-OP for a HARBOR_TOKEN session.
+//
+// HARBOR_TOKEN promises the token is used "for this process only: never
+// persisted". Two callers cache the resolved user id back to disk with a bare
+// config.Save, which for a synthesized env session would write a credentials.json
+// containing the bearer token — turning a deliberately ephemeral run into a
+// standing session that outlives the environment variable. On a persistent CI
+// runner that is a token left on disk nobody asked to store.
+//
+// It is silent by design: the write is a cache, so failing to make it is not
+// worth interrupting the command the user actually ran.
+//
+// One file is still written under HARBOR_TOKEN: the keystore cache
+// (config.SaveKeystoreBlob). That is the WRAPPED master key, useless without the
+// passphrase, and caching it is what keeps a headless run from re-fetching the
+// keystore on every command. 'harbor crypto sync' refreshes it and
+// config.ClearKeystoreBlob removes it.
+func cacheCredentials(creds *config.Credentials) {
+	if usingEnvToken() {
+		return
+	}
+	_ = config.Save(creds)
+}
+
+// envDeviceID derives the sync device id for a HARBOR_TOKEN session.
+//
+// A device id is required to push (the server rejects an empty one), and there
+// is no saved session to take one from — which is why 'harbor crypto setup' was
+// unusable headlessly: it writes the keystore through sync/push, and the
+// synthesized credentials carried no device (issue #88).
+//
+// It is DERIVED FROM THE TOKEN, not random, for two reasons. A fresh id per run
+// would register a new device on every CI job and fill the user's device list
+// with junk that also holds back the sync GC floor. And deriving it from the
+// token means two different tokens — two different machines or jobs — get two
+// different devices, which is what the sync engine expects.
+//
+// The token is hashed and truncated, so the id is stable and collision-resistant
+// without carrying any part of the secret: 12 hex characters of SHA-256 cannot
+// be walked back to the token, and the id is sent to the server on every push.
+func envDeviceID(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return "cli-env-" + hex.EncodeToString(sum[:])[:12]
+}
+
 // loadClientFromConfig builds an authenticated client from saved credentials.
 // It wires transparent token refresh (proactive when the access token is near
 // expiry, and reactive on a 401 invalid_token) and returns a friendly
@@ -309,7 +363,13 @@ func loadClientFromConfig() (*client.Client, *config.Credentials, error) {
 	// Token) for this process only: never persisted and never refreshed.
 	if envTok := strings.TrimSpace(os.Getenv("HARBOR_TOKEN")); envTok != "" {
 		base := resolveBaseURL(nil)
-		creds := &config.Credentials{AccessToken: envTok, ClientID: cliClientID, APIURL: base}
+		creds := &config.Credentials{
+			AccessToken: envTok,
+			ClientID:    cliClientID,
+			APIURL:      base,
+			DeviceID:    envDeviceID(envTok),
+			DeviceName:  "harbor-cli (HARBOR_TOKEN)",
+		}
 		c := client.NewClient(base, envTok)
 		c.Verbose = verboseFlag
 		return c, creds, nil
