@@ -25,7 +25,8 @@ import (
 // only way to change a note's mind was to delete it and type it again. These two
 // commands close that: `notes encrypt` seals an existing plaintext note, `notes
 // decrypt` opens it back up, and the note keeps its id, its tasks, its
-// attachments, its tags, its history and its created_at through both.
+// attachments, its tags and its created_at through both. Its version HISTORY
+// does not survive either direction — see historyLossCaveat.
 //
 // IT IS A REMEDY, NOT JUST A FEATURE. Four sibling clients shipped write paths
 // that saved PLAINTEXT into notebooks marked default_encrypt (harbor-swift#817,
@@ -602,6 +603,9 @@ already encrypted are skipped, so it is safe to re-run.
 ` + bulletCaveat(historyLossCaveat) + `
 ` + bulletCaveat(attachmentCaveat) + `
 
+Because of the first one you will be asked to type "yes" unless you pass --yes,
+which is required in --json or non-interactive use.
+
 While a note is encrypted the server cannot read it: it is excluded from search,
 and its tasks, links and attachment references stop being reconciled until it is
 decrypted again.`,
@@ -692,6 +696,12 @@ var notesEncryptConfirmation = registerConfirmation("harbor notes encrypt", conf
 // alongside the registered warning so a --notebook sweep says how many notes'
 // histories it is about to delete rather than asking about the idea in general.
 func notesConfirmEncrypt(count int, yes bool) error {
+	// Nothing to convert, nothing to consent to. The sweep is documented as safe
+	// to re-run, so an idempotent repair script must not need --yes to be told a
+	// notebook is already clean.
+	if count == 0 {
+		return nil
+	}
 	if !yes && !jsonOutput && stdinIsInteractive() {
 		fmt.Printf("About to encrypt %d %s, deleting the version history of %s.\n",
 			count, pluralize(count, "note", "notes"), pluralize(count, "it", "each of them"))

@@ -23,7 +23,10 @@ var historyCmd = &cobra.Command{
 	Long: `Inspect the snapshots captured each time a note's content or attributes
 change. List the versions, show the full content of any one snapshot, or revert
 a note to a past version (which is restored as a brand-new current version —
-history is forward-only and never rewritten).`,
+reverting is forward-only and never rewrites a past snapshot).
+
+History is NOT permanent, though: encrypting or decrypting a note discards every
+earlier version of it, server-side and unrecoverably. See 'harbor notes encrypt'.`,
 }
 
 // historyListCmd lists a note's version history (metadata only).
