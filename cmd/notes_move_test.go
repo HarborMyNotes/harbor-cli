@@ -767,7 +767,7 @@ func TestSealedMoveAndNotesEncryptSendTheSameWrite(t *testing.T) {
 
 	unlockedSession(t, key)
 	viaEncrypt := newMoveMock(t, moveNotebooks(), movePlaintextNote())
-	if _, err := runCLI(t, viaEncrypt.m, "notes", "encrypt", moveNoteID); err != nil {
+	if _, err := runCLI(t, viaEncrypt.m, "notes", "encrypt", "--yes", moveNoteID); err != nil {
 		t.Fatalf("notes encrypt: %v", err)
 	}
 	encryptBody := viaEncrypt.m.bodyOf(t, "PATCH /api/v1/notes/"+moveNoteID)
@@ -1184,7 +1184,7 @@ func TestNotesEncryptStillSendsItsOwnBaseUSN(t *testing.T) {
 	unlockedSession(t, newMasterKey(t))
 	mm := newMoveMock(t, moveNotebooks(), movePlaintextNote())
 
-	if _, err := runCLI(t, mm.m, "notes", "encrypt", moveNoteID); err != nil {
+	if _, err := runCLI(t, mm.m, "notes", "encrypt", "--yes", moveNoteID); err != nil {
 		t.Fatalf("notes encrypt: %v", err)
 	}
 	if got, _ := mm.m.bodyOf(t, "PATCH /api/v1/notes/"+moveNoteID)["base_usn"].(float64); got != 88 {
@@ -1220,11 +1220,14 @@ func TestSealedMovePrintsTheAttachmentCaveat(t *testing.T) {
 	if !strings.Contains(said, "Note moved and encrypted") {
 		t.Errorf("the sealed move never said it encrypted anything:\n%s", said)
 	}
-	// The other caveat a sealed move inherits, and it is a separate fact: this note
-	// was plaintext until a moment ago, so its earlier versions are plaintext on the
-	// server and encrypting it now does not un-store them.
-	if !strings.Contains(said, "this does not clear the plaintext already on the server") {
-		t.Errorf("the sealed move never said its earlier versions are still readable:\n%s", said)
+	// The other caveat a sealed move inherits, and it is a separate fact: sealing
+	// the note DELETED every earlier version of it. A move is run for another
+	// reason entirely, so this is the one place the user would never have thought
+	// to look for it.
+	for _, line := range strings.Split(historyLossCaveat, "\n") {
+		if !strings.Contains(said, line) {
+			t.Errorf("the sealed move never said %q — the user is left believing their history survived:\n%s", line, said)
+		}
 	}
 	// It is a limit, not an apology: the sentence must still be the one the
 	// encrypt command's help text carries.

@@ -589,26 +589,17 @@ var notesEncryptCmd = &cobra.Command{
 	Args:  cobra.ArbitraryArgs,
 	Long: `Encrypt notes that were saved in the clear, keeping everything else about them.
 
-The note keeps its id, tasks, attachments, tags, reminders, history and created_at
-— only its title and body change, into HRBC2 envelopes only your passphrase can
-open. Nothing is written unless every step before the write succeeded, so a
-failure leaves the note exactly as it was.
+The note keeps its id, tasks, attachments, tags, reminders and created_at — only
+its title and body change, into HRBC2 envelopes only your passphrase can open.
+Nothing is written unless every step before the write succeeded, so a failure
+leaves the note exactly as it was.
 
 Use --notebook to fix a whole notebook at once: several Harbor clients shipped
 write paths that saved plaintext into notebooks marked "encrypt by default", and
 this is how those notes get repaired without deleting and re-creating them. Notes
 already encrypted are skipped, so it is safe to re-run.
 
-Two things encrypting does NOT do, both worth knowing before you rely on it:
-
-  • It does not clear the plaintext ALREADY ON THE SERVER. The note's earlier
-    versions were snapshotted as plaintext and stay readable ('harbor history
-    list <id>'). The one exception is not one to plan around: the server folds a
-    save into the previous history row when that row is recent enough and from
-    the same client, so encrypting a note you just edited here may overwrite that
-    single row — a coincidence of timing, not a feature, and every older version
-    is untouched. Treat anything that was saved in the clear as having been
-    stored in the clear.
+` + bulletCaveat(historyLossCaveat) + `
 ` + bulletCaveat(attachmentCaveat) + `
 
 While a note is encrypted the server cannot read it: it is excluded from search,
@@ -616,7 +607,7 @@ and its tasks, links and attachment references stop being reconciled until it is
 decrypted again.`,
 	Example: `  harbor notes encrypt 9c2e...
   harbor notes encrypt 9c2e... 7d4a... 1f0b...
-  harbor notes encrypt --notebook 5b1f...`,
+  harbor notes encrypt --notebook 5b1f... --yes`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c, creds, err := loadClientFromConfig()
 		if err != nil {
@@ -631,6 +622,13 @@ decrypted again.`,
 		}
 		ids, complete, err := conversionTargets(cmd, c, args, true)
 		if err != nil {
+			return err
+		}
+		// Asked once for the whole run and BEFORE anything is written, for the same
+		// reason decrypt is: the user is consenting to destroying these notes'
+		// version history, and being asked per note over a notebook sweep is how a
+		// person learns to type "yes" without reading.
+		if err := notesConfirmEncrypt(len(ids), boolFlag(cmd, "yes")); err != nil {
 			return err
 		}
 		sealed := 0
@@ -665,6 +663,42 @@ decrypted again.`,
 	},
 }
 
+// notesEncryptConfirmation gates `notes encrypt`.
+//
+// It exists because the write DESTROYS data, which is not what "encrypt" sounds
+// like it does. Every snapshot in the note's history that disagrees with the
+// note's new is_encrypted state is hard-deleted server-side — not tombstoned,
+// not re-sealed — so encrypting a note discards every earlier version of it.
+// note_history does not sync and is not indexed, so there is nothing to
+// propagate and nothing to recover from another device.
+//
+// The wording leads with the deletion rather than with the encryption, because
+// the encryption is the part the user already wants and the deletion is the part
+// they do not know about. See app.harbor.my/docs/encryption.md, "Changing
+// encryption discards history".
+var notesEncryptConfirmation = registerConfirmation("harbor notes encrypt", confirmation{
+	Warning: "This DELETES every earlier version of these notes. Encrypting discards the\n" +
+		"note's whole version history on the server — permanently, and it cannot be\n" +
+		"recovered from another device. The current contents are kept and sealed;\n" +
+		"everything 'harbor history list' would have shown you is destroyed.",
+	Prompt:      `Type "yes" to confirm: `,
+	Affirmative: "yes",
+	Unattended:  "refusing to destroy these notes' version history without confirmation — pass --yes",
+	Aborted:     "aborted — nothing was encrypted",
+})
+
+// notesConfirmEncrypt gates `notes encrypt`, resolving the ambient state and
+// handing the decision to the shared confirmDestructive. The count is printed
+// alongside the registered warning so a --notebook sweep says how many notes'
+// histories it is about to delete rather than asking about the idea in general.
+func notesConfirmEncrypt(count int, yes bool) error {
+	if !yes && !jsonOutput && stdinIsInteractive() {
+		fmt.Printf("About to encrypt %d %s, deleting the version history of %s.\n",
+			count, pluralize(count, "note", "notes"), pluralize(count, "it", "each of them"))
+	}
+	return confirmDestructive(notesEncryptConfirmation, jsonOutput, stdinIsInteractive(), yes, askLine)
+}
+
 // notesDecryptConfirmation gates `notes decrypt`. The wording leads with where
 // the plaintext GOES rather than with "this is irreversible", because the note
 // itself is trivially re-encryptable and that is not the point: the moment the
@@ -673,7 +707,9 @@ decrypted again.`,
 var notesDecryptConfirmation = registerConfirmation("harbor notes decrypt", confirmation{
 	Warning: "This writes these notes' contents to the server in the CLEAR — indexed for search\n" +
 		"and written into the note's version history. Encrypting them again protects them\n" +
-		"from then on; it does not un-store what the server has already been given.",
+		"from then on; it does not un-store what the server has already been given.\n" +
+		"It ALSO deletes every earlier version of these notes: the encrypted snapshots\n" +
+		"are discarded permanently, the same way encrypting discards the plaintext ones.",
 	Prompt:      `Type "yes" to confirm: `,
 	Affirmative: "yes",
 	Unattended:  "refusing to write notes back as plaintext without confirmation — pass --yes",
@@ -694,11 +730,13 @@ protects the note from then on; it does not retract what was already stored. You
 will be asked to type "yes" unless you pass --yes, which is required in --json or
 non-interactive use.
 
+` + bulletCaveat(historyLossCaveat) + `
+
 Everything else about the note survives: id, tasks, attachments, tags, reminders,
-history, created_at. The one thing that can be lost is a task LINKED to the note
-whose <harbor-task> block the decrypted body does not carry — the server deletes
-such a task the moment it can read the body again — so that case is refused with
-nothing written unless you pass --allow-task-loss.
+created_at. The one thing that can be lost is a task LINKED to the note whose
+<harbor-task> block the decrypted body does not carry — the server deletes such a
+task the moment it can read the body again — so that case is refused with nothing
+written unless you pass --allow-task-loss.
 
 --format says how to interpret the decrypted body. html is right for any note
 this CLI encrypted (it seals the note exactly as the server stored it, so
@@ -729,7 +767,8 @@ Markdown source.`,
 		}
 		format := stringFlag(cmd, "format")
 		allowTaskLoss := boolFlag(cmd, "allow-task-loss")
-		return runConversion(ids, complete, "decrypted", func(id string) (bool, error) {
+		opened := 0
+		err = runConversion(ids, complete, "decrypted", func(id string) (bool, error) {
 			body, perr := planDecrypt(c, key, id, format, allowTaskLoss)
 			if perr != nil || body == nil {
 				return false, perr
@@ -738,8 +777,19 @@ Markdown source.`,
 			if werr != nil {
 				return false, mapNoteError(werr)
 			}
-			return true, verifyConversionLanded(data, false, id)
+			if verr := verifyConversionLanded(data, false, id); verr != nil {
+				return false, verr
+			}
+			opened++
+			return true, nil
 		})
+		// Same reasoning as the encrypt path: changing the flag in EITHER direction
+		// discards the note's history, and a partial run is exactly when saying so
+		// matters most.
+		if opened > 0 {
+			printHistoryCaveat()
+		}
+		return err
 	},
 }
 
@@ -772,6 +822,25 @@ const attachmentCaveat = "It does not encrypt the BYTES of attached files. The n
 	"the references to them — becomes ciphertext, but the attachments themselves\n" +
 	"are stored as they were, and can still be downloaded and read in full."
 
+// historyLossCaveat is what changing a note's encryption DESTROYS, and like the
+// attachment caveat it lives in one place because several commands must say it
+// in the same words.
+//
+// This sentence used to say the opposite — that earlier versions "stay readable"
+// — with a long paragraph about the server's history coalescing as the rare
+// exception. The exception is now the rule. Every snapshot that disagrees with
+// the note's new is_encrypted state is hard-deleted by the write that changes
+// the flag: not tombstoned, not re-sealed. note_history neither syncs nor is
+// indexed, so nothing propagates and nothing is recoverable from another device.
+//
+// It is deliberate server-side behaviour, not a bug to route around: sealing old
+// snapshots instead would need a per-version crypto pass in all five clients,
+// and the guarantee would only ever be as strong as the weakest one. See
+// app.harbor.my/docs/encryption.md, "Changing encryption discards history".
+const historyLossCaveat = "It DELETES the note's version history. Every earlier version is discarded\n" +
+	"server-side when the encryption changes — permanently, and not recoverable\n" +
+	"from another device. The current contents are kept; nothing older survives."
+
 // bulletCaveat renders a caveat as one of the "  • " bullets the encrypt help
 // text is built from, indenting its continuation lines to line up under the
 // first. It is what lets the same sentence be both help text and a printed
@@ -786,30 +855,18 @@ func printAttachmentCaveat() {
 	fmt.Fprintln(os.Stderr, dim(attachmentCaveat))
 }
 
-// printHistoryCaveat says what encrypting does NOT do to the plaintext already on
-// the server, and it is worded around what the user can RELY on rather than
-// around what happens.
+// printHistoryCaveat says out loud, after the fact, that the note's earlier
+// versions are gone.
 //
-// The first draft said the plain thing — earlier versions stay in history as
-// plaintext — and that is wrong in one case. The server COALESCES history
-// snapshots (internal/history/history.go, coalesceInto): when the latest row came
-// from the same source device and is newer than the configured idle window, the
-// next save folds INTO that row instead of starting a new one. So encrypting a
-// note you edited moments ago through the same client overwrites that row's
-// plaintext with ciphertext, and the version genuinely disappears.
-//
-// That does not make the warning wrong, it makes the flat version of it wrong.
-// Whether the most recent row survives depends on how recently the note was
-// saved, from which client, and on a server-side window this CLI cannot see —
-// which is a coincidence of timing, not a guarantee anyone can lean on, and every
-// older row is untouched either way. So the message covers both cases and lands
-// on the part that is unconditionally true: what was saved in the clear was
-// stored in the clear, and encrypting afterwards does not un-store it.
+// It is printed as well as confirmed because the two land on different people.
+// The confirmation is skipped entirely by --yes and by any non-interactive run,
+// which is exactly where a scripted sweep can delete the history of a thousand
+// notes with nobody reading anything; and `notes update --notebook` seals notes
+// as a SIDE EFFECT of a command run for another reason, where nobody consulted
+// `notes encrypt --help` at all. So the fact is stated unconditionally on the
+// way out, on stderr so it cannot corrupt a piped --json stdout.
 func printHistoryCaveat() {
-	fmt.Fprintln(os.Stderr, dim("Note: this does not clear the plaintext already on the server. A version saved\n"+
-		"moments ago may be folded into this write, but older ones stay readable\n"+
-		"('harbor history list <id>') — treat what was saved in the clear as having been\n"+
-		"stored in the clear."))
+	fmt.Fprintln(os.Stderr, dim(historyLossCaveat))
 }
 
 // verifyConversionLanded checks the server's own answer rather than assuming a
@@ -835,6 +892,7 @@ func verifyConversionLanded(data []byte, wantEncrypted bool, noteID string) erro
 
 func init() {
 	notesEncryptCmd.Flags().String("notebook", "", "Convert every note in this notebook instead of naming ids")
+	notesEncryptCmd.Flags().Bool("yes", false, "Skip the confirmation prompt (required in --json/non-interactive use)")
 
 	notesDecryptCmd.Flags().String("notebook", "", "Convert every note in this notebook instead of naming ids")
 	notesDecryptCmd.Flags().String("format", "html", "How to interpret the decrypted body: html or markdown")

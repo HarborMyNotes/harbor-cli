@@ -239,7 +239,7 @@ func TestConversionRoundTripLosesNothing(t *testing.T) {
 	cm := newConvertMock(t, plaintextFixture(), linkedTask())
 
 	// ---- plaintext → encrypted ----------------------------------------------
-	if _, err := runCLI(t, cm.m, "notes", "encrypt", convertNoteID); err != nil {
+	if _, err := runCLI(t, cm.m, "notes", "encrypt", "--yes", convertNoteID); err != nil {
 		t.Fatalf("notes encrypt: %v", err)
 	}
 	sealed := cm.note
@@ -327,7 +327,7 @@ func TestEncryptSendsOnlyWhatItMeansTo(t *testing.T) {
 	unlockedSession(t, newMasterKey(t))
 	cm := newConvertMock(t, plaintextFixture(), linkedTask())
 
-	if _, err := runCLI(t, cm.m, "notes", "encrypt", convertNoteID); err != nil {
+	if _, err := runCLI(t, cm.m, "notes", "encrypt", "--yes", convertNoteID); err != nil {
 		t.Fatalf("notes encrypt: %v", err)
 	}
 
@@ -400,7 +400,7 @@ func TestAFailedWriteLeavesTheNoteExactlyAsItWas(t *testing.T) {
 	cm := newConvertMock(t, plaintextFixture(), linkedTask())
 	cm.patchStatus, cm.patchBody = 500, apiErrorBody("internal", "the write did not land")
 
-	_, err := runCLI(t, cm.m, "notes", "encrypt", convertNoteID)
+	_, err := runCLI(t, cm.m, "notes", "encrypt", "--yes", convertNoteID)
 
 	if err == nil {
 		t.Fatal("a failed write reported success")
@@ -418,7 +418,7 @@ func TestAStaleNoteIsRefusedRatherThanClobbered(t *testing.T) {
 	// Somebody else's edit lands between the CLI's GET and its PATCH.
 	cm.m.handler = withPreWriteEdit(cm)
 
-	_, err := runCLI(t, cm.m, "notes", "encrypt", convertNoteID)
+	_, err := runCLI(t, cm.m, "notes", "encrypt", "--yes", convertNoteID)
 
 	if err == nil {
 		t.Fatal("a stale write was accepted")
@@ -458,7 +458,7 @@ func withPreWriteEdit(cm *convertMock) http.HandlerFunc {
 // repaired here is a client that wrote a note the user believed was encrypted.
 func TestConversionRefusesWithoutThePassphrase(t *testing.T) {
 	for _, args := range [][]string{
-		{"notes", "encrypt", convertNoteID},
+		{"notes", "encrypt", "--yes", convertNoteID},
 		{"notes", "decrypt", convertNoteID, "--yes"},
 	} {
 		t.Run(args[1], func(t *testing.T) {
@@ -619,16 +619,79 @@ func TestDecryptCountsWhatItIsAboutToPublish(t *testing.T) {
 // TestEncryptDoesNotAsk is the other side of the same rule. Encrypting is not a
 // downgrade, and a prompt on the safe direction is how people learn to type "yes"
 // without reading the one that matters.
-func TestEncryptDoesNotAsk(t *testing.T) {
+func TestEncryptAsksBeforeDestroyingHistory(t *testing.T) {
 	unlockedSession(t, newMasterKey(t))
 	cm := newConvertMock(t, plaintextFixture(), linkedTask())
 	asked := answerPrompt(t, "no")
 
-	if _, err := runCLI(t, cm.m, "notes", "encrypt", convertNoteID); err != nil {
-		t.Fatalf("notes encrypt: %v", err)
+	_, err := runCLI(t, cm.m, "notes", "encrypt", convertNoteID)
+	if err == nil {
+		t.Fatal("encrypting went ahead without consent — it deletes the note's history")
 	}
-	if len(*asked) != 0 {
-		t.Errorf("encrypting prompted the user: %v", *asked)
+	if !strings.Contains(err.Error(), "nothing was encrypted") {
+		t.Errorf("a declined confirmation should say nothing was encrypted: %v", err)
+	}
+	if len(*asked) == 0 {
+		t.Error("the user was never prompted")
+	}
+	if enc, _ := cm.note["is_encrypted"].(bool); enc {
+		t.Error("the note was encrypted despite the user declining")
+	}
+}
+
+// TestEncryptRefusesUnattendedWithoutYes pins the scripted path: with nobody at a
+// keyboard the command must refuse rather than silently destroying history, and
+// must name the flag that would have worked.
+func TestEncryptRefusesUnattendedWithoutYes(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	cm := newConvertMock(t, plaintextFixture(), linkedTask())
+
+	_, err := runCLI(t, cm.m, "notes", "encrypt", convertNoteID)
+	if err == nil {
+		t.Fatal("expected a refusal with no terminal to prompt on")
+	}
+	for _, want := range []string{"version history", "--yes"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal missing %q: %v", want, err)
+		}
+	}
+	if enc, _ := cm.note["is_encrypted"].(bool); enc {
+		t.Error("the note was encrypted without confirmation")
+	}
+}
+
+// TestEncryptConfirmationCountsTheNotes proves a --notebook sweep says how many
+// notes' histories it is about to delete, so the answer is informed rather than
+// reflexive — the same reason the decrypt confirmation carries a count.
+func TestEncryptConfirmationCountsTheNotes(t *testing.T) {
+	answerPrompt(t, "yes")
+	out := captureStdout(t, func() {
+		if err := notesConfirmEncrypt(7, false); err != nil {
+			t.Fatalf("notesConfirmEncrypt: %v", err)
+		}
+	})
+	for _, want := range []string{"7 notes", "deleting the version history"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the question does not say %q:\n%s", want, out)
+		}
+	}
+
+	// Singular reads as a sentence too, not "1 notes".
+	answerPrompt(t, "yes")
+	one := captureStdout(t, func() {
+		if err := notesConfirmEncrypt(1, false); err != nil {
+			t.Fatalf("notesConfirmEncrypt: %v", err)
+		}
+	})
+	if !strings.Contains(one, "1 note,") {
+		t.Errorf("singular wording is wrong:\n%s", one)
+	}
+
+	if notesEncryptConfirmation.Affirmative != "yes" {
+		t.Errorf("affirmative = %q, want \"yes\"", notesEncryptConfirmation.Affirmative)
+	}
+	if !strings.Contains(notesEncryptConfirmation.Warning, "DELETES every earlier version") {
+		t.Errorf("the confirmation does not lead with the deletion:\n%s", notesEncryptConfirmation.Warning)
 	}
 }
 
@@ -802,7 +865,7 @@ func TestConversionIsIdempotent(t *testing.T) {
 	unlockedSession(t, key)
 	cm := newConvertMock(t, encryptedFixture(t, key, convertBody), linkedTask())
 
-	out, err := runCLI(t, cm.m, "notes", "encrypt", convertNoteID)
+	out, err := runCLI(t, cm.m, "notes", "encrypt", "--yes", convertNoteID)
 
 	if err != nil {
 		t.Fatalf("re-encrypting an encrypted note failed: %v", err)
@@ -961,7 +1024,7 @@ func TestEncryptSaysNothingAboutHistoryWhenItSealedNothing(t *testing.T) {
 	cm := newConvertMock(t, encryptedFixture(t, key, convertBody), linkedTask())
 
 	warned := captureStderr(t, func() {
-		if _, err := runCLI(t, cm.m, "notes", "encrypt", convertNoteID); err != nil {
+		if _, err := runCLI(t, cm.m, "notes", "encrypt", "--yes", convertNoteID); err != nil {
 			t.Fatalf("notes encrypt: %v", err)
 		}
 	})
@@ -1039,7 +1102,7 @@ func TestEncryptWarnsAboutHistoryEvenWhenAnotherNoteFailed(t *testing.T) {
 
 	var out string
 	var err error
-	warned := captureStderr(t, func() { out, err = runCLI(t, m, "notes", "encrypt", good, bad) })
+	warned := captureStderr(t, func() { out, err = runCLI(t, m, "notes", "encrypt", "--yes", good, bad) })
 
 	// The run still fails: a script must not read a partial sweep as a clean one.
 	if err == nil {
@@ -1070,20 +1133,61 @@ func TestEncryptWarnsAboutHistoryEvenWhenAnotherNoteFailed(t *testing.T) {
 // server-side window this CLI cannot see, and every older row is untouched
 // regardless. The message has to carry both halves and land on the part that
 // holds either way.
-func TestHistoryCaveatIsTrueInBothDirections(t *testing.T) {
+func TestHistoryCaveatSaysTheHistoryIsDeleted(t *testing.T) {
 	out := captureStderr(t, printHistoryCaveat)
 
 	for _, want := range []string{
-		"may be folded into this write", // the exception, stated as a maybe
-		"older ones stay readable",      // the rule
-		"stored in the clear",           // what holds either way
+		"DELETES the note's version history",
+		"Every earlier version is discarded",
+		"not recoverable",
 	} {
 		if !strings.Contains(out, want) {
-			t.Errorf("the caveat no longer says %q, so it is only true in one direction:\n%s", want, out)
+			t.Errorf("the caveat no longer says %q:\n%s", want, out)
 		}
 	}
-	if strings.Contains(out, "harbor history list") == false {
-		t.Errorf("the caveat does not say how to go and look:\n%s", out)
+}
+
+// TestNothingClaimsHistorySurvivesEncryption is the regression guard the issue
+// asked for: it sweeps every user-visible string the conversion commands can
+// print — help text, confirmations, and the printed caveat — for any claim that
+// earlier versions survive encrypting.
+//
+// The false sentence was copy-pasted into four repos and lived here for months
+// because nothing pinned its absence. A test that only checks the NEW wording
+// would pass while the old paragraph sat two lines below it, so this asserts the
+// absence directly.
+func TestNothingClaimsHistorySurvivesEncryption(t *testing.T) {
+	surfaces := map[string]string{
+		"notes encrypt --help":   notesEncryptCmd.Long,
+		"notes decrypt --help":   notesDecryptCmd.Long,
+		"notes update --help":    notesUpdateCmd.Long,
+		"encrypt confirmation":   notesEncryptConfirmation.Warning,
+		"decrypt confirmation":   notesDecryptConfirmation.Warning,
+		"printed history caveat": captureStderr(t, printHistoryCaveat),
+	}
+	// Each phrase asserted the opposite of what the server does.
+	banned := []string{
+		"stay readable",
+		"stays readable",
+		"are untouched",
+		"is untouched",
+		"folded into this write",
+		"stored in the clear",
+		"snapshotted as plaintext",
+	}
+	for name, text := range surfaces {
+		for _, bad := range banned {
+			if strings.Contains(text, bad) {
+				t.Errorf("%s still claims history survives — contains %q", name, bad)
+			}
+		}
+	}
+
+	// And the truth is stated everywhere it matters.
+	for _, name := range []string{"notes encrypt --help", "notes decrypt --help", "notes update --help", "printed history caveat"} {
+		if !strings.Contains(surfaces[name], "DELETES the note's version history") {
+			t.Errorf("%s does not say the history is deleted", name)
+		}
 	}
 }
 

@@ -190,12 +190,15 @@ is re-encrypted and nothing is re-keyed. Moving one OUT of an encrypting noteboo
 does not decrypt it — encryption is per-note. Use 'harbor notes decrypt' for
 that, which is itself refused while the note is still inside such a notebook.
 
-What sealing a note does NOT cover, and it is worth knowing BEFORE you move one:
+What sealing a note does to it, and what it does NOT cover — both worth knowing
+BEFORE you move one:
 
+` + bulletCaveat(historyLossCaveat) + `
 ` + bulletCaveat(attachmentCaveat) + `
 
-So a note moved into an encrypting notebook is unreadable, but any file attached
-to it is not. The same caveat is printed after the move.`,
+So a note moved into an encrypting notebook loses every earlier version of itself
+and is unreadable from then on, but any file attached to it is not. Both caveats
+are printed after the move.`,
 	Example: `  harbor notes update 9c2e... --title "Plan (final)"
   harbor notes update 9c2e... --file updated.md
   harbor notes update 9c2e... --content "# Rewritten" --keep-tasks
