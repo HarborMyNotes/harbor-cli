@@ -222,6 +222,13 @@ func prepareCommandTree() {
 	rootCmd.InitDefaultHelpCmd()
 	rootCmd.InitDefaultCompletionCmd(os.Args[1:]...)
 	enforceArgContract(rootCmd)
+	// Re-assert the version here, not only in the struct literal, so that what
+	// `--version` prints is guarded by BEHAVIOUR rather than by a test grepping
+	// the literal. The grep is alignment-dependent: add a longer field to the
+	// literal, gofmt re-aligns it, and the grepped string silently matches
+	// nothing — after which a revert to the raw variable goes unnoticed.
+	// Idempotent like the rest of this function.
+	rootCmd.Version = resolveVersion()
 }
 
 // enforceArgContract walks the command tree and closes the two ways a command

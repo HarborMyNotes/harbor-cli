@@ -845,8 +845,21 @@ func TestSupportBundleReportsTheResolvedVersion(t *testing.T) {
 // else exercises; it is exact-string and covers the three files that surface a
 // version today, so treat it as a guard, not a proof.
 func TestVersionIsWiredEverywhere(t *testing.T) {
-	if rootCmd.Version != resolveVersion() {
-		t.Errorf("cobra reports %q but resolveVersion() says %q — --version bypasses the resolver", rootCmd.Version, resolveVersion())
+	// Behavioural, not a comparison of two expressions that are equal by
+	// construction: with the reader swapped, what --version would print must be
+	// the fake's tag. `rootCmd.Version != resolveVersion()` reads like a check
+	// and is not one — in a test binary both sides are "dev" regardless.
+	origVersion, origReader, origCobra := version, readBuildInfo, rootCmd.Version
+	t.Cleanup(func() {
+		version, readBuildInfo, rootCmd.Version = origVersion, origReader, origCobra
+	})
+	version = devVersion
+	readBuildInfo = func() (*debug.BuildInfo, bool) {
+		return &debug.BuildInfo{Main: debug.Module{Version: "v0.1.27"}}, true
+	}
+	prepareCommandTree()
+	if rootCmd.Version != "v0.1.27" {
+		t.Errorf("--version would print %q, want v0.1.27 — cobra bypasses the resolver", rootCmd.Version)
 	}
 
 	for _, f := range []string{"support.go", "skill.go", "root.go"} {
