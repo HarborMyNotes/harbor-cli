@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -261,5 +262,88 @@ func TestSyncPushCommandExitsZeroWhenEverythingApplied(t *testing.T) {
 	}
 	if _, err := runCLI(t, m, "sync", "push", "--file", file, "--device-id", "cli-test", "--scope-id", "u1"); err != nil {
 		t.Fatalf("a clean push must exit 0: %v", err)
+	}
+}
+
+// TestWarnDefaultNotebookEncrypt proves the push path says something when a
+// pushed notebook record carries the banned pair, and stays quiet otherwise.
+//
+// It warns rather than refuses because sync push COERCES server-side (unlike
+// PATCH /notebooks/:id, which 422s): the record lands with default_encrypt
+// forced off and comes back corrected on the next pull. Refusing would reject a
+// batch the server would have accepted; silence would let a flag the user set
+// disappear without explanation.
+func TestWarnDefaultNotebookEncrypt(t *testing.T) {
+	banned := []any{map[string]any{
+		"type": "notebook", "id": "nb1",
+		"record": map[string]any{"id": "nb1", "is_default": true, "default_encrypt": true},
+	}}
+	out := captureStderr(t, func() { warnDefaultNotebookEncrypt(banned) })
+	for _, want := range []string{"default", "force", "next pull"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the warning does not mention %q:\n%s", want, out)
+		}
+	}
+
+	quiet := []any{
+		map[string]any{"type": "notebook", "id": "nb2",
+			"record": map[string]any{"id": "nb2", "is_default": true, "default_encrypt": false}},
+		map[string]any{"type": "notebook", "id": "nb3",
+			"record": map[string]any{"id": "nb3", "is_default": false, "default_encrypt": true}},
+		map[string]any{"type": "note", "id": "n1",
+			"record": map[string]any{"id": "n1", "is_default": true, "default_encrypt": true}},
+		map[string]any{"type": "notebook", "id": "nb4"}, // no record at all
+		"not an envelope",
+	}
+	if out := captureStderr(t, func() { warnDefaultNotebookEncrypt(quiet) }); out != "" {
+		t.Errorf("warned about a legal push:\n%s", out)
+	}
+}
+
+// TestWarnDefaultNotebookEncryptSpeaksOnce proves a batch full of offending
+// notebooks produces one warning, not one per record — a push is a batch, and a
+// wall of identical warnings is how people learn to scroll past them.
+func TestWarnDefaultNotebookEncryptSpeaksOnce(t *testing.T) {
+	var changes []any
+	for i := 0; i < 5; i++ {
+		changes = append(changes, map[string]any{
+			"type": "notebook", "id": "nb",
+			"record": map[string]any{"id": "nb", "is_default": true, "default_encrypt": true},
+		})
+	}
+	out := captureStderr(t, func() { warnDefaultNotebookEncrypt(changes) })
+	if n := strings.Count(out, "cannot store that pair"); n != 1 {
+		t.Errorf("warned %d times for one batch, want 1:\n%s", n, out)
+	}
+}
+
+// TestNoNotebookRecordsAreConstructedByTheCLI is the CLI's whole "the sync engine
+// cannot produce the banned pair" obligation, discharged structurally.
+//
+// The CLI keeps no offline queue: `sync push` forwards a JSON file the user
+// wrote, and the only sync record the CLI builds itself is the crypto keystore.
+// So there is no client-side state that could hold a default notebook with
+// default_encrypt on. This test fails the day that stops being true — if someone
+// adds code that constructs a "notebook" sync record, the guarantee needs
+// rethinking rather than silently lapsing.
+func TestNoNotebookRecordsAreConstructedByTheCLI(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The keystore record in crypto.go is the one the CLI legitimately builds.
+		for _, banned := range []string{`"type":      "notebook"`, `"type": "notebook"`} {
+			if strings.Contains(string(src), banned) {
+				t.Errorf("%s constructs a notebook sync record — the CLI's 'no local state can hold the banned pair' guarantee no longer holds by construction", f)
+			}
+		}
 	}
 }

@@ -88,6 +88,7 @@ server_record you need to resolve it comes back in the results, so that stays 0.
 		if err != nil {
 			return err
 		}
+		warnDefaultNotebookEncrypt(changes)
 		data, err := c.SyncPush(map[string]any{"scope_id": scopeID, "device_id": deviceID, "changes": changes})
 		if err != nil {
 			return mapSyncError(err)
@@ -558,4 +559,41 @@ func init() {
 
 	syncCmd.AddCommand(syncPullCmd, syncPushCmd, syncDevicesCmd, syncRegisterDeviceCmd, syncRemoveDeviceCmd, syncAckCmd)
 	rootCmd.AddCommand(syncCmd)
+}
+
+// warnDefaultNotebookEncrypt tells the user when a pushed notebook envelope would
+// make one notebook both the account default and encrypt-by-default.
+//
+// It WARNS rather than refuses, because that is what the server does here. Unlike
+// PATCH /notebooks/:id — which 422s and writes nothing — sync push coerces:
+// a pushed record that ends up default has default_encrypt forced to 0, and the
+// corrected record comes back on the next pull as an ordinary server-authoritative
+// overwrite. Refusing locally would break the passthrough contract of this command
+// (the envelopes are the user's own JSON) and reject a batch the server would have
+// accepted. Saying nothing would leave the user to discover on a later pull that a
+// flag they set had been quietly turned off.
+//
+// This is also the whole of the CLI's "sync engine cannot produce the pair"
+// obligation: the CLI keeps no local queue and constructs no notebook records of
+// its own — `sync push` forwards a JSON file the user wrote — so there is no
+// client-side state that could hold the banned pair. Pinned by
+// TestNoNotebookRecordsAreConstructedByTheCLI.
+func warnDefaultNotebookEncrypt(changes []any) {
+	for _, ch := range changes {
+		env, ok := ch.(map[string]any)
+		if !ok || str(env, "type") != "notebook" {
+			continue
+		}
+		rec := nested(env, "record")
+		if rec == nil {
+			continue
+		}
+		if boolean(rec, "is_default") && boolean(rec, "default_encrypt") {
+			fmt.Fprintln(os.Stderr, dim("Note: a pushed notebook is both the default and encrypt-by-default. The server\n"+
+				"cannot store that pair — the default is where forwarded email, imports and notes\n"+
+				"with no notebook land, and none of those can encrypt — so it will force\n"+
+				"default_encrypt off and send the corrected record back on your next pull."))
+			return
+		}
+	}
 }
