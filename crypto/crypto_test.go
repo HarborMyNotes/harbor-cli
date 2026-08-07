@@ -76,8 +76,14 @@ func TestOpenField_ReferenceVector(t *testing.T) {
 // It is a hardcoded LITERAL on purpose. #86 slipped through because the test
 // helper recomputed the expected envelope with the same wrong AAD the code used,
 // so the suite agreed with the bug. A literal cannot do that.
+// legacyVector is the same parameters sealed with the pre-#86 separatorless AAD
+// ("note-1content"). Pinned as a literal too, so the negative test asserts
+// against the real broken output rather than something merely different. The
+// ciphertext is identical to crossClientVector; only the GCM tag differs, which
+// is why the bug surfaced as a clean auth failure rather than corruption.
 const (
 	crossClientVector    = "HRBC2.AAECAwQFBgcICQoL.FGe1aaCR4nXiNfKr04YcFISiyIPEgI0uXE_6tfgGWQw"
+	legacyVector         = "HRBC2.AAECAwQFBgcICQoL.FGe1aaCR4nXiNfKr04YcFE51m3k-lGztdNYH6AGwEZU"
 	crossClientID        = "note-1"
 	crossClientField     = "content"
 	crossClientPlaintext = "Secret note body"
@@ -90,6 +96,15 @@ func crossClientKey() []byte {
 		key[i] = byte(i)
 	}
 	return key
+}
+
+// crossClientNonce returns the vector's nonce: the bytes 0x00 through 0x0b.
+func crossClientNonce() []byte {
+	nonce := make([]byte, 12)
+	for i := range nonce {
+		nonce[i] = byte(i)
+	}
+	return nonce
 }
 
 // TestOpenField_CrossClientVector proves this CLI can READ an envelope produced
@@ -107,16 +122,30 @@ func TestOpenField_CrossClientVector(t *testing.T) {
 }
 
 // TestSealField_CrossClientVector proves this CLI can be READ BY the other
-// clients: it seals with SealField, then decrypts with an independent reference
-// implementation using the canonical utf8(id + ":" + field) AAD. SealField picks
-// its own random nonce, so the envelope cannot be compared to the literal byte
-// for byte — decrypting it under the canonical AAD is the equivalent proof, and
-// TestOpenField_CrossClientVector pins the literal from the other direction.
+// clients, in the strongest form available: sealing the vector's parameters with
+// the vector's nonce must reproduce the shared envelope byte for byte. Anything
+// less — a different AAD, tag order, or base64 flavour — changes the string.
 func TestSealField_CrossClientVector(t *testing.T) {
+	got, err := sealFieldWithNonce(crossClientKey(), crossClientID, crossClientField, crossClientPlaintext, crossClientNonce())
+	if err != nil {
+		t.Fatalf("sealFieldWithNonce: %v", err)
+	}
+	if got != crossClientVector {
+		t.Fatalf("envelope does not match the shared cross-client vector — other clients cannot read what we seal\n got: %s\nwant: %s", got, crossClientVector)
+	}
+}
+
+// TestSealField_ReadableByCanonicalReader proves the same property for the real,
+// random-nonce SealField path that production actually uses: an independent
+// reader supplying the canonical AAD must be able to open it.
+func TestSealField_ReadableByCanonicalReader(t *testing.T) {
 	key := crossClientKey()
 	env, err := SealField(key, crossClientID, crossClientField, crossClientPlaintext)
 	if err != nil {
 		t.Fatalf("SealField: %v", err)
+	}
+	if env == crossClientVector {
+		t.Fatal("SealField reused the vector's nonce — it must generate a fresh one")
 	}
 	got, err := openRefAAD(t, key, crossClientID+":"+crossClientField, env)
 	if err != nil {
@@ -133,13 +162,17 @@ func TestSealField_CrossClientVector(t *testing.T) {
 // the happy path would pass again the moment someone "simplified" fieldAAD.
 func TestFieldAAD_RejectsLegacySeparatorless(t *testing.T) {
 	key := crossClientKey()
-	nonce := []byte("0123456789ab") // 12 bytes, fixed
 
-	legacy := sealRefAAD(t, key, crossClientID+crossClientField, crossClientPlaintext, nonce)
+	// Built with the vector's own nonce, so this is the exact envelope the CLI
+	// used to produce — and it must equal the pinned legacyVector literal.
+	legacy := sealRefAAD(t, key, crossClientID+crossClientField, crossClientPlaintext, crossClientNonce())
+	if legacy != legacyVector {
+		t.Fatalf("legacy reference envelope drifted\n got: %s\nwant: %s", legacy, legacyVector)
+	}
 	if legacy == crossClientVector {
 		t.Fatal("the separatorless AAD produced the canonical vector — the vector or the helper is wrong")
 	}
-	if _, err := OpenField(key, crossClientID, crossClientField, legacy); !errors.Is(err, ErrDecrypt) {
+	if _, err := OpenField(key, crossClientID, crossClientField, legacyVector); !errors.Is(err, ErrDecrypt) {
 		t.Fatalf("OpenField on a legacy separatorless envelope: err = %v, want ErrDecrypt", err)
 	}
 

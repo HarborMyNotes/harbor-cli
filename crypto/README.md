@@ -66,8 +66,10 @@ contract):
   (`app.harbor.my` → `web/src/lib/crypto/envelope.ts`); macOS/iOS, Android and
   Windows all match it byte-for-byte, and so must this CLI. The separator was
   missing here until #86, which made every CLI-sealed note undecryptable by every
-  other client. `TestSealField_CrossClientVector` pins the shared known-answer
-  vector as a literal so it cannot drift again.
+  other client. The shared known-answer vector is pinned as a literal in
+  `crypto_test.go` (`crossClientVector`, asserted in both directions by
+  `TestSealField_CrossClientVector` and `TestOpenField_CrossClientVector`) so it
+  cannot drift again.
 - An encrypted note may have an **empty title** (sent as `""`, not an envelope);
   `content` must always be a valid envelope.
 
