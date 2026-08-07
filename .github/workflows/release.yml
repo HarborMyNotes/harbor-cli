@@ -57,6 +57,17 @@ jobs:
           echo "Next version: $NEXT_VERSION"
           echo "version=$NEXT_VERSION" >> "$GITHUB_OUTPUT"
 
+      # ---------------------------------------------------------------------
+      # THE FIVE ASSET NAMES BELOW ARE A PUBLIC CONTRACT. Do not rename one
+      # without updating every consumer in the SAME change:
+      #
+      #   - Formula/harbor.rb        (Homebrew; downloads a named asset)
+      #   - harbor.my/install.sh     (the one-line installer)
+      #
+      # Both hardcode these filenames and the name "checksums.txt". Renaming an
+      # asset does not break the build — it silently breaks every install script
+      # already in the wild, which only shows up as user reports days later.
+      # ---------------------------------------------------------------------
       - name: Build binaries
         run: |
           VERSION=${{ steps.version.outputs.version }}
@@ -67,6 +78,24 @@ jobs:
           GOOS=linux   GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/harbor-linux-amd64 .
           GOOS=linux   GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/harbor-linux-arm64 .
           GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/harbor-windows-amd64.exe .
+
+      # Publishes a SHA-256 manifest so a download can be verified. Consumed by
+      # the Homebrew formula (which pins a sha256) and by install.sh.
+      - name: Generate checksums
+        run: |
+          cd dist
+          # Bare filenames, no dist/ prefix, so `sha256sum -c checksums.txt`
+          # works from a directory of downloaded release assets.
+          #
+          # The glob is `harbor-*`, NOT `*`: a bare `*` on a re-run of this step
+          # would find the checksums.txt left by the previous attempt and list it
+          # in its own manifest, which then fails `sha256sum -c`.
+          sha256sum harbor-* > checksums.txt
+          echo "--- checksums.txt ---"
+          cat checksums.txt
+          # Prove the manifest verifies before it is published, rather than
+          # finding out from a user whose install.sh refused the download.
+          sha256sum -c checksums.txt
 
       - name: Create tag
         run: |
@@ -97,4 +126,9 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/harbor.rb
           git commit -m "Update Homebrew formula to ${VERSION}"
+          # This push MUST use the default GITHUB_TOKEN. A push authenticated by
+          # that token does not trigger workflows, which is the only thing
+          # stopping this commit from starting another release — and so on
+          # forever. Switching to a PAT or a deploy key here creates an infinite
+          # release loop that burns a version number every few minutes.
           git push origin main

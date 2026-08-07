@@ -716,3 +716,51 @@ func TestSavedSessionIsStillCached(t *testing.T) {
 		t.Errorf("a saved session no longer caches its resolved user id:\n%s", body)
 	}
 }
+
+// TestVersionFromBuildInfo pins which embedded module versions are real releases
+// worth reporting and which are local builds.
+//
+// The distinction is not obvious: a plain `go build` in this repo does NOT embed
+// "(devel)" — because the tree has release tags, Go synthesizes a PSEUDO-VERSION
+// like v0.1.31-0.20260807051754-b683a4a261ad, which looks like a version and is
+// not one. Reporting it would put a number nobody can install into bug reports.
+func TestVersionFromBuildInfo(t *testing.T) {
+	cases := map[string]string{
+		// Real release tags — what `go install pkg@vX.Y.Z` embeds.
+		"v0.1.27":    "v0.1.27",
+		"v1.0.0":     "v1.0.0",
+		"v0.2.0-rc1": "v0.2.0-rc1",
+
+		// Local builds, in every shape they come in.
+		"":                                      devVersion,
+		"(devel)":                               devVersion,
+		"v0.1.31-0.20260807051754-b683a4a261ad": devVersion, // untagged commit
+		"v0.1.31-0.20260807051754-b683a4a261ad+dirty": devVersion, // modified tree
+		"v0.0.0-20260807051754-b683a4a261ad":          devVersion, // never-tagged module
+	}
+	for in, want := range cases {
+		if got := versionFromBuildInfo(in); got != want {
+			t.Errorf("versionFromBuildInfo(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestResolveVersionPrefersLdflags proves the injected value always wins, so a
+// release binary reports exactly what the workflow stamped and the build-info
+// fallback cannot change it.
+func TestResolveVersionPrefersLdflags(t *testing.T) {
+	original := version
+	t.Cleanup(func() { version = original })
+
+	version = "v9.9.9"
+	if got := resolveVersion(); got != "v9.9.9" {
+		t.Errorf("resolveVersion() = %q, want the injected v9.9.9", got)
+	}
+
+	// With nothing injected, this test binary's own build info decides. Whatever
+	// it is, it must never be a raw pseudo-version leaking to the user.
+	version = devVersion
+	if got := resolveVersion(); pseudoVersionRe.MatchString(got) || strings.HasSuffix(got, "+dirty") {
+		t.Errorf("resolveVersion() leaked a local build version: %q", got)
+	}
+}

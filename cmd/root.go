@@ -13,6 +13,8 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"regexp"
+	"runtime/debug"
 	"strings"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
@@ -34,10 +36,62 @@ var (
 	apiURLFlag string
 )
 
+// devVersion is the sentinel a build carries when nothing injected a version.
+const devVersion = "dev"
+
 // version is the CLI version, injected at build time via
 // -ldflags "-X github.com/HarborMyNotes/harbor-cli/cmd.version=vX.Y.Z".
-// It defaults to "dev" for local builds.
-var version = "dev"
+// It defaults to devVersion for local builds; resolveVersion recovers the real
+// one for a `go install` build, which does no injection.
+var version = devVersion
+
+// resolveVersion returns the version to report.
+//
+// The ldflags value wins whenever it is set, so a release binary reports exactly
+// what the workflow stamped and this function changes nothing about it.
+//
+// The fallback exists for `go install github.com/HarborMyNotes/harbor-cli@latest`
+// — a documented install route that does no ldflags injection, so it used to
+// report "dev" no matter which tag you asked for. Go embeds the module version
+// in the binary, so it can simply be read back.
+//
+// A local build is reported as "dev" rather than passed through, and there are
+// three shapes of that — which is more than it looks:
+//
+//   - "(devel)", from a build with no VCS stamping;
+//   - a PSEUDO-VERSION like v0.1.31-0.20260807051754-b683a4a261ad, which Go
+//     synthesizes for a commit that is not a release tag. It looks like a
+//     version and is not one, so passing it through would put a number nobody
+//     can install into bug reports;
+//   - the same with a "+dirty" suffix, from a modified working tree.
+//
+// Only a real tag is reported, which is what `go install pkg@vX.Y.Z` embeds.
+func resolveVersion() string {
+	if version != devVersion {
+		return version
+	}
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return devVersion
+	}
+	return versionFromBuildInfo(info.Main.Version)
+}
+
+// versionFromBuildInfo decides whether an embedded module version is a real
+// release tag worth reporting, or a local build that should read "dev". It is
+// split out from resolveVersion so every shape can be tested directly rather
+// than by building binaries.
+func versionFromBuildInfo(v string) string {
+	if v == "" || v == "(devel)" || strings.HasSuffix(v, "+dirty") || pseudoVersionRe.MatchString(v) {
+		return devVersion
+	}
+	return v
+}
+
+// pseudoVersionRe matches the timestamp-and-hash core Go puts in every
+// pseudo-version (yyyymmddhhmmss-<12 hex>), which is what separates "built from
+// some commit" from "installed from a release tag".
+var pseudoVersionRe = regexp.MustCompile(`[0-9]{14}-[0-9a-f]{12}`)
 
 // Command group annotations, so `harbor --help` clusters related commands.
 const (
@@ -70,7 +124,7 @@ Get started:
 Credentials are stored in ~/.config/harbor/credentials.json (0600) as a
 non-expiring token, so you stay signed in. Set HARBOR_TOKEN to use a token for a
 single command without logging in. Every command honors --json.`,
-	Version:       version,
+	Version:       resolveVersion(),
 	SilenceErrors: true, // we render errors ourselves in Execute
 	SilenceUsage:  true,
 }
