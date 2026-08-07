@@ -87,14 +87,18 @@ jobs:
           # Bare filenames, no dist/ prefix, so `sha256sum -c checksums.txt`
           # works from a directory of downloaded release assets.
           #
-          # The glob is `harbor-*`, NOT `*`: a bare `*` on a re-run of this step
-          # would find the checksums.txt left by the previous attempt and list it
-          # in its own manifest, which then fails `sha256sum -c`.
+          # The glob is `harbor-*`, NOT `*`. The shell creates checksums.txt for
+          # the redirect before sha256sum runs, so any `*` that expands AFTER
+          # that lists the file in its own manifest — which then fails `-c`.
+          # This job gets a fresh runner every time, so it cannot happen here;
+          # `harbor-*` is simply the glob that stays correct if this ever runs
+          # somewhere with a dirty dist/, and it says what it means.
           sha256sum harbor-* > checksums.txt
           echo "--- checksums.txt ---"
           cat checksums.txt
-          # Prove the manifest verifies before it is published, rather than
-          # finding out from a user whose install.sh refused the download.
+          # A cheap self-check, not a security guarantee: it re-hashes the same
+          # files seconds later on the same disk, so only a truncated write or
+          # bad hardware makes it fail. It does NOT verify the uploaded assets.
           sha256sum -c checksums.txt
 
       - name: Create tag

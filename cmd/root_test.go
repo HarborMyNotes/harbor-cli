@@ -756,11 +756,40 @@ func TestResolveVersionPrefersLdflags(t *testing.T) {
 	if got := resolveVersion(); got != "v9.9.9" {
 		t.Errorf("resolveVersion() = %q, want the injected v9.9.9", got)
 	}
+}
 
-	// With nothing injected, this test binary's own build info decides. Whatever
-	// it is, it must never be a raw pseudo-version leaking to the user.
-	version = devVersion
-	if got := resolveVersion(); pseudoVersionRe.MatchString(got) || strings.HasSuffix(got, "+dirty") {
-		t.Errorf("resolveVersion() leaked a local build version: %q", got)
+// TestVersionIsWiredEverywhere pins that resolveVersion is actually REACHED.
+//
+// Without this the whole feature can be deleted with a green suite: reverting
+// cobra's Version field to the raw variable, or removing the build-info fallback
+// outright, breaks nothing that any other test asserts. A version helper nothing
+// calls is just a well-tested unused function.
+//
+// The support bundle matters as much as --version here. It exists for triage, so
+// a bundle reporting "dev" while the same binary's --version reports v0.1.32 is
+// worse than either answer alone.
+func TestVersionIsWiredEverywhere(t *testing.T) {
+	// NOT mutated: cobra's Version field is evaluated once at package init, so a
+	// later assignment to the variable cannot move it — which is correct for a
+	// real binary, where ldflags sets the value at link time. Compare under
+	// ambient conditions and let the source check below catch a revert.
+	prepareCommandTree()
+	if rootCmd.Version != resolveVersion() {
+		t.Errorf("cobra reports %q but resolveVersion() says %q — --version bypasses the resolver", rootCmd.Version, resolveVersion())
+	}
+
+	// Every other place the version is surfaced must agree with it. A literal
+	// grep, because the failure mode is a NEW call site reading the raw variable
+	// — which no behavioural test would notice.
+	for _, f := range []string{"support.go", "skill.go", "root.go"} {
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, bad := range []string{"CLIVersion: version", `"app_version":  version`, "Version:       version,"} {
+			if strings.Contains(string(src), bad) {
+				t.Errorf("%s surfaces the raw version variable (%q) instead of resolveVersion(), so it reports \"dev\" under go install", f, bad)
+			}
+		}
 	}
 }

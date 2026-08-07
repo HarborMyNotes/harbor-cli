@@ -66,6 +66,10 @@ var version = devVersion
 //   - the same with a "+dirty" suffix, from a modified working tree.
 //
 // Only a real tag is reported, which is what `go install pkg@vX.Y.Z` embeds.
+// One consequence worth knowing: a `go build` at a CLEAN checkout of an exact
+// release tag reports that tag rather than "dev", because that is genuinely what
+// Go stamps. The common local case — an untagged or dirty tree — still reads
+// "dev".
 func resolveVersion() string {
 	if version != devVersion {
 		return version
