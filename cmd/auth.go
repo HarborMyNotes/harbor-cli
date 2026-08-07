@@ -67,6 +67,90 @@ func loginSummaryJSON(creds *config.Credentials, showToken bool, token string) [
 	return out
 }
 
+// envTokenSession returns the credentials a HARBOR_TOKEN run authenticates with,
+// and whether the environment supplied one at all. It mirrors the branch in
+// loadClientFromConfig so the two can never disagree about what a token session
+// looks like.
+func envTokenSession() (*config.Credentials, bool) {
+	tok := strings.TrimSpace(os.Getenv("HARBOR_TOKEN"))
+	if tok == "" {
+		return nil, false
+	}
+	return &config.Credentials{
+		AccessToken: tok,
+		ClientID:    cliClientID,
+		APIURL:      resolveBaseURL(nil),
+		DeviceID:    envDeviceID(tok),
+		DeviceName:  "harbor-cli (HARBOR_TOKEN)",
+	}, true
+}
+
+// whoamiEnvToken reports a HARBOR_TOKEN session.
+//
+// Unlike the saved-session path this makes ONE network call, because a bare
+// token carries no identity: the email, the scopes and the account all live on
+// the server. Answering "you are authenticated" without saying as whom would be
+// only marginally better than the "not logged in" it replaces.
+//
+// A failed call is reported, not returned as an error. Whether the token works
+// is exactly what the command was asked, so "here is your session, and the
+// server rejected it" is the answer — not a stack of plumbing the user has to
+// interpret.
+func whoamiEnvToken(cmd *cobra.Command, creds *config.Credentials) error {
+	showToken, _ := cmd.Flags().GetBool("show-token")
+
+	c := client.NewClient(creds.BaseURL(), creds.AccessToken)
+	c.Verbose = verboseFlag
+	var email, name string
+	data, err := c.GetProfile()
+	if err == nil {
+		p := parseJSON(client.UnwrapData(data))
+		email, name = str(p, "email"), str(p, "name")
+	}
+
+	if jsonOutput {
+		m := map[string]any{
+			"email":         email,
+			"api_url":       creds.BaseURL(),
+			"token_valid":   err == nil,
+			"never_expires": true,
+			"device_id":     creds.DeviceID,
+			"device_name":   creds.DeviceName,
+			"source":        "HARBOR_TOKEN",
+		}
+		if err != nil {
+			m["error"] = err.Error()
+		}
+		if showToken {
+			m["access_token"] = creds.AccessToken
+		}
+		out, _ := json.Marshal(m)
+		printResult(out, func([]byte) {})
+		return nil
+	}
+
+	pairs := [][2]string{{"Session", "HARBOR_TOKEN (environment)"}}
+	if email != "" {
+		pairs = append(pairs, [2]string{"Email", email})
+	}
+	if name != "" {
+		pairs = append(pairs, [2]string{"Name", name})
+	}
+	pairs = append(pairs,
+		[2]string{"API URL", creds.BaseURL()},
+		[2]string{"Token valid", boolMark(err == nil)},
+		[2]string{"Device", fmt.Sprintf("%s (%s)", creds.DeviceName, creds.DeviceID)},
+	)
+	if showToken {
+		pairs = append(pairs, [2]string{"Access token", creds.AccessToken})
+	}
+	printKV(pairs)
+	if err != nil {
+		fmt.Println(dim("The server rejected this token: " + err.Error()))
+	}
+	return nil
+}
+
 // isNonExpiring reports whether the saved session is a long-lived credential
 // (a Personal Access Token) that never expires and has no refresh token.
 func isNonExpiring(creds *config.Credentials) bool {
@@ -668,8 +752,15 @@ var whoamiCmd = &cobra.Command{
 	Use:     "whoami",
 	Short:   "Show the current session (alias: auth status)",
 	GroupID: groupAuth,
-	Long:    "Displays the logged-in email, API target, granted scopes, token expiry, and device identity.",
-	RunE:    runWhoami,
+	Long: `Displays the logged-in email, API target, granted scopes, token expiry, and
+device identity.
+
+Reads the saved session offline. When HARBOR_TOKEN is set that token is the
+session instead, and since a bare token carries no identity, whoami asks the
+server who it belongs to — so this is the one case where the command makes a
+network call. A token the server rejects is reported, not raised: whether the
+token works is exactly what you asked.`,
+	RunE: runWhoami,
 }
 
 // authStatusCmd is the `auth status` alias of whoami.
@@ -681,6 +772,14 @@ var authStatusCmd = &cobra.Command{
 
 // runWhoami renders the saved session details (offline; no network call).
 func runWhoami(cmd *cobra.Command, args []string) error {
+	// HARBOR_TOKEN authenticates every other command, so reading only the saved
+	// session made whoami answer "not logged in — run 'harbor login' first" for a
+	// session that works perfectly (issue #88). whoami is the first thing anyone
+	// runs when scripting the CLI, so that was the single most misleading answer
+	// in the tool.
+	if creds, ok := envTokenSession(); ok {
+		return whoamiEnvToken(cmd, creds)
+	}
 	creds, err := config.Load()
 	if err != nil {
 		return err

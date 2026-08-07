@@ -286,7 +286,7 @@ func resolveScopeID(c *client.Client, creds *config.Credentials, cmd *cobra.Comm
 		return "", errors.New("could not resolve your user id (pass --scope-id)")
 	}
 	creds.UserID = id
-	_ = config.Save(creds)
+	cacheCredentials(creds)
 	return id, nil
 }
 

@@ -78,7 +78,7 @@ func resolveScopeIDValue(c *client.Client, creds *config.Credentials) (string, e
 		return "", errors.New("could not resolve your user id")
 	}
 	creds.UserID = id
-	_ = config.Save(creds)
+	cacheCredentials(creds)
 	return id, nil
 }
 

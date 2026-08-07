@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -386,5 +388,148 @@ func TestLoginWithTokenPersistsPAT(t *testing.T) {
 	}
 	if !isNonExpiring(creds) {
 		t.Error("a pasted PAT should store as a non-expiring credential")
+	}
+}
+
+// TestWhoamiUnderEnvTokenReportsTheSession is the other half of #88: whoami read
+// only the saved session, so a perfectly working HARBOR_TOKEN run was told "not
+// logged in — run 'harbor login' first". It is the first command anyone runs when
+// scripting the CLI, which made it the most misleading answer in the tool.
+func TestWhoamiUnderEnvTokenReportsTheSession(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer hbp_env-token" {
+			t.Errorf("profile fetched without the env token: %q", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"u1","email":"you@example.com","name":"Test User"}`))
+	}))
+	defer srv.Close()
+
+	t.Setenv("HOME", t.TempDir()) // no saved session at all
+	t.Setenv("HARBOR_TOKEN", "hbp_env-token")
+	t.Setenv("HARBOR_API_URL", srv.URL)
+	resetCommandState(t)
+
+	out := captureStdout(t, func() {
+		if err := runWhoami(whoamiCmd, nil); err != nil {
+			t.Fatalf("whoami: %v", err)
+		}
+	})
+	for _, want := range []string{"HARBOR_TOKEN", "you@example.com", srv.URL} {
+		if !strings.Contains(out, want) {
+			t.Errorf("whoami output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "not logged in") {
+		t.Errorf("whoami still claims the user is not logged in:\n%s", out)
+	}
+	if strings.Contains(out, "hbp_env-token") {
+		t.Errorf("whoami printed the token without --show-token:\n%s", out)
+	}
+}
+
+// TestWhoamiUnderEnvTokenReportsARejectedToken proves a bad token is answered,
+// not raised. "Is this token any good?" is the question whoami was asked, so a
+// 401 is the answer — returning it as a command error would make the one command
+// that diagnoses auth the one that fails on bad auth.
+func TestWhoamiUnderEnvTokenReportsARejectedToken(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"code":"invalid_token","message":"The access token is invalid."}}`))
+	}))
+	defer srv.Close()
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("HARBOR_TOKEN", "hbp_revoked")
+	t.Setenv("HARBOR_API_URL", srv.URL)
+	resetCommandState(t)
+
+	out := captureStdout(t, func() {
+		if err := runWhoami(whoamiCmd, nil); err != nil {
+			t.Fatalf("whoami should report a bad token, not fail: %v", err)
+		}
+	})
+	if !strings.Contains(out, "HARBOR_TOKEN") {
+		t.Errorf("whoami did not name the session source:\n%s", out)
+	}
+	if !strings.Contains(strings.ToLower(out), "rejected") {
+		t.Errorf("whoami did not say the token was rejected:\n%s", out)
+	}
+}
+
+// TestWhoamiUnderEnvTokenJSON pins the machine-readable shape, including the
+// source field that tells a script where the session came from.
+func TestWhoamiUnderEnvTokenJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"u1","email":"you@example.com","name":"Test User"}`))
+	}))
+	defer srv.Close()
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("HARBOR_TOKEN", "hbp_env-token")
+	t.Setenv("HARBOR_API_URL", srv.URL)
+	resetCommandState(t)
+	jsonOutput = true
+	t.Cleanup(func() { jsonOutput = false })
+
+	out := captureStdout(t, func() {
+		if err := runWhoami(whoamiCmd, nil); err != nil {
+			t.Fatalf("whoami: %v", err)
+		}
+	})
+	var got map[string]any
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("whoami --json is not valid JSON: %v\n%s", err, out)
+	}
+	if got["source"] != "HARBOR_TOKEN" {
+		t.Errorf("source = %v, want HARBOR_TOKEN", got["source"])
+	}
+	if got["email"] != "you@example.com" {
+		t.Errorf("email = %v", got["email"])
+	}
+	if got["token_valid"] != true {
+		t.Errorf("token_valid = %v, want true", got["token_valid"])
+	}
+	if _, leaked := got["access_token"]; leaked {
+		t.Error("--json leaked the access token without --show-token")
+	}
+}
+
+// TestWhoamiWithoutEnvTokenStillReadsTheSavedSession proves the saved-session
+// path is untouched — and in particular that it stays OFFLINE. It is a local
+// state inspector; only the token session needs the network, because a bare
+// token carries no identity.
+func TestWhoamiWithoutEnvTokenStillReadsTheSavedSession(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("whoami hit the network for a saved session")
+	}))
+	defer srv.Close()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("HARBOR_TOKEN", "")
+	t.Setenv("HARBOR_API_URL", srv.URL)
+	resetCommandState(t)
+
+	if err := os.MkdirAll(filepath.Join(home, ".config", "harbor"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	saved := `{"api_url":"` + srv.URL + `","email":"saved@example.com","access_token":"hbp_saved","token_type":"Bearer","expires_at":0,"device_id":"cli-abc","device_name":"laptop"}`
+	if err := os.WriteFile(filepath.Join(home, ".config", "harbor", "credentials.json"), []byte(saved), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	out := captureStdout(t, func() {
+		if err := runWhoami(whoamiCmd, nil); err != nil {
+			t.Fatalf("whoami: %v", err)
+		}
+	})
+	if !strings.Contains(out, "saved@example.com") {
+		t.Errorf("the saved session was not reported:\n%s", out)
+	}
+	if strings.Contains(out, "HARBOR_TOKEN") {
+		t.Errorf("a saved session was reported as an env-token session:\n%s", out)
 	}
 }
