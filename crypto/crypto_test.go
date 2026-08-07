@@ -76,6 +76,7 @@ func TestOpenField_ReferenceVector(t *testing.T) {
 // It is a hardcoded LITERAL on purpose. #86 slipped through because the test
 // helper recomputed the expected envelope with the same wrong AAD the code used,
 // so the suite agreed with the bug. A literal cannot do that.
+//
 // legacyVector is the same parameters sealed with the pre-#86 separatorless AAD
 // ("note-1content"). Pinned as a literal too, so the negative test asserts
 // against the real broken output rather than something merely different. The
