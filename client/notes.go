@@ -32,6 +32,12 @@ func (c *Client) UpdateNote(id string, body map[string]any) ([]byte, error) {
 // changes what a note holds, this changes how it is STORED — and a reader
 // auditing where the CLI flips a note's encryption should find one name, not a
 // map[string]any three call frames away.
+//
+// IT DESTROYS DATA. The server hard-deletes every note_history snapshot that
+// disagrees with the note's new is_encrypted state, so this call discards the
+// note's entire version history — not a tombstone, and note_history does not
+// sync, so nothing is recoverable from another device. Callers must confirm
+// first; see notesEncryptConfirmation in cmd/notes_convert.go.
 func (c *Client) ConvertNoteToEncrypted(id string, body map[string]any) ([]byte, error) {
 	return c.doPatch("/notes/"+id, body)
 }

@@ -239,7 +239,7 @@ func TestConversionRoundTripLosesNothing(t *testing.T) {
 	cm := newConvertMock(t, plaintextFixture(), linkedTask())
 
 	// ---- plaintext → encrypted ----------------------------------------------
-	if _, err := runCLI(t, cm.m, "notes", "encrypt", convertNoteID); err != nil {
+	if _, err := runCLI(t, cm.m, "notes", "encrypt", "--yes", convertNoteID); err != nil {
 		t.Fatalf("notes encrypt: %v", err)
 	}
 	sealed := cm.note
@@ -327,7 +327,7 @@ func TestEncryptSendsOnlyWhatItMeansTo(t *testing.T) {
 	unlockedSession(t, newMasterKey(t))
 	cm := newConvertMock(t, plaintextFixture(), linkedTask())
 
-	if _, err := runCLI(t, cm.m, "notes", "encrypt", convertNoteID); err != nil {
+	if _, err := runCLI(t, cm.m, "notes", "encrypt", "--yes", convertNoteID); err != nil {
 		t.Fatalf("notes encrypt: %v", err)
 	}
 
@@ -400,7 +400,7 @@ func TestAFailedWriteLeavesTheNoteExactlyAsItWas(t *testing.T) {
 	cm := newConvertMock(t, plaintextFixture(), linkedTask())
 	cm.patchStatus, cm.patchBody = 500, apiErrorBody("internal", "the write did not land")
 
-	_, err := runCLI(t, cm.m, "notes", "encrypt", convertNoteID)
+	_, err := runCLI(t, cm.m, "notes", "encrypt", "--yes", convertNoteID)
 
 	if err == nil {
 		t.Fatal("a failed write reported success")
@@ -418,7 +418,7 @@ func TestAStaleNoteIsRefusedRatherThanClobbered(t *testing.T) {
 	// Somebody else's edit lands between the CLI's GET and its PATCH.
 	cm.m.handler = withPreWriteEdit(cm)
 
-	_, err := runCLI(t, cm.m, "notes", "encrypt", convertNoteID)
+	_, err := runCLI(t, cm.m, "notes", "encrypt", "--yes", convertNoteID)
 
 	if err == nil {
 		t.Fatal("a stale write was accepted")
@@ -458,7 +458,7 @@ func withPreWriteEdit(cm *convertMock) http.HandlerFunc {
 // repaired here is a client that wrote a note the user believed was encrypted.
 func TestConversionRefusesWithoutThePassphrase(t *testing.T) {
 	for _, args := range [][]string{
-		{"notes", "encrypt", convertNoteID},
+		{"notes", "encrypt", "--yes", convertNoteID},
 		{"notes", "decrypt", convertNoteID, "--yes"},
 	} {
 		t.Run(args[1], func(t *testing.T) {
@@ -616,19 +616,107 @@ func TestDecryptCountsWhatItIsAboutToPublish(t *testing.T) {
 	}
 }
 
-// TestEncryptDoesNotAsk is the other side of the same rule. Encrypting is not a
-// downgrade, and a prompt on the safe direction is how people learn to type "yes"
-// without reading the one that matters.
-func TestEncryptDoesNotAsk(t *testing.T) {
+// TestEncryptAsksBeforeDestroyingHistory pins the gate. Encrypting reads like the
+// SAFE direction — it is the one that adds protection — which is exactly why it
+// shipped without a prompt while decrypt had one. It is not safe: the write hard
+// -deletes every earlier version of the note.
+//
+// The count assertion is "exactly one", not "at least one". Asking per note over
+// a --notebook sweep is how a person learns to type "yes" without reading, so
+// asking once for the whole run is the design, not an incidental.
+func TestEncryptAsksBeforeDestroyingHistory(t *testing.T) {
 	unlockedSession(t, newMasterKey(t))
 	cm := newConvertMock(t, plaintextFixture(), linkedTask())
 	asked := answerPrompt(t, "no")
 
-	if _, err := runCLI(t, cm.m, "notes", "encrypt", convertNoteID); err != nil {
-		t.Fatalf("notes encrypt: %v", err)
+	_, err := runCLI(t, cm.m, "notes", "encrypt", convertNoteID)
+	if err == nil {
+		t.Fatal("encrypting went ahead without consent — it deletes the note's history")
 	}
-	if len(*asked) != 0 {
-		t.Errorf("encrypting prompted the user: %v", *asked)
+	if !strings.Contains(err.Error(), "nothing was encrypted") {
+		t.Errorf("a declined confirmation should say nothing was encrypted: %v", err)
+	}
+	if len(*asked) != 1 {
+		t.Errorf("asked %d times, want exactly 1 for the whole run: %v", len(*asked), *asked)
+	}
+	if enc, _ := cm.note["is_encrypted"].(bool); enc {
+		t.Error("the note was encrypted despite the user declining")
+	}
+}
+
+// TestEncryptAsksOncePerRunNotPerNote drives the multi-note form, which is the
+// case the single-note test cannot distinguish: a confirmation moved inside the
+// per-note loop still asks exactly once when there is exactly one note.
+func TestEncryptAsksOncePerRunNotPerNote(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	cm := newConvertMock(t, plaintextFixture(), linkedTask())
+	asked := answerPrompt(t, "no")
+
+	if _, err := runCLI(t, cm.m, "notes", "encrypt", convertNoteID, convertNoteID, convertNoteID); err == nil {
+		t.Fatal("expected the declined confirmation to stop the run")
+	}
+	if len(*asked) != 1 {
+		t.Errorf("asked %d times for a 3-note run, want exactly 1: %v", len(*asked), *asked)
+	}
+}
+
+// TestEncryptRefusesUnattendedWithoutYes pins the scripted path: with nobody at a
+// keyboard the command must refuse rather than silently destroying history, and
+// must name the flag that would have worked.
+func TestEncryptRefusesUnattendedWithoutYes(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	// Declared, not inherited: without this the test only passes because `go test`
+	// happens to hand the binary a non-TTY stdin, and it fails (or blocks) under a
+	// pty. Its decrypt twin has always done this.
+	pipedStdin(t)
+	cm := newConvertMock(t, plaintextFixture(), linkedTask())
+
+	_, err := runCLI(t, cm.m, "notes", "encrypt", convertNoteID)
+	if err == nil {
+		t.Fatal("expected a refusal with no terminal to prompt on")
+	}
+	for _, want := range []string{"version history", "--yes"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal missing %q: %v", want, err)
+		}
+	}
+	if enc, _ := cm.note["is_encrypted"].(bool); enc {
+		t.Error("the note was encrypted without confirmation")
+	}
+}
+
+// TestEncryptConfirmationCountsTheNotes proves a --notebook sweep says how many
+// notes' histories it is about to delete, so the answer is informed rather than
+// reflexive — the same reason the decrypt confirmation carries a count.
+func TestEncryptConfirmationCountsTheNotes(t *testing.T) {
+	answerPrompt(t, "yes")
+	out := captureStdout(t, func() {
+		if err := notesConfirmEncrypt(7, false); err != nil {
+			t.Fatalf("notesConfirmEncrypt: %v", err)
+		}
+	})
+	for _, want := range []string{"7 notes", "deleting the version history"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the question does not say %q:\n%s", want, out)
+		}
+	}
+
+	// Singular reads as a sentence too, not "1 notes".
+	answerPrompt(t, "yes")
+	one := captureStdout(t, func() {
+		if err := notesConfirmEncrypt(1, false); err != nil {
+			t.Fatalf("notesConfirmEncrypt: %v", err)
+		}
+	})
+	if !strings.Contains(one, "1 note,") {
+		t.Errorf("singular wording is wrong:\n%s", one)
+	}
+
+	if notesEncryptConfirmation.Affirmative != "yes" {
+		t.Errorf("affirmative = %q, want \"yes\"", notesEncryptConfirmation.Affirmative)
+	}
+	if !strings.Contains(notesEncryptConfirmation.Warning, "DELETES every earlier version") {
+		t.Errorf("the confirmation does not lead with the deletion:\n%s", notesEncryptConfirmation.Warning)
 	}
 }
 
@@ -802,7 +890,7 @@ func TestConversionIsIdempotent(t *testing.T) {
 	unlockedSession(t, key)
 	cm := newConvertMock(t, encryptedFixture(t, key, convertBody), linkedTask())
 
-	out, err := runCLI(t, cm.m, "notes", "encrypt", convertNoteID)
+	out, err := runCLI(t, cm.m, "notes", "encrypt", "--yes", convertNoteID)
 
 	if err != nil {
 		t.Fatalf("re-encrypting an encrypted note failed: %v", err)
@@ -961,7 +1049,7 @@ func TestEncryptSaysNothingAboutHistoryWhenItSealedNothing(t *testing.T) {
 	cm := newConvertMock(t, encryptedFixture(t, key, convertBody), linkedTask())
 
 	warned := captureStderr(t, func() {
-		if _, err := runCLI(t, cm.m, "notes", "encrypt", convertNoteID); err != nil {
+		if _, err := runCLI(t, cm.m, "notes", "encrypt", "--yes", convertNoteID); err != nil {
 			t.Fatalf("notes encrypt: %v", err)
 		}
 	})
@@ -1039,7 +1127,7 @@ func TestEncryptWarnsAboutHistoryEvenWhenAnotherNoteFailed(t *testing.T) {
 
 	var out string
 	var err error
-	warned := captureStderr(t, func() { out, err = runCLI(t, m, "notes", "encrypt", good, bad) })
+	warned := captureStderr(t, func() { out, err = runCLI(t, m, "notes", "encrypt", "--yes", good, bad) })
 
 	// The run still fails: a script must not read a partial sweep as a clean one.
 	if err == nil {
@@ -1070,20 +1158,100 @@ func TestEncryptWarnsAboutHistoryEvenWhenAnotherNoteFailed(t *testing.T) {
 // server-side window this CLI cannot see, and every older row is untouched
 // regardless. The message has to carry both halves and land on the part that
 // holds either way.
-func TestHistoryCaveatIsTrueInBothDirections(t *testing.T) {
+func TestHistoryCaveatSaysTheHistoryIsDeleted(t *testing.T) {
 	out := captureStderr(t, printHistoryCaveat)
 
 	for _, want := range []string{
-		"may be folded into this write", // the exception, stated as a maybe
-		"older ones stay readable",      // the rule
-		"stored in the clear",           // what holds either way
+		"DELETES the note's version history",
+		"Every earlier version is discarded",
+		"not recoverable",
 	} {
 		if !strings.Contains(out, want) {
-			t.Errorf("the caveat no longer says %q, so it is only true in one direction:\n%s", want, out)
+			t.Errorf("the caveat no longer says %q:\n%s", want, out)
 		}
 	}
-	if strings.Contains(out, "harbor history list") == false {
-		t.Errorf("the caveat does not say how to go and look:\n%s", out)
+}
+
+// TestNothingClaimsHistorySurvivesEncryption is the regression guard the issue
+// asked for: nothing the CLI can print may claim a note's earlier versions
+// survive an encryption change.
+//
+// It WALKS THE COMMAND TREE rather than checking a hand-listed set of strings.
+// The first version of this test listed six fields by name, and a false claim
+// added to a Short, an Example, or any other command's help would have sailed
+// past it — which is the same shape of gap that let the original sentence live
+// here for months. The repo already rejects hand-maintained registries for
+// exactly this reason (see irreversibleClientCalls).
+//
+// The banned phrases are checked only on commands that actually talk about
+// encryption, because a couple of them ("is untouched") are ordinary English
+// elsewhere — 'harbor account' uses it about export formats.
+func TestNothingClaimsHistorySurvivesEncryption(t *testing.T) {
+	prepareCommandTree()
+
+	// Each phrase asserted the opposite of what the server does.
+	banned := []string{
+		"stay readable",
+		"stays readable",
+		"are untouched",
+		"is untouched",
+		"folded into this write",
+		"stored in the clear",
+		"snapshotted as plaintext",
+	}
+
+	checked := 0
+	forEachCommand(t, func(c *cobra.Command) {
+		text := c.Long + "\n" + c.Short + "\n" + c.Example
+		// Anything that talks about encryption, plus the whole 'harbor history'
+		// tree whether it mentions encryption or not: `harbor history list` is
+		// the exact command someone runs to go looking for the versions this
+		// deletes, so it is the likeliest place for the claim to reappear.
+		inScope := strings.Contains(strings.ToLower(text), "encrypt") ||
+			strings.HasPrefix(c.CommandPath(), "harbor history")
+		if !inScope {
+			return
+		}
+		checked++
+		for _, bad := range banned {
+			if strings.Contains(text, bad) {
+				t.Errorf("%q still claims history survives — contains %q", c.CommandPath(), bad)
+			}
+		}
+	})
+	// A floor high enough to notice the walk breaking, not just failing outright.
+	// 18 commands qualify today.
+	if checked < 12 {
+		t.Fatalf("only %d commands are in scope — the walk is not reaching the tree", checked)
+	}
+
+	// The confirmations are not part of the command tree, so they are named.
+	for name, text := range map[string]string{
+		"encrypt confirmation":   notesEncryptConfirmation.Warning,
+		"decrypt confirmation":   notesDecryptConfirmation.Warning,
+		"printed history caveat": captureStderr(t, printHistoryCaveat),
+	} {
+		for _, bad := range banned {
+			if strings.Contains(text, bad) {
+				t.Errorf("%s still claims history survives — contains %q", name, bad)
+			}
+		}
+	}
+
+	// And the truth is stated everywhere a user could be about to lose history.
+	for name, text := range map[string]string{
+		"notes encrypt --help":   notesEncryptCmd.Long,
+		"notes decrypt --help":   notesDecryptCmd.Long,
+		"notes update --help":    notesUpdateCmd.Long,
+		"printed history caveat": captureStderr(t, printHistoryCaveat),
+	} {
+		if !strings.Contains(text, "DELETES the note's version history") {
+			t.Errorf("%s does not say the history is deleted", name)
+		}
+	}
+	// 'harbor history' must not read as though history were permanent.
+	if !strings.Contains(historyCmd.Long, "discards every") {
+		t.Error("harbor history --help does not mention that encryption discards versions")
 	}
 }
 

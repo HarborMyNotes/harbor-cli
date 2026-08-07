@@ -229,6 +229,7 @@ var irreversibleClientCalls = []string{
 	"c.DeleteAccountExport(",    // the archive and its emailed link
 	"c.RequestAccountDeletion(", // the whole account, after a grace window
 	"c.ConvertNoteToPlaintext(", // a note's contents, published to the server
+	"c.ConvertNoteToEncrypted(", // the note's whole version history, hard-deleted
 }
 
 // TestEveryIrreversibleCommandAsksFirst is the check that would have caught the
