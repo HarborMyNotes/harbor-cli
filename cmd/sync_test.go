@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -327,23 +328,33 @@ func TestWarnDefaultNotebookEncryptSpeaksOnce(t *testing.T) {
 // adds code that constructs a "notebook" sync record, the guarantee needs
 // rethinking rather than silently lapsing.
 func TestNoNotebookRecordsAreConstructedByTheCLI(t *testing.T) {
-	files, err := filepath.Glob("*.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, f := range files {
-		if strings.HasSuffix(f, "_test.go") {
-			continue
-		}
-		src, err := os.ReadFile(f)
+	// A regex, not a fixed string: gofmt aligns struct-literal keys to the longest
+	// one, so the spacing after "type" changes with the other keys in the map. An
+	// exact-match check passes on the most natural envelope shape and is worthless.
+	banned := regexp.MustCompile(`"type"\s*:\s*"notebook"`)
+
+	roots := []string{".", "../client", "../crypto", "../config"}
+	scanned := 0
+	for _, root := range roots {
+		files, err := filepath.Glob(filepath.Join(root, "*.go"))
 		if err != nil {
 			t.Fatal(err)
 		}
-		// The keystore record in crypto.go is the one the CLI legitimately builds.
-		for _, banned := range []string{`"type":      "notebook"`, `"type": "notebook"`} {
-			if strings.Contains(string(src), banned) {
+		for _, f := range files {
+			if strings.HasSuffix(f, "_test.go") {
+				continue
+			}
+			src, err := os.ReadFile(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			scanned++
+			if banned.Match(src) {
 				t.Errorf("%s constructs a notebook sync record — the CLI's 'no local state can hold the banned pair' guarantee no longer holds by construction", f)
 			}
 		}
+	}
+	if scanned < 20 {
+		t.Fatalf("only scanned %d files — the walk is not reaching the source tree", scanned)
 	}
 }

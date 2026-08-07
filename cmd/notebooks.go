@@ -167,6 +167,11 @@ var notebooksDeleteCmd = &cobra.Command{
 }
 
 // mapNotebookError gives friendly messages for the notebook-specific codes.
+// default_notebook_cannot_encrypt is deliberately absent from the switch below.
+// Its server message is user-facing copy shared with the web app, and the CLI's
+// default renderer prints an APIError's message verbatim — so paraphrasing it
+// here is the one way to get it wrong. Pinned by
+// TestDefaultCannotEncryptServerMessageIsNotParaphrased.
 func mapNotebookError(err error) error {
 	var apiErr *client.APIError
 	if errors.As(err, &apiErr) {
@@ -177,11 +182,6 @@ func mapNotebookError(err error) error {
 			return errors.New("the default notebook cannot be deleted — promote another notebook first")
 		case "cannot_unset_default":
 			return errors.New("there must always be a default notebook — promote a different one instead")
-			// default_notebook_cannot_encrypt is deliberately NOT mapped. Its server
-			// message is user-facing copy shared with the web app, and the default
-			// renderer prints an APIError's message verbatim — so paraphrasing it
-			// here is the one way to get it wrong. Pinned by
-			// TestDefaultCannotEncryptServerMessageIsNotParaphrased.
 		}
 	}
 	return err
@@ -310,7 +310,7 @@ func init() {
 
 	notebooksCreateCmd.Flags().String("name", "", "Notebook name (required)")
 	notebooksCreateCmd.Flags().String("stack", "", "Stack (grouping label)")
-	notebooksCreateCmd.Flags().Bool("default-encrypt", false, "Encrypt new notes in this notebook by default (never allowed on the default notebook)")
+	notebooksCreateCmd.Flags().Bool("default-encrypt", false, "Encrypt new notes in this notebook by default")
 
 	notebooksUpdateCmd.Flags().String("name", "", "New name")
 	notebooksUpdateCmd.Flags().String("stack", "", "New stack")
