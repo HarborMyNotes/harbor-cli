@@ -104,10 +104,17 @@ var notebooksUpdateCmd = &cobra.Command{
 
 Use --make-default to promote this notebook to the account default (the prior
 default is demoted automatically). There must always be exactly one default, so
-a notebook cannot be un-defaulted directly — promote a different one instead.`,
+a notebook cannot be un-defaulted directly — promote a different one instead.
+
+The default notebook can never also be encrypt-by-default: forwarded email,
+imports, and notes created with no notebook all land in the default, and none of
+those writers can encrypt. So --default-encrypt is refused on the default
+notebook, and --make-default is refused on a notebook that encrypts — unless you
+turn it off in the same command, e.g. --make-default --default-encrypt=false.`,
 	Example: `  harbor notebooks update 5b1f... --name "Work — Active"
   harbor notebooks update 5b1f... --stack Archive --public=false
-  harbor notebooks update 5b1f... --make-default`,
+  harbor notebooks update 5b1f... --make-default
+  harbor notebooks update 5b1f... --make-default --default-encrypt=false`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c, _, err := loadClientFromConfig()
 		if err != nil {
@@ -123,6 +130,10 @@ a notebook cannot be un-defaulted directly — promote a different one instead.`
 		}
 		if len(body) == 0 {
 			return errors.New("nothing to update — pass at least one field flag")
+		}
+		// Refuse the banned pair before spending a request on a guaranteed 422.
+		if err := guardDefaultNotebookEncrypt(c, args[0], body); err != nil {
+			return err
 		}
 		data, err := c.UpdateNotebook(args[0], body)
 		if err != nil {
@@ -156,6 +167,11 @@ var notebooksDeleteCmd = &cobra.Command{
 }
 
 // mapNotebookError gives friendly messages for the notebook-specific codes.
+// default_notebook_cannot_encrypt is deliberately absent from the switch below.
+// Its server message is user-facing copy shared with the web app, and the CLI's
+// default renderer prints an APIError's message verbatim — so paraphrasing it
+// here is the one way to get it wrong. Pinned by
+// TestDefaultCannotEncryptServerMessageIsNotParaphrased.
 func mapNotebookError(err error) error {
 	var apiErr *client.APIError
 	if errors.As(err, &apiErr) {
@@ -169,6 +185,67 @@ func mapNotebookError(err error) error {
 		}
 	}
 	return err
+}
+
+// defaultCannotEncryptMessage is the server's own wording for the banned pair,
+// quoted rather than paraphrased.
+//
+// The rule: a notebook can never be both the account default AND encrypt-by-
+// default. The default is where forwarded email, imports, and notes created with
+// no notebook land, and none of those writers can client-side encrypt — so a
+// note the user believes is sealed would arrive there in the clear.
+//
+// The CLI refuses locally instead of letting the request 422, so the user gets the
+// reason and the fix without spending a write. A request that states both fields
+// needs no network at all; the single-flag cases still read the notebook first,
+// so offline they surface the read error rather than this refusal.
+// The wording matches app.harbor.my internal/notebooks/notebooks.go exactly
+// (issue app.harbor.my#1338); web shows the same sentence.
+const defaultCannotEncryptMessage = "the default notebook can't encrypt notes by default — forwarded email, imports, and notes with no notebook land there; encrypt a different notebook instead"
+
+// guardDefaultNotebookEncrypt refuses an update whose RESULTING state would make
+// one notebook both the default and encrypt-by-default.
+//
+// Judged on the resulting state, not on the fields present, because the server
+// judges it that way: `--make-default --default-encrypt=false` legally promotes a
+// notebook while switching encryption off, and refusing that because the request
+// mentions both flags would block the one command that fixes the situation.
+//
+// It fetches the notebook only when the answer genuinely depends on the current
+// state — when the request sets both fields, or sets neither to a banned value,
+// no round trip happens.
+func guardDefaultNotebookEncrypt(c *client.Client, id string, body map[string]any) error {
+	wantEncrypt, encryptSet := body["default_encrypt"].(bool)
+	wantDefault, defaultSet := body["is_default"].(bool)
+
+	// Turning encryption OFF can never produce the pair, whatever else changes.
+	if encryptSet && !wantEncrypt {
+		return nil
+	}
+	// Both stated in one request: decidable with no fetch.
+	if encryptSet && wantEncrypt && defaultSet && wantDefault {
+		return errors.New(defaultCannotEncryptMessage)
+	}
+	// Only one side stated; the other comes from the notebook as it stands.
+	needCurrent := (encryptSet && wantEncrypt) || (defaultSet && wantDefault)
+	if !needCurrent {
+		return nil
+	}
+	data, err := c.GetNotebook(id, false)
+	if err != nil {
+		// A notebook we cannot read is not one we can clear. Let the write go and
+		// let the server judge it — it enforces the same rule, and failing the
+		// command here would turn a transient read error into a refusal to write.
+		return nil
+	}
+	nb := parseJSON(client.UnwrapData(data))
+	if encryptSet && wantEncrypt && boolean(nb, "is_default") {
+		return errors.New(defaultCannotEncryptMessage)
+	}
+	if defaultSet && wantDefault && boolean(nb, "default_encrypt") {
+		return errors.New(defaultCannotEncryptMessage + " — switch it off with '--default-encrypt=false' in the same command to promote this notebook")
+	}
+	return nil
 }
 
 // ===========================================================================
@@ -239,9 +316,9 @@ func init() {
 
 	notebooksUpdateCmd.Flags().String("name", "", "New name")
 	notebooksUpdateCmd.Flags().String("stack", "", "New stack")
-	notebooksUpdateCmd.Flags().Bool("default-encrypt", false, "Encrypt new notes by default")
+	notebooksUpdateCmd.Flags().Bool("default-encrypt", false, "Encrypt new notes by default (never allowed on the default notebook)")
 	notebooksUpdateCmd.Flags().Bool("public", false, "Make the notebook public")
-	notebooksUpdateCmd.Flags().Bool("make-default", false, "Promote this notebook to the account default")
+	notebooksUpdateCmd.Flags().Bool("make-default", false, "Promote this notebook to the account default (refused if it encrypts by default)")
 
 	notebooksDeleteCmd.Flags().String("notes", "", "What to do with its notes: move_to_default (default) or trash")
 

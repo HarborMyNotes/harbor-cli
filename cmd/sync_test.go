@@ -7,9 +7,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -261,5 +264,113 @@ func TestSyncPushCommandExitsZeroWhenEverythingApplied(t *testing.T) {
 	}
 	if _, err := runCLI(t, m, "sync", "push", "--file", file, "--device-id", "cli-test", "--scope-id", "u1"); err != nil {
 		t.Fatalf("a clean push must exit 0: %v", err)
+	}
+}
+
+// TestWarnDefaultNotebookEncrypt proves the push path says something when a
+// pushed notebook record carries the banned pair, and stays quiet otherwise.
+//
+// It warns rather than refuses because sync push COERCES server-side (unlike
+// PATCH /notebooks/:id, which 422s): the record lands with default_encrypt
+// forced off and comes back corrected on the next pull. Refusing would reject a
+// batch the server would have accepted; silence would let a flag the user set
+// disappear without explanation.
+func TestWarnDefaultNotebookEncrypt(t *testing.T) {
+	banned := []any{map[string]any{
+		"type": "notebook", "id": "nb1",
+		"record": map[string]any{"id": "nb1", "is_default": true, "default_encrypt": true},
+	}}
+	out := captureStderr(t, func() { warnDefaultNotebookEncrypt(banned) })
+	for _, want := range []string{"default", "force", "next pull"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the warning does not mention %q:\n%s", want, out)
+		}
+	}
+
+	quiet := []any{
+		map[string]any{"type": "notebook", "id": "nb2",
+			"record": map[string]any{"id": "nb2", "is_default": true, "default_encrypt": false}},
+		map[string]any{"type": "notebook", "id": "nb3",
+			"record": map[string]any{"id": "nb3", "is_default": false, "default_encrypt": true}},
+		map[string]any{"type": "note", "id": "n1",
+			"record": map[string]any{"id": "n1", "is_default": true, "default_encrypt": true}},
+		map[string]any{"type": "notebook", "id": "nb4"}, // no record at all
+		"not an envelope",
+	}
+	if out := captureStderr(t, func() { warnDefaultNotebookEncrypt(quiet) }); out != "" {
+		t.Errorf("warned about a legal push:\n%s", out)
+	}
+}
+
+// TestWarnDefaultNotebookEncryptSpeaksOnce proves a batch full of offending
+// notebooks produces one warning, not one per record — a push is a batch, and a
+// wall of identical warnings is how people learn to scroll past them.
+func TestWarnDefaultNotebookEncryptSpeaksOnce(t *testing.T) {
+	var changes []any
+	for i := 0; i < 5; i++ {
+		changes = append(changes, map[string]any{
+			"type": "notebook", "id": "nb",
+			"record": map[string]any{"id": "nb", "is_default": true, "default_encrypt": true},
+		})
+	}
+	out := captureStderr(t, func() { warnDefaultNotebookEncrypt(changes) })
+	if n := strings.Count(out, "cannot store that pair"); n != 1 {
+		t.Errorf("warned %d times for one batch, want 1:\n%s", n, out)
+	}
+}
+
+// TestNoNotebookRecordsAreConstructedByTheCLI is the canary over the CLI's "the
+// sync engine cannot produce the banned pair" property.
+//
+// The property holds by construction: the CLI keeps no offline queue, and there
+// are exactly two SyncPush call sites — this file's push command, which forwards
+// a JSON file the USER wrote, and cmd/crypto.go, which pushes the keystore. So
+// there is no client-side state that could hold a default notebook with
+// default_encrypt on.
+//
+// This test is a canary, NOT a proof. It walks the whole module and greps for a
+// notebook type tag, which catches the obvious regression — someone building a
+// notebook envelope inline — but a determined one slips past: a struct with a
+// json tag, a const indirection, or a value assembled at runtime. Treat a
+// failure here as certain, and a pass as "nothing obvious", not as a guarantee.
+// A real proof would parse with go/ast and follow the values into SyncPush.
+func TestNoNotebookRecordsAreConstructedByTheCLI(t *testing.T) {
+	// A regex, not a fixed string: gofmt aligns struct-literal keys to the longest
+	// one, so the spacing after "type" changes with the other keys in the map. An
+	// exact-match check passes on the most natural envelope shape.
+	banned := regexp.MustCompile(`"type"\s*:\s*"notebook"`)
+
+	// Walk the whole module from its root rather than a hardcoded package list, so
+	// a new package cannot be invisible to this simply by existing.
+	scanned := 0
+	err := filepath.WalkDir("..", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", "build", "dist", "vendor", "node_modules":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		src, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		scanned++
+		if banned.Match(src) {
+			t.Errorf("%s constructs a notebook sync record — the CLI's 'no local state can hold the banned pair' property no longer holds by construction", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scanned < 40 {
+		t.Fatalf("only scanned %d files — the walk is not reaching the source tree", scanned)
 	}
 }

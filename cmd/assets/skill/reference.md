@@ -73,6 +73,17 @@ Containers for notes; exactly one **default** notebook per account.
 `--make-default` promotes a notebook (the prior default is demoted; you can't
 "un-default" directly — promote another). The default notebook can't be deleted.
 
+**The default notebook can never be encrypt-by-default.** Forwarded email,
+imports, and notes created with no notebook all land in the default, and none of
+those writers can client-side encrypt — so the pair is banned outright. The CLI
+refuses it locally, in both directions: `--default-encrypt` on the default
+notebook, and `--make-default` on a notebook that already encrypts. To promote an
+encrypting notebook, turn encryption off in the same command:
+
+```bash
+harbor notebooks update <id> --make-default --default-encrypt=false
+```
+
 ---
 
 ## Notes  (aliases: `note`, `n`)
