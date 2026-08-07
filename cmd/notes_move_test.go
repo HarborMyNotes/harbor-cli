@@ -1224,9 +1224,13 @@ func TestSealedMovePrintsTheAttachmentCaveat(t *testing.T) {
 	// the note DELETED every earlier version of it. A move is run for another
 	// reason entirely, so this is the one place the user would never have thought
 	// to look for it.
+	// This asserts the caveat REACHED the user, not what it says — it compares
+	// against the constant, so it would still pass if the constant were wrong.
+	// The wording itself is pinned by TestHistoryCaveatSaysTheHistoryIsDeleted and
+	// TestNothingClaimsHistorySurvivesEncryption.
 	for _, line := range strings.Split(historyLossCaveat, "\n") {
 		if !strings.Contains(said, line) {
-			t.Errorf("the sealed move never said %q — the user is left believing their history survived:\n%s", line, said)
+			t.Errorf("the sealed move never printed %q, so the history warning never reached the user:\n%s", line, said)
 		}
 	}
 	// It is a limit, not an apology: the sentence must still be the one the

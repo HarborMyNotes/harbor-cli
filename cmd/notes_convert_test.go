@@ -1203,7 +1203,13 @@ func TestNothingClaimsHistorySurvivesEncryption(t *testing.T) {
 	checked := 0
 	forEachCommand(t, func(c *cobra.Command) {
 		text := c.Long + "\n" + c.Short + "\n" + c.Example
-		if !strings.Contains(strings.ToLower(text), "encrypt") {
+		// Anything that talks about encryption, plus the whole 'harbor history'
+		// tree whether it mentions encryption or not: `harbor history list` is
+		// the exact command someone runs to go looking for the versions this
+		// deletes, so it is the likeliest place for the claim to reappear.
+		inScope := strings.Contains(strings.ToLower(text), "encrypt") ||
+			strings.HasPrefix(c.CommandPath(), "harbor history")
+		if !inScope {
 			return
 		}
 		checked++
@@ -1213,8 +1219,10 @@ func TestNothingClaimsHistorySurvivesEncryption(t *testing.T) {
 			}
 		}
 	})
-	if checked < 4 {
-		t.Fatalf("only %d commands mention encryption — the walk is not reaching the tree", checked)
+	// A floor high enough to notice the walk breaking, not just failing outright.
+	// 18 commands qualify today.
+	if checked < 12 {
+		t.Fatalf("only %d commands are in scope — the walk is not reaching the tree", checked)
 	}
 
 	// The confirmations are not part of the command tree, so they are named.

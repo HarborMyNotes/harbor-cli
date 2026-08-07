@@ -681,10 +681,10 @@ decrypted again.`,
 // they do not know about. See app.harbor.my/docs/encryption.md, "Changing
 // encryption discards history".
 var notesEncryptConfirmation = registerConfirmation("harbor notes encrypt", confirmation{
-	Warning: "This DELETES every earlier version of these notes. Encrypting discards the\n" +
-		"note's whole version history on the server — permanently, and it cannot be\n" +
-		"recovered from another device. The current contents are kept and sealed;\n" +
-		"everything 'harbor history list' would have shown you is destroyed.",
+	Warning: "This DELETES every earlier version. Encrypting discards a note's whole\n" +
+		"version history on the server — permanently, and it cannot be recovered from\n" +
+		"another device. The current contents are kept and sealed; everything\n" +
+		"'harbor history list' would have shown you is destroyed.",
 	Prompt:      `Type "yes" to confirm: `,
 	Affirmative: "yes",
 	Unattended:  "refusing to destroy these notes' version history without confirmation — pass --yes",
