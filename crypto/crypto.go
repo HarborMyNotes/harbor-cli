@@ -234,10 +234,18 @@ func RewrapMasterKey(k *Keystore, oldPass, newPass string, p Argon2Params) (stri
 }
 
 // fieldAAD builds the AEAD additional-authenticated-data for a note field: the
-// note id immediately followed by the field name, no separator. This binds an
-// envelope to exactly one note and one field.
+// UTF-8 bytes of "<recordID>:<fieldName>". This binds an envelope to exactly one
+// note and one field, so a content envelope can never be replayed as that note's
+// title nor moved to another note.
+//
+// The colon is load-bearing and is NOT a local choice: this exact byte sequence
+// is the cross-client interop contract, defined canonically by the web client
+// (app.harbor.my web/src/lib/crypto/envelope.ts) and matched byte-for-byte by
+// macOS/iOS, Android and Windows. Change it and notes sealed here stop opening
+// everywhere else. See crypto/README.md and the pinned vector in
+// TestSealField_CrossClientVector.
 func fieldAAD(recordID, fieldName string) []byte {
-	return []byte(recordID + fieldName)
+	return []byte(recordID + ":" + fieldName)
 }
 
 // SealField encrypts a note field's plaintext into an HRBC2 envelope under the

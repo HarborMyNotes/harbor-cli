@@ -17,11 +17,13 @@ import (
 // still exercising the real KDF.
 var fastParams = Argon2Params{MemKiB: 8192, Iterations: 1, Parallelism: 1}
 
-// sealRef independently builds an HRBC2 envelope from the documented recipe — a
-// fixed nonce, AES-256-GCM under the master key, AAD = id+field, and UNPADDED
-// base64url — so the tests prove OpenField conforms to the external contract
-// rather than merely round-tripping against our own SealField.
-func sealRef(t *testing.T, masterKey []byte, id, field, plaintext string, nonce []byte) string {
+// sealRefAAD independently builds an HRBC2 envelope from the documented recipe —
+// a fixed nonce, AES-256-GCM under the master key, an explicitly supplied AAD,
+// and UNPADDED base64url. Taking the AAD as a parameter (rather than deriving it
+// the way the production code does) is deliberate: this helper must be able to
+// build a DELIBERATELY WRONG envelope for the negative tests, and a helper that
+// silently agrees with the code under test is exactly how #86 stayed hidden.
+func sealRefAAD(t *testing.T, masterKey []byte, aad, plaintext string, nonce []byte) string {
 	t.Helper()
 	block, err := aes.NewCipher(masterKey)
 	if err != nil {
@@ -31,14 +33,22 @@ func sealRef(t *testing.T, masterKey []byte, id, field, plaintext string, nonce 
 	if err != nil {
 		t.Fatalf("gcm: %v", err)
 	}
-	ct := g.Seal(nil, nonce, []byte(plaintext), []byte(id+field))
+	ct := g.Seal(nil, nonce, []byte(plaintext), []byte(aad))
 	enc := base64.RawURLEncoding
 	return "HRBC2." + enc.EncodeToString(nonce) + "." + enc.EncodeToString(ct)
 }
 
+// sealRef builds an HRBC2 envelope using the CANONICAL cross-client AAD,
+// utf8(id + ":" + field), so the tests prove OpenField conforms to the external
+// contract rather than merely round-tripping against our own SealField.
+func sealRef(t *testing.T, masterKey []byte, id, field, plaintext string, nonce []byte) string {
+	t.Helper()
+	return sealRefAAD(t, masterKey, id+":"+field, plaintext, nonce)
+}
+
 // TestOpenField_ReferenceVector proves OpenField decrypts an envelope built by
 // the documented recipe, locking the format (HRBC2 tag, unpadded base64url,
-// AAD = id+field) against accidental drift.
+// AAD = id + ":" + field) against accidental drift.
 func TestOpenField_ReferenceVector(t *testing.T) {
 	masterKey := make([]byte, 32)
 	for i := range masterKey {
@@ -55,6 +65,126 @@ func TestOpenField_ReferenceVector(t *testing.T) {
 	if got != "hello, harbor" {
 		t.Fatalf("plaintext = %q, want %q", got, "hello, harbor")
 	}
+}
+
+// crossClientVector is the known-answer vector shared by every other Harbor
+// client — generated from the web app (the canonical definition) and pinned
+// identically in harbor-swift's HarborCryptoTests. Parameters: master key = the
+// bytes 0x00..0x1f, nonce = the bytes 0x00..0x0b, record id "note-1", field
+// "content", plaintext "Secret note body".
+//
+// It is a hardcoded LITERAL on purpose. #86 slipped through because the test
+// helper recomputed the expected envelope with the same wrong AAD the code used,
+// so the suite agreed with the bug. A literal cannot do that.
+const (
+	crossClientVector    = "HRBC2.AAECAwQFBgcICQoL.FGe1aaCR4nXiNfKr04YcFISiyIPEgI0uXE_6tfgGWQw"
+	crossClientID        = "note-1"
+	crossClientField     = "content"
+	crossClientPlaintext = "Secret note body"
+)
+
+// crossClientKey returns the vector's master key: the bytes 0x00 through 0x1f.
+func crossClientKey() []byte {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+	return key
+}
+
+// TestOpenField_CrossClientVector proves this CLI can READ an envelope produced
+// by web, macOS/iOS, Android or Windows, by decrypting their shared pinned
+// vector. If this fails, notes encrypted on every other Harbor client have
+// become unreadable here.
+func TestOpenField_CrossClientVector(t *testing.T) {
+	got, err := OpenField(crossClientKey(), crossClientID, crossClientField, crossClientVector)
+	if err != nil {
+		t.Fatalf("OpenField on the shared cross-client vector: %v (the field AAD no longer matches the other clients)", err)
+	}
+	if got != crossClientPlaintext {
+		t.Fatalf("plaintext = %q, want %q", got, crossClientPlaintext)
+	}
+}
+
+// TestSealField_CrossClientVector proves this CLI can be READ BY the other
+// clients: it seals with SealField, then decrypts with an independent reference
+// implementation using the canonical utf8(id + ":" + field) AAD. SealField picks
+// its own random nonce, so the envelope cannot be compared to the literal byte
+// for byte — decrypting it under the canonical AAD is the equivalent proof, and
+// TestOpenField_CrossClientVector pins the literal from the other direction.
+func TestSealField_CrossClientVector(t *testing.T) {
+	key := crossClientKey()
+	env, err := SealField(key, crossClientID, crossClientField, crossClientPlaintext)
+	if err != nil {
+		t.Fatalf("SealField: %v", err)
+	}
+	got, err := openRefAAD(t, key, crossClientID+":"+crossClientField, env)
+	if err != nil {
+		t.Fatalf("a canonical-AAD reader could not open our envelope: %v (other clients would see 'could not decrypt')", err)
+	}
+	if got != crossClientPlaintext {
+		t.Fatalf("plaintext = %q, want %q", got, crossClientPlaintext)
+	}
+}
+
+// TestFieldAAD_RejectsLegacySeparatorless proves the pre-#86 AAD — the record id
+// with the field name jammed on, no colon — no longer decrypts. This is the
+// regression guard: the bug was a missing separator, so a test that only checks
+// the happy path would pass again the moment someone "simplified" fieldAAD.
+func TestFieldAAD_RejectsLegacySeparatorless(t *testing.T) {
+	key := crossClientKey()
+	nonce := []byte("0123456789ab") // 12 bytes, fixed
+
+	legacy := sealRefAAD(t, key, crossClientID+crossClientField, crossClientPlaintext, nonce)
+	if legacy == crossClientVector {
+		t.Fatal("the separatorless AAD produced the canonical vector — the vector or the helper is wrong")
+	}
+	if _, err := OpenField(key, crossClientID, crossClientField, legacy); !errors.Is(err, ErrDecrypt) {
+		t.Fatalf("OpenField on a legacy separatorless envelope: err = %v, want ErrDecrypt", err)
+	}
+
+	// And the mirror: our own envelope must NOT open under the legacy AAD.
+	env, err := SealField(key, crossClientID, crossClientField, crossClientPlaintext)
+	if err != nil {
+		t.Fatalf("SealField: %v", err)
+	}
+	if _, err := openRefAAD(t, key, crossClientID+crossClientField, env); err == nil {
+		t.Fatal("our envelope opened under the legacy separatorless AAD — fieldAAD lost its separator")
+	}
+}
+
+// openRefAAD independently decrypts an HRBC2 envelope under an explicitly
+// supplied AAD, standing in for another Harbor client reading our output. It
+// deliberately does not call fieldAAD, so it cannot inherit a mistake from the
+// code under test.
+func openRefAAD(t *testing.T, masterKey []byte, aad, envelope string) (string, error) {
+	t.Helper()
+	parts := strings.Split(envelope, ".")
+	if len(parts) != 3 || parts[0] != EnvelopeVersion {
+		t.Fatalf("not an HRBC2 envelope: %q", envelope)
+	}
+	enc := base64.RawURLEncoding
+	iv, err := enc.DecodeString(parts[1])
+	if err != nil {
+		t.Fatalf("iv: %v", err)
+	}
+	ct, err := enc.DecodeString(parts[2])
+	if err != nil {
+		t.Fatalf("ciphertext: %v", err)
+	}
+	block, err := aes.NewCipher(masterKey)
+	if err != nil {
+		t.Fatalf("aes: %v", err)
+	}
+	g, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatalf("gcm: %v", err)
+	}
+	pt, err := g.Open(nil, iv, ct, []byte(aad))
+	if err != nil {
+		return "", err
+	}
+	return string(pt), nil
 }
 
 // TestSealOpenRoundTrip proves SealField/OpenField round-trip for both fields and
