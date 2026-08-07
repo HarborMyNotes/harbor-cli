@@ -444,13 +444,24 @@ func TestWhoamiTokenVerdicts(t *testing.T) {
 		wantMark   string
 		wantSays   string
 		wantAvoids string
+		// wantErr is the exit-code contract: non-nil ONLY for a definite
+		// rejection, so 'harbor whoami || exit 1' as a CI preflight catches a
+		// revoked token but is not tripped by a VPN blip or a scoped-down token.
+		wantErr bool
 	}{
-		{"a working token", 200, `{"id":"u1","email":"you@example.com"}`, "✓", "", "rejected"},
+		{"a working token", 200, `{"id":"u1","email":"you@example.com"}`, "✓", "", "rejected", false},
 		// boolMark(false) is the repo's dim "·"; the distinguishing signal is the
 		// sentence underneath, and that "?" is reserved for "could not tell".
-		{"a revoked token", 401, `{"error":{"code":"invalid_token","message":"The access token is invalid."}}`, "·", "rejected", "Could not check"},
-		{"a token without profile scope", 403, `{"error":{"code":"insufficient_scope","message":"This token lacks the profile scope."}}`, "?", "Could not check", "rejected this token"},
-		{"a server error", 500, `{"error":{"code":"internal","message":"boom"}}`, "?", "Could not check", "rejected this token"},
+		{"a revoked token", 401, `{"error":{"code":"invalid_token","message":"The access token is invalid."}}`, "·", "rejected", "Could not check", true},
+		{"a token without profile scope", 403, `{"error":{"code":"insufficient_scope","message":"This token lacks the profile scope."}}`, "?", "Could not check", "rejected this token", false},
+		{"a server error", 500, `{"error":{"code":"internal","message":"boom"}}`, "?", "Could not check", "rejected this token", false},
+		// A 200 that is not a profile — an intercepting proxy, or a base URL
+		// pointing at something that is not the API. "No error" is not proof the
+		// token works, and saying so confidently is this command's cardinal sin.
+		{"a 200 that is not a profile", 200, `<html><body>hello</body></html>`, "?", "Could not check", "rejected this token", false},
+		// A bare 401 with no Harbor error code is a proxy's, not the API's: with
+		// a bearer present Harbor answers 401 only with invalid_token.
+		{"a gateway 401", 401, `<html>401 Authorization Required</html>`, "?", "Could not check", "rejected this token", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -466,11 +477,14 @@ func TestWhoamiTokenVerdicts(t *testing.T) {
 			t.Setenv("HARBOR_API_URL", srv.URL)
 			resetCommandState(t)
 
-			out := captureStdout(t, func() {
-				if err := runWhoami(whoamiCmd, nil); err != nil {
-					t.Fatalf("whoami must report, not fail: %v", err)
-				}
-			})
+			var err error
+			out := captureStdout(t, func() { err = runWhoami(whoamiCmd, nil) })
+			if tc.wantErr && err == nil {
+				t.Error("a rejected token exited 0 — a CI preflight would sail past it")
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("whoami must report, not fail: %v", err)
+			}
 			if !strings.Contains(out, tc.wantMark) {
 				t.Errorf("Token valid mark %q missing:\n%s", tc.wantMark, out)
 			}
@@ -534,11 +548,13 @@ func TestWhoamiJSONVerdictIsTriState(t *testing.T) {
 			jsonOutput = true
 			t.Cleanup(func() { jsonOutput = false })
 
-			out := captureStdout(t, func() {
-				if err := runWhoami(whoamiCmd, nil); err != nil {
-					t.Fatalf("whoami: %v", err)
-				}
-			})
+			var runErr error
+			out := captureStdout(t, func() { runErr = runWhoami(whoamiCmd, nil) })
+			// The JSON body is printed either way; only a definite rejection
+			// also sets the exit code, exactly as the table form does.
+			if wantErr := tc.want == false; wantErr != (runErr != nil) {
+				t.Errorf("exit contract differs from the table form: err = %v, want error = %v", runErr, wantErr)
+			}
 			var got map[string]any
 			if err := json.Unmarshal([]byte(out), &got); err != nil {
 				t.Fatalf("not valid JSON: %v\n%s", err, out)

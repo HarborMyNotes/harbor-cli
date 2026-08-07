@@ -4,6 +4,8 @@
 package cmd
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -563,8 +565,12 @@ func TestEnvDeviceIDIsStableAndSecret(t *testing.T) {
 	if !strings.HasPrefix(first, "cli-env-") {
 		t.Errorf("device id = %q, want a cli-env- prefix so it is recognisable in the device list", first)
 	}
-	if strings.Contains(first, token) || strings.Contains(first, "secret") {
-		t.Errorf("the device id carries the token: %q", first)
+	// The id is hex, so a substring check for the token can never fire and would
+	// assert nothing. Prove the real property instead: it is exactly the
+	// truncated digest, which is one-way.
+	sum := sha256.Sum256([]byte(token))
+	if want := "cli-env-" + hex.EncodeToString(sum[:])[:12]; first != want {
+		t.Errorf("device id = %q, want the truncated sha256 %q", first, want)
 	}
 	// Long enough not to collide, short enough to read in a device list.
 	if got := len(first); got != len("cli-env-")+12 {

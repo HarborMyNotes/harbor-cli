@@ -106,8 +106,17 @@ const (
 )
 
 // classifyTokenProbe turns the profile call's outcome into a verdict.
-func classifyTokenProbe(err error) tokenVerdict {
+//
+// gotIdentity says whether the response actually carried a profile. A bare
+// "no error" is not enough: an intercepting proxy, or a base URL pointing at
+// something that is not the API, can answer 200 with HTML — and reporting that
+// as a working token would be exactly the confident-but-wrong answer this
+// command exists to stop giving.
+func classifyTokenProbe(err error, gotIdentity bool) tokenVerdict {
 	if err == nil {
+		if !gotIdentity {
+			return tokenUnknown
+		}
 		return tokenWorks
 	}
 	if isNetworkError(err) {
@@ -115,10 +124,12 @@ func classifyTokenProbe(err error) tokenVerdict {
 	}
 	var apiErr *client.APIError
 	if errors.As(err, &apiErr) {
-		// Only the server saying "this token is not valid" is a rejection. A
-		// scope refusal proves the opposite — it was authenticated, then denied
-		// this one endpoint.
-		if apiErr.Status == http.StatusUnauthorized || apiErr.Code == "invalid_token" {
+		// Only the server saying "this token is not valid" is a rejection, and it
+		// is identified by CODE rather than by status: with a bearer present the
+		// API answers 401 only with invalid_token, so a bare 401 is a proxy's,
+		// not Harbor's. A scope refusal proves the opposite of a rejection — the
+		// token authenticated, then was denied this one endpoint.
+		if apiErr.Code == "invalid_token" {
 			return tokenRejected
 		}
 		return tokenUnknown
@@ -148,7 +159,7 @@ func whoamiEnvToken(cmd *cobra.Command, creds *config.Credentials) error {
 		p := parseJSON(client.UnwrapData(data))
 		email, name = str(p, "email"), str(p, "name")
 	}
-	verdict := classifyTokenProbe(err)
+	verdict := classifyTokenProbe(err, email != "" || name != "")
 
 	if jsonOutput {
 		m := map[string]any{
@@ -178,7 +189,10 @@ func whoamiEnvToken(cmd *cobra.Command, creds *config.Credentials) error {
 		}
 		out, _ := json.Marshal(m)
 		printResult(out, func([]byte) {})
-		return nil
+		// Same exit contract as the table form below. Returning nil here would
+		// make 'harbor whoami --json || exit 1' sail past a revoked token while
+		// the human form caught it — the two must not disagree.
+		return rejectedTokenError(verdict)
 	}
 
 	pairs := [][2]string{{"Session", "HARBOR_TOKEN (environment)"}}
@@ -207,9 +221,29 @@ func whoamiEnvToken(cmd *cobra.Command, creds *config.Credentials) error {
 	case tokenRejected:
 		fmt.Println(dim("The server rejected this token: " + err.Error()))
 	case tokenUnknown:
-		fmt.Println(dim("Could not check this token — " + err.Error() + "\n" +
+		detail := "the server's answer did not look like a profile"
+		if err != nil {
+			detail = err.Error()
+		}
+		fmt.Println(dim("Could not check this token — " + detail + "\n" +
 			"That is not the same as the token being bad: a token scoped without 'profile'\n" +
 			"cannot read this endpoint yet works for everything it was granted."))
+	}
+
+	return rejectedTokenError(verdict)
+}
+
+// rejectedTokenError is whoami's exit contract, shared by the table and --json
+// paths so the two can never disagree.
+//
+// Non-zero ONLY for a definite rejection, and only after the output, matching
+// 'harbor status': a script running 'harbor whoami || exit 1' as a preflight
+// must not sail past a revoked token. "Could not tell" deliberately stays 0 —
+// failing a build over a VPN blip, or over a token merely scoped without
+// 'profile', would be the same false alarm in a different costume.
+func rejectedTokenError(v tokenVerdict) error {
+	if v == tokenRejected {
+		return errors.New("the server rejected this token")
 	}
 	return nil
 }
@@ -821,8 +855,13 @@ device identity.
 Reads the saved session offline. When HARBOR_TOKEN is set that token is the
 session instead, and since a bare token carries no identity, whoami asks the
 server who it belongs to — so this is the one case where the command makes a
-network call. A token the server rejects is reported, not raised: whether the
-token works is exactly what you asked.`,
+network call.
+
+The answer is always printed, and the exit code is non-zero only when the server
+actually rejected the token. "Could not tell" — an unreachable server, a 5xx, or
+a token scoped without 'profile' (common for CI tokens, which work fine for what
+they were granted) — is reported as unknown and exits 0, so a preflight check
+does not fail a build over a network blip.`,
 	RunE: runWhoami,
 }
 
@@ -833,7 +872,11 @@ var authStatusCmd = &cobra.Command{
 	RunE:  runWhoami,
 }
 
-// runWhoami renders the saved session details (offline; no network call).
+// runWhoami reports the current session.
+//
+// The saved-session path is offline — it is a local state inspector. A
+// HARBOR_TOKEN session is not: a bare token carries no identity, so that branch
+// asks the server whose it is. See whoamiEnvToken.
 func runWhoami(cmd *cobra.Command, args []string) error {
 	// HARBOR_TOKEN authenticates every other command, so reading only the saved
 	// session made whoami answer "not logged in — run 'harbor login' first" for a
