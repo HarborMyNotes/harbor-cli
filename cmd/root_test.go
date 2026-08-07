@@ -762,11 +762,13 @@ func TestResolveVersionPrefersLdflags(t *testing.T) {
 // TestVersionFallbackIsReached proves the build-info fallback is actually WIRED,
 // not merely correct when called directly.
 //
-// This is the test the first version of this change lacked, and the gap was
-// real: deleting the debug.ReadBuildInfo() call and returning "dev" left the
-// entire suite green while `go install` regressed to reporting "dev" again. A
-// grep for the call is no better — it passes just as happily once the call is
-// gone. So the reader is a seam, and this drives resolveVersionFrom with a fake.
+// The gap was real and took three attempts to close, each time one level up:
+// reverting cobra's Version field, then gutting resolveVersionFrom's fallback,
+// then gutting resolveVersion itself — every one of them left the suite green
+// while `go install` silently regressed to reporting "dev". A grep for the call
+// is no better than none, since it passes once the call is gone. So the reader
+// is a seam, driven here both as a parameter and by swapping the package
+// variable, which is the only way the production entry point is covered.
 func TestVersionFallbackIsReached(t *testing.T) {
 	fake := func(v string) func() (*debug.BuildInfo, bool) {
 		return func() (*debug.BuildInfo, bool) {
@@ -791,9 +793,19 @@ func TestVersionFallbackIsReached(t *testing.T) {
 	if got := resolveVersionFrom(devVersion, func() (*debug.BuildInfo, bool) { return nil, false }); got != devVersion {
 		t.Errorf("missing build info should read %q, got %q", devVersion, got)
 	}
-	// And the production wiring uses the real reader.
-	if got := resolveVersion(); got != resolveVersionFrom(version, readBuildInfo) {
-		t.Errorf("resolveVersion does not delegate to resolveVersionFrom: %q", got)
+	// And the PRODUCTION entry point goes through the seam. This is the
+	// assertion two earlier attempts got wrong: comparing resolveVersion()
+	// against resolveVersionFrom(version, readBuildInfo) is a tautology, because
+	// in a test binary both sides evaluate to "dev" no matter what the function
+	// does. Swap the package-level reader instead, so gutting resolveVersion to
+	// `return version` — which regresses go install and every other surface —
+	// actually fails.
+	origVersion, origReader := version, readBuildInfo
+	t.Cleanup(func() { version, readBuildInfo = origVersion, origReader })
+	version = devVersion
+	readBuildInfo = fake("v0.1.27")
+	if got := resolveVersion(); got != "v0.1.27" {
+		t.Errorf("resolveVersion() = %q, want v0.1.27 — it does not use the build-info fallback", got)
 	}
 }
 
@@ -806,7 +818,6 @@ func TestVersionFallbackIsReached(t *testing.T) {
 // else exercises; it is exact-string and covers the three files that surface a
 // version today, so treat it as a guard, not a proof.
 func TestVersionIsWiredEverywhere(t *testing.T) {
-	prepareCommandTree()
 	if rootCmd.Version != resolveVersion() {
 		t.Errorf("cobra reports %q but resolveVersion() says %q — --version bypasses the resolver", rootCmd.Version, resolveVersion())
 	}

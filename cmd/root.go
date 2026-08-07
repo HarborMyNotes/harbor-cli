@@ -66,6 +66,8 @@ var version = devVersion
 //   - the same with a "+dirty" suffix, from a modified working tree.
 //
 // Only a real tag is reported, which is what `go install pkg@vX.Y.Z` embeds.
+// A "+incompatible" tag would pass through verbatim; that is unreachable while
+// this module is v0/v1, and worth revisiting if it ever goes v2.
 // One consequence worth knowing: a `go build` at a CLEAN checkout of an exact
 // release tag reports that tag rather than "dev", because that is genuinely what
 // Go stamps. The common local case — an untagged or dirty tree — still reads
@@ -75,9 +77,10 @@ func resolveVersion() string {
 }
 
 // readBuildInfo is debug.ReadBuildInfo as a variable so a test can substitute
-// it. Without that seam the fallback can only be checked by grepping the source
-// for the call — which passes just as happily when the call has been deleted, so
-// the whole of this feature could be removed with a green suite.
+// it. Grepping the source for the call is not a substitute: it passes just as
+// happily once the call is gone. Swapping this variable is what lets a test
+// prove the fallback is actually reached from resolveVersion, rather than only
+// that it computes the right answer when called directly.
 var readBuildInfo = debug.ReadBuildInfo
 
 // resolveVersionFrom is resolveVersion with both inputs supplied: the injected

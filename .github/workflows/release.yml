@@ -64,7 +64,8 @@ jobs:
       # change.
       #
       # Consumers, as of this writing:
-      #   - Formula/harbor.rb    downloads a named asset. It does NOT yet pin a
+      #   - Formula/harbor.rb    downloads named assets (the four non-Windows
+      #                          ones). It does NOT yet pin a
       #                          sha256; issue #85 moves it to a real tap and
       #                          adds that pin, which is what checksums.txt is
       #                          groundwork for.
