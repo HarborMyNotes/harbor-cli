@@ -336,8 +336,9 @@ Write flags on `harbor notes create`: `--encrypt` (force, needs the passphrase),
 
 - **Creating in a `default_encrypt` notebook requires `HARBOR_PASSPHRASE`.** Without
   it the create **fails and writes nothing**, rather than quietly landing a plaintext
-  note there. This covers the account default notebook when it carries the flag.
-  `--plaintext` is the sanctioned way to create an unencrypted note there anyway.
+  note there. `--plaintext` is the sanctioned way to create an unencrypted note
+  there anyway. The account **default** notebook can never carry the flag, so a
+  note created with no `--notebook` is never affected by this.
 - Decryption is automatic on `notes get/list`, `trash list`, `reminders list`.
   A wrong/absent passphrase shows ciphertext (`[encrypted]`), never an error.
 - `notes update` re-seals an already-encrypted note; it refuses to write plaintext

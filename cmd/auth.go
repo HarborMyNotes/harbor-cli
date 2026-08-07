@@ -85,6 +85,47 @@ func envTokenSession() (*config.Credentials, bool) {
 	}, true
 }
 
+// tokenVerdict is what one profile probe can honestly conclude about a token.
+//
+// Two states are not enough, and the missing one is the case this whole feature
+// exists for. A PAT minted for CI is typically scoped down — the server's own
+// example is {"scopes": ["notes", "files"]}, with no "profile" — so the probe
+// gets a 403 from a token that works perfectly for the job it was made for.
+// Calling that "rejected" would send someone off to rotate a good credential.
+// An unreachable server and a 500 are the same mistake pointed the other way.
+type tokenVerdict int
+
+const (
+	// tokenWorks: the server answered, so the token authenticated.
+	tokenWorks tokenVerdict = iota
+	// tokenRejected: the server said this token is not valid (401 invalid_token).
+	tokenRejected
+	// tokenUnknown: nothing was learned — unreachable, a 5xx, or a token whose
+	// scopes do not include reading the profile.
+	tokenUnknown
+)
+
+// classifyTokenProbe turns the profile call's outcome into a verdict.
+func classifyTokenProbe(err error) tokenVerdict {
+	if err == nil {
+		return tokenWorks
+	}
+	if isNetworkError(err) {
+		return tokenUnknown
+	}
+	var apiErr *client.APIError
+	if errors.As(err, &apiErr) {
+		// Only the server saying "this token is not valid" is a rejection. A
+		// scope refusal proves the opposite — it was authenticated, then denied
+		// this one endpoint.
+		if apiErr.Status == http.StatusUnauthorized || apiErr.Code == "invalid_token" {
+			return tokenRejected
+		}
+		return tokenUnknown
+	}
+	return tokenUnknown
+}
+
 // whoamiEnvToken reports a HARBOR_TOKEN session.
 //
 // Unlike the saved-session path this makes ONE network call, because a bare
@@ -92,10 +133,10 @@ func envTokenSession() (*config.Credentials, bool) {
 // the server. Answering "you are authenticated" without saying as whom would be
 // only marginally better than the "not logged in" it replaces.
 //
-// A failed call is reported, not returned as an error. Whether the token works
-// is exactly what the command was asked, so "here is your session, and the
-// server rejected it" is the answer — not a stack of plumbing the user has to
-// interpret.
+// The call's outcome is reported, never returned as an error. Whether the token
+// works is exactly what the command was asked, so "here is your session, and
+// the server rejected it" is the answer — not a stack of plumbing. See
+// tokenVerdict for why "could not tell" is a distinct answer from "rejected".
 func whoamiEnvToken(cmd *cobra.Command, creds *config.Credentials) error {
 	showToken, _ := cmd.Flags().GetBool("show-token")
 
@@ -107,16 +148,27 @@ func whoamiEnvToken(cmd *cobra.Command, creds *config.Credentials) error {
 		p := parseJSON(client.UnwrapData(data))
 		email, name = str(p, "email"), str(p, "name")
 	}
+	verdict := classifyTokenProbe(err)
 
 	if jsonOutput {
 		m := map[string]any{
-			"email":         email,
-			"api_url":       creds.BaseURL(),
-			"token_valid":   err == nil,
-			"never_expires": true,
-			"device_id":     creds.DeviceID,
-			"device_name":   creds.DeviceName,
-			"source":        "HARBOR_TOKEN",
+			"api_url":     creds.BaseURL(),
+			"device_id":   creds.DeviceID,
+			"device_name": creds.DeviceName,
+			"source":      "HARBOR_TOKEN",
+		}
+		if email != "" {
+			m["email"] = email
+		}
+		// token_valid is a tri-state here, so null means "could not tell" rather
+		// than a script reading a transient network blip as a bad credential.
+		switch verdict {
+		case tokenWorks:
+			m["token_valid"] = true
+		case tokenRejected:
+			m["token_valid"] = false
+		default:
+			m["token_valid"] = nil
 		}
 		if err != nil {
 			m["error"] = err.Error()
@@ -136,17 +188,28 @@ func whoamiEnvToken(cmd *cobra.Command, creds *config.Credentials) error {
 	if name != "" {
 		pairs = append(pairs, [2]string{"Name", name})
 	}
+	valid := map[tokenVerdict]string{
+		tokenWorks:    boolMark(true),
+		tokenRejected: boolMark(false),
+		tokenUnknown:  "?",
+	}[verdict]
 	pairs = append(pairs,
 		[2]string{"API URL", creds.BaseURL()},
-		[2]string{"Token valid", boolMark(err == nil)},
+		[2]string{"Token valid", valid},
 		[2]string{"Device", fmt.Sprintf("%s (%s)", creds.DeviceName, creds.DeviceID)},
 	)
 	if showToken {
 		pairs = append(pairs, [2]string{"Access token", creds.AccessToken})
 	}
 	printKV(pairs)
-	if err != nil {
+
+	switch verdict {
+	case tokenRejected:
 		fmt.Println(dim("The server rejected this token: " + err.Error()))
+	case tokenUnknown:
+		fmt.Println(dim("Could not check this token — " + err.Error() + "\n" +
+			"That is not the same as the token being bad: a token scoped without 'profile'\n" +
+			"cannot read this endpoint yet works for everything it was granted."))
 	}
 	return nil
 }

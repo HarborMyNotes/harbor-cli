@@ -428,33 +428,130 @@ func TestWhoamiUnderEnvTokenReportsTheSession(t *testing.T) {
 	}
 }
 
-// TestWhoamiUnderEnvTokenReportsARejectedToken proves a bad token is answered,
-// not raised. "Is this token any good?" is the question whoami was asked, so a
-// 401 is the answer — returning it as a command error would make the one command
-// that diagnoses auth the one that fails on bad auth.
-func TestWhoamiUnderEnvTokenReportsARejectedToken(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte(`{"error":{"code":"invalid_token","message":"The access token is invalid."}}`))
-	}))
-	defer srv.Close()
+// TestWhoamiTokenVerdicts pins the three answers one profile probe can honestly
+// give, and in particular that "could not tell" is NOT reported as "rejected".
+//
+// The scope case is the one that matters: a PAT minted for CI is typically
+// scoped down — the server's own example is {"scopes": ["notes","files"]}, with
+// no "profile" — so the probe 403s on a token that works perfectly for the job
+// it was made for. Calling that rejected sends someone off to rotate a good
+// credential. An unreachable server is the same mistake pointed the other way.
+func TestWhoamiTokenVerdicts(t *testing.T) {
+	cases := []struct {
+		name       string
+		status     int
+		body       string
+		wantMark   string
+		wantSays   string
+		wantAvoids string
+	}{
+		{"a working token", 200, `{"id":"u1","email":"you@example.com"}`, "✓", "", "rejected"},
+		// boolMark(false) is the repo's dim "·"; the distinguishing signal is the
+		// sentence underneath, and that "?" is reserved for "could not tell".
+		{"a revoked token", 401, `{"error":{"code":"invalid_token","message":"The access token is invalid."}}`, "·", "rejected", "Could not check"},
+		{"a token without profile scope", 403, `{"error":{"code":"insufficient_scope","message":"This token lacks the profile scope."}}`, "?", "Could not check", "rejected this token"},
+		{"a server error", 500, `{"error":{"code":"internal","message":"boom"}}`, "?", "Could not check", "rejected this token"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
 
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("HARBOR_TOKEN", "hbp_probe")
+			t.Setenv("HARBOR_API_URL", srv.URL)
+			resetCommandState(t)
+
+			out := captureStdout(t, func() {
+				if err := runWhoami(whoamiCmd, nil); err != nil {
+					t.Fatalf("whoami must report, not fail: %v", err)
+				}
+			})
+			if !strings.Contains(out, tc.wantMark) {
+				t.Errorf("Token valid mark %q missing:\n%s", tc.wantMark, out)
+			}
+			if tc.wantSays != "" && !strings.Contains(out, tc.wantSays) {
+				t.Errorf("output does not say %q:\n%s", tc.wantSays, out)
+			}
+			if tc.wantAvoids != "" && strings.Contains(out, tc.wantAvoids) {
+				t.Errorf("output wrongly says %q:\n%s", tc.wantAvoids, out)
+			}
+		})
+	}
+}
+
+// TestWhoamiUnreachableServerIsNotARejection covers the fourth case, which needs
+// no server at all: a VPN blip must not be reported as a bad credential, or
+// token_valid:false lands in a CI log as a token problem.
+func TestWhoamiUnreachableServerIsNotARejection(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	t.Setenv("HARBOR_TOKEN", "hbp_revoked")
-	t.Setenv("HARBOR_API_URL", srv.URL)
+	t.Setenv("HARBOR_TOKEN", "hbp_probe")
+	t.Setenv("HARBOR_API_URL", "http://127.0.0.1:1/api/v1") // nothing listens here
 	resetCommandState(t)
 
 	out := captureStdout(t, func() {
 		if err := runWhoami(whoamiCmd, nil); err != nil {
-			t.Fatalf("whoami should report a bad token, not fail: %v", err)
+			t.Fatalf("whoami must report, not fail: %v", err)
 		}
 	})
-	if !strings.Contains(out, "HARBOR_TOKEN") {
-		t.Errorf("whoami did not name the session source:\n%s", out)
+	if strings.Contains(out, "rejected this token") {
+		t.Errorf("an unreachable server was reported as a bad token:\n%s", out)
 	}
-	if !strings.Contains(strings.ToLower(out), "rejected") {
-		t.Errorf("whoami did not say the token was rejected:\n%s", out)
+	if !strings.Contains(out, "Could not check") {
+		t.Errorf("output does not say the check was inconclusive:\n%s", out)
+	}
+}
+
+// TestWhoamiJSONVerdictIsTriState pins the machine-readable side: null means
+// "could not tell", so a script cannot read a transient failure as a bad token.
+func TestWhoamiJSONVerdictIsTriState(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		want   any
+	}{
+		{"works", 200, `{"id":"u1","email":"you@example.com"}`, true},
+		{"rejected", 401, `{"error":{"code":"invalid_token","message":"nope"}}`, false},
+		{"unknown", 403, `{"error":{"code":"insufficient_scope","message":"nope"}}`, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("HARBOR_TOKEN", "hbp_probe")
+			t.Setenv("HARBOR_API_URL", srv.URL)
+			resetCommandState(t)
+			jsonOutput = true
+			t.Cleanup(func() { jsonOutput = false })
+
+			out := captureStdout(t, func() {
+				if err := runWhoami(whoamiCmd, nil); err != nil {
+					t.Fatalf("whoami: %v", err)
+				}
+			})
+			var got map[string]any
+			if err := json.Unmarshal([]byte(out), &got); err != nil {
+				t.Fatalf("not valid JSON: %v\n%s", err, out)
+			}
+			if got["token_valid"] != tc.want {
+				t.Errorf("token_valid = %v (%T), want %v", got["token_valid"], got["token_valid"], tc.want)
+			}
+			// never_expires was a flat assertion about credential lifetime that
+			// nothing checked — PATs can be minted with an expiry.
+			if _, present := got["never_expires"]; present {
+				t.Error("never_expires is asserted without being checked")
+			}
+		})
 	}
 }
 
