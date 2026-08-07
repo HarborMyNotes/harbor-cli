@@ -71,11 +71,25 @@ var version = devVersion
 // Go stamps. The common local case — an untagged or dirty tree — still reads
 // "dev".
 func resolveVersion() string {
-	if version != devVersion {
-		return version
+	return resolveVersionFrom(version, readBuildInfo)
+}
+
+// readBuildInfo is debug.ReadBuildInfo as a variable so a test can substitute
+// it. Without that seam the fallback can only be checked by grepping the source
+// for the call — which passes just as happily when the call has been deleted, so
+// the whole of this feature could be removed with a green suite.
+var readBuildInfo = debug.ReadBuildInfo
+
+// resolveVersionFrom is resolveVersion with both inputs supplied: the injected
+// version and the build-info reader. Splitting it out is what lets a test prove
+// the fallback is actually REACHED, rather than merely that it computes the
+// right answer when called directly.
+func resolveVersionFrom(injected string, read func() (*debug.BuildInfo, bool)) string {
+	if injected != devVersion {
+		return injected
 	}
-	info, ok := debug.ReadBuildInfo()
-	if !ok {
+	info, ok := read()
+	if !ok || info == nil {
 		return devVersion
 	}
 	return versionFromBuildInfo(info.Main.Version)

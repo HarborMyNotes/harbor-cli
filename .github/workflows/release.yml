@@ -58,15 +58,19 @@ jobs:
           echo "version=$NEXT_VERSION" >> "$GITHUB_OUTPUT"
 
       # ---------------------------------------------------------------------
-      # THE FIVE ASSET NAMES BELOW ARE A PUBLIC CONTRACT. Do not rename one
-      # without updating every consumer in the SAME change:
+      # THE FIVE ASSET NAMES BELOW ARE A PUBLIC CONTRACT. Renaming one does not
+      # break this build — it breaks whatever downloads the old name, which only
+      # surfaces as user reports days later. Update every consumer in the SAME
+      # change.
       #
-      #   - Formula/harbor.rb        (Homebrew; downloads a named asset)
-      #   - harbor.my/install.sh     (the one-line installer)
-      #
-      # Both hardcode these filenames and the name "checksums.txt". Renaming an
-      # asset does not break the build — it silently breaks every install script
-      # already in the wild, which only shows up as user reports days later.
+      # Consumers, as of this writing:
+      #   - Formula/harbor.rb    downloads a named asset. It does NOT yet pin a
+      #                          sha256; issue #85 moves it to a real tap and
+      #                          adds that pin, which is what checksums.txt is
+      #                          groundwork for.
+      #   - harbor.my/install.sh does not exist yet (harbor.my#49). It is
+      #                          specified to fetch checksums.txt and verify the
+      #                          binary against it.
       # ---------------------------------------------------------------------
       - name: Build binaries
         run: |
@@ -79,20 +83,26 @@ jobs:
           GOOS=linux   GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/harbor-linux-arm64 .
           GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/harbor-windows-amd64.exe .
 
-      # Publishes a SHA-256 manifest so a download can be verified. Consumed by
-      # the Homebrew formula (which pins a sha256) and by install.sh.
+      # Publishes a SHA-256 manifest so a download can be verified. Nothing
+      # consumes it yet — it is the prerequisite for the tap's sha256 pin (#85)
+      # and for install.sh (harbor.my#49), neither of which can verify a
+      # download until this file exists.
       - name: Generate checksums
         run: |
           cd dist
           # Bare filenames, no dist/ prefix, so `sha256sum -c checksums.txt`
           # works from a directory of downloaded release assets.
           #
-          # The glob is `harbor-*`, NOT `*`. The shell creates checksums.txt for
-          # the redirect before sha256sum runs, so any `*` that expands AFTER
-          # that lists the file in its own manifest — which then fails `-c`.
-          # This job gets a fresh runner every time, so it cannot happen here;
-          # `harbor-*` is simply the glob that stays correct if this ever runs
-          # somewhere with a dirty dist/, and it says what it means.
+          # The glob is `harbor-*`, NOT `*`. Expansion precedes redirection, so a
+          # bare `*` is fine on a FIRST run — but on any run where checksums.txt
+          # already exists it lists that file in its own manifest, which then
+          # fails `-c`. A fresh runner means it cannot happen here; `harbor-*` is
+          # simply the glob that stays correct anywhere, and it says what it
+          # means.
+          #
+          # It is also narrower than the `files: dist/*` upload below: an asset
+          # not named harbor-* would be published WITHOUT a checksum. Add it here
+          # too if that ever happens.
           sha256sum harbor-* > checksums.txt
           echo "--- checksums.txt ---"
           cat checksums.txt

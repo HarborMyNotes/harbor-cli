@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"testing"
 
@@ -758,29 +759,58 @@ func TestResolveVersionPrefersLdflags(t *testing.T) {
 	}
 }
 
-// TestVersionIsWiredEverywhere pins that resolveVersion is actually REACHED.
+// TestVersionFallbackIsReached proves the build-info fallback is actually WIRED,
+// not merely correct when called directly.
 //
-// Without this the whole feature can be deleted with a green suite: reverting
-// cobra's Version field to the raw variable, or removing the build-info fallback
-// outright, breaks nothing that any other test asserts. A version helper nothing
-// calls is just a well-tested unused function.
+// This is the test the first version of this change lacked, and the gap was
+// real: deleting the debug.ReadBuildInfo() call and returning "dev" left the
+// entire suite green while `go install` regressed to reporting "dev" again. A
+// grep for the call is no better — it passes just as happily once the call is
+// gone. So the reader is a seam, and this drives resolveVersionFrom with a fake.
+func TestVersionFallbackIsReached(t *testing.T) {
+	fake := func(v string) func() (*debug.BuildInfo, bool) {
+		return func() (*debug.BuildInfo, bool) {
+			return &debug.BuildInfo{Main: debug.Module{Version: v}}, true
+		}
+	}
+
+	// Nothing injected: the answer must come from build info.
+	if got := resolveVersionFrom(devVersion, fake("v0.1.27")); got != "v0.1.27" {
+		t.Errorf("with no ldflags, resolveVersionFrom = %q, want the go-install tag v0.1.27", got)
+	}
+	// Injected: build info must be ignored entirely, so a release binary reports
+	// exactly what the workflow stamped.
+	if got := resolveVersionFrom("v9.9.9", fake("v0.1.27")); got != "v9.9.9" {
+		t.Errorf("ldflags did not win: %q", got)
+	}
+	// A local build still reads "dev" through the real path, not just the helper.
+	if got := resolveVersionFrom(devVersion, fake("v0.1.31-0.20260807051754-b683a4a261ad")); got != devVersion {
+		t.Errorf("a pseudo-version leaked through the wired path: %q", got)
+	}
+	// No build info at all (a stripped or non-module binary).
+	if got := resolveVersionFrom(devVersion, func() (*debug.BuildInfo, bool) { return nil, false }); got != devVersion {
+		t.Errorf("missing build info should read %q, got %q", devVersion, got)
+	}
+	// And the production wiring uses the real reader.
+	if got := resolveVersion(); got != resolveVersionFrom(version, readBuildInfo) {
+		t.Errorf("resolveVersion does not delegate to resolveVersionFrom: %q", got)
+	}
+}
+
+// TestVersionIsWiredEverywhere pins that every surface reports the SAME version.
 //
-// The support bundle matters as much as --version here. It exists for triage, so
-// a bundle reporting "dev" while the same binary's --version reports v0.1.32 is
-// worse than either answer alone.
+// The failure mode is a new call site reading the raw variable — under
+// `go install` that surface reports "dev" while --version reports the real tag.
+// Support metadata exists for triage, so it is the worst place for the two to
+// disagree. A source check is the only thing that catches a call site nothing
+// else exercises; it is exact-string and covers the three files that surface a
+// version today, so treat it as a guard, not a proof.
 func TestVersionIsWiredEverywhere(t *testing.T) {
-	// NOT mutated: cobra's Version field is evaluated once at package init, so a
-	// later assignment to the variable cannot move it — which is correct for a
-	// real binary, where ldflags sets the value at link time. Compare under
-	// ambient conditions and let the source check below catch a revert.
 	prepareCommandTree()
 	if rootCmd.Version != resolveVersion() {
 		t.Errorf("cobra reports %q but resolveVersion() says %q — --version bypasses the resolver", rootCmd.Version, resolveVersion())
 	}
 
-	// Every other place the version is surfaced must agree with it. A literal
-	// grep, because the failure mode is a NEW call site reading the raw variable
-	// — which no behavioural test would notice.
 	for _, f := range []string{"support.go", "skill.go", "root.go"} {
 		src, err := os.ReadFile(f)
 		if err != nil {
