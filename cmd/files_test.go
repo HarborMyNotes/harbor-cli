@@ -5,10 +5,13 @@ package cmd
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/HarborMyNotes/harbor-cli/crypto"
 )
 
 func TestHashFile(t *testing.T) {
@@ -84,6 +87,124 @@ func TestMapFileError(t *testing.T) {
 	for code, sub := range cases {
 		if got := mapFileError(apiErr(code)); !strings.Contains(got.Error(), sub) {
 			t.Errorf("mapFileError(%s) = %q", code, got.Error())
+		}
+	}
+}
+
+// readAll drains a reader in tests, failing rather than returning an error.
+func readAll(t *testing.T, r io.Reader) []byte {
+	t.Helper()
+	b, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("reading: %v", err)
+	}
+	return b
+}
+
+// TestDecryptDownloadPassesPlaintextThrough proves an ordinary blob is handed
+// back byte-identical, including files shorter than the sniff window — reading
+// the first 33 bytes must never truncate a 5-byte file.
+func TestDecryptDownloadPassesPlaintextThrough(t *testing.T) {
+	lockedSession(t)
+	for _, body := range []string{"", "x", "hello", "just a normal file, not encrypted at all", strings.Repeat("z", 5000)} {
+		got, err := decryptDownload(nil, nil, strings.NewReader(body), false)
+		if err != nil {
+			t.Fatalf("decryptDownload(%d bytes): %v", len(body), err)
+		}
+		if out := string(readAll(t, got)); out != body {
+			t.Fatalf("plaintext altered: got %d bytes, want %d", len(out), len(body))
+		}
+	}
+}
+
+// TestDecryptDownloadDecryptsEnvelope proves an encrypted blob is unwrapped when
+// the session is unlocked, which is the whole point of the transparent path.
+func TestDecryptDownloadDecryptsEnvelope(t *testing.T) {
+	key := newMasterKey(t)
+	unlockedSession(t, key)
+
+	original := []byte("the real file bytes, secret")
+	sealed, err := crypto.SealBytes(key, original)
+	if err != nil {
+		t.Fatalf("SealBytes: %v", err)
+	}
+	got, err := decryptDownload(nil, nil, bytes.NewReader(sealed), false)
+	if err != nil {
+		t.Fatalf("decryptDownload: %v", err)
+	}
+	if out := readAll(t, got); !bytes.Equal(out, original) {
+		t.Fatalf("decrypted = %q, want %q", out, original)
+	}
+}
+
+// TestDecryptDownloadRefusesWhenLocked proves the CLI does NOT write ciphertext
+// into a file the user thinks is their document, and that the refusal names both
+// the env var and the escape hatch.
+func TestDecryptDownloadRefusesWhenLocked(t *testing.T) {
+	key := newMasterKey(t)
+	sealed, err := crypto.SealBytes(key, []byte("secret"))
+	if err != nil {
+		t.Fatalf("SealBytes: %v", err)
+	}
+	lockedSession(t)
+
+	got, err := decryptDownload(nil, nil, bytes.NewReader(sealed), false)
+	if err == nil {
+		t.Fatalf("expected a refusal, got %q", readAll(t, got))
+	}
+	for _, want := range []string{"encrypted", "HARBOR_PASSPHRASE", "--ciphertext", "nothing was written"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal missing %q: %v", want, err)
+		}
+	}
+}
+
+// TestDecryptDownloadCiphertextOptOut proves --ciphertext hands back the raw
+// envelope untouched, for backups and moving bytes between machines.
+func TestDecryptDownloadCiphertextOptOut(t *testing.T) {
+	key := newMasterKey(t)
+	sealed, err := crypto.SealBytes(key, []byte("secret"))
+	if err != nil {
+		t.Fatalf("SealBytes: %v", err)
+	}
+	lockedSession(t)
+
+	got, err := decryptDownload(nil, nil, bytes.NewReader(sealed), true)
+	if err != nil {
+		t.Fatalf("decryptDownload(--ciphertext): %v", err)
+	}
+	if out := readAll(t, got); !bytes.Equal(out, sealed) {
+		t.Fatalf("--ciphertext altered the envelope: %d bytes, want %d", len(out), len(sealed))
+	}
+}
+
+// TestDecryptDownloadWrongKey proves a blob sealed under a different key fails
+// closed with an explanation rather than writing garbage to disk.
+func TestDecryptDownloadWrongKey(t *testing.T) {
+	sealed, err := crypto.SealBytes(newMasterKey(t), []byte("secret"))
+	if err != nil {
+		t.Fatalf("SealBytes: %v", err)
+	}
+	unlockedSession(t, make([]byte, 32)) // a different, all-zero key
+
+	if _, err := decryptDownload(nil, nil, bytes.NewReader(sealed), false); err == nil {
+		t.Fatal("expected a decrypt failure")
+	} else if !strings.Contains(err.Error(), "nothing was written") {
+		t.Errorf("error should say nothing was written: %v", err)
+	}
+}
+
+// TestFilesKeyRefusals proves the upload path refuses with actionable text
+// rather than uploading a plaintext file stamped is_encrypted.
+func TestFilesKeyRefusals(t *testing.T) {
+	lockedSession(t)
+	_, err := filesKey(nil, nil)
+	if err == nil {
+		t.Fatal("expected a refusal with no passphrase set")
+	}
+	for _, want := range []string{"HARBOR_PASSPHRASE", "nothing was uploaded", "in the clear"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal missing %q: %v", want, err)
 		}
 	}
 }

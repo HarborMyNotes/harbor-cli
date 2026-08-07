@@ -4,9 +4,11 @@
 package crypto
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"regexp"
 	"strings"
@@ -403,5 +405,182 @@ func TestSealedFieldMatchesServerShape(t *testing.T) {
 	ct, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil || len(ct) < 16 {
 		t.Fatalf("ct not ≥16 raw-url bytes: %q (%v)", parts[2], err)
+	}
+}
+
+// binaryVector pins the HRBC2 BINARY envelope (attachments) as a hex literal:
+// master key = the bytes 0x00..0x1f, nonce = the bytes 0x00..0x0b, plaintext
+// "Secret file bytes", and NO AAD. It was computed with Python's cryptography
+// AESGCM, independently of this package.
+//
+// Unlike the field envelope, no other Harbor client had published a binary
+// known-answer vector — the CLI is minting the first one. It is derived purely
+// from the format the other four already implement (magic ‖ iv ‖ ct ‖ tag,
+// master key, no AAD), so it describes their behaviour rather than inventing a
+// new rule; the value is here so a future client can check itself against it.
+const (
+	binaryVector          = "4852424332000102030405060708090a0b1467b569a091e27de42df2abd3900c08f0b1a847dcafcd37cbc951802b90471172"
+	binaryVectorPlaintext = "Secret file bytes"
+)
+
+// TestSealBytes_BinaryVector proves sealing the vector's parameters reproduces
+// the pinned envelope byte for byte — magic, nonce placement, tag position and
+// the absence of AAD all at once. Any of them changing breaks this.
+func TestSealBytes_BinaryVector(t *testing.T) {
+	got, err := sealBytesWithNonce(crossClientKey(), []byte(binaryVectorPlaintext), crossClientNonce())
+	if err != nil {
+		t.Fatalf("sealBytesWithNonce: %v", err)
+	}
+	if hex.EncodeToString(got) != binaryVector {
+		t.Fatalf("binary envelope does not match the pinned vector\n got: %s\nwant: %s", hex.EncodeToString(got), binaryVector)
+	}
+}
+
+// TestOpenBytes_BinaryVector proves the other direction: the pinned envelope
+// decrypts back to the original bytes, so a file written by another client is
+// readable here.
+func TestOpenBytes_BinaryVector(t *testing.T) {
+	env, err := hex.DecodeString(binaryVector)
+	if err != nil {
+		t.Fatalf("decoding the vector: %v", err)
+	}
+	got, err := OpenBytes(crossClientKey(), env)
+	if err != nil {
+		t.Fatalf("OpenBytes on the pinned binary vector: %v", err)
+	}
+	if string(got) != binaryVectorPlaintext {
+		t.Fatalf("plaintext = %q, want %q", got, binaryVectorPlaintext)
+	}
+}
+
+// TestSealBytes_NoAAD proves attachments carry NO AAD, by opening our envelope
+// with an independent decryptor that passes nil. If someone "hardens" SealBytes
+// by binding AAD, every other Harbor client stops being able to read our files
+// and this test says so.
+func TestSealBytes_NoAAD(t *testing.T) {
+	key := crossClientKey()
+	env, err := SealBytes(key, []byte(binaryVectorPlaintext))
+	if err != nil {
+		t.Fatalf("SealBytes: %v", err)
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatalf("aes: %v", err)
+	}
+	g, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatalf("gcm: %v", err)
+	}
+	magic := len("HRBC2")
+	got, err := g.Open(nil, env[magic:magic+12], env[magic+12:], nil)
+	if err != nil {
+		t.Fatalf("a no-AAD reader could not open our envelope: %v (other clients would fail the same way)", err)
+	}
+	if string(got) != binaryVectorPlaintext {
+		t.Fatalf("plaintext = %q, want %q", got, binaryVectorPlaintext)
+	}
+}
+
+// TestSealOpenBytesRoundTrip covers the sizes that break naive implementations:
+// empty input, one byte, and a payload spanning several GCM blocks. It also
+// pins that two seals of the same bytes differ, i.e. the nonce is fresh.
+func TestSealOpenBytesRoundTrip(t *testing.T) {
+	key := crossClientKey()
+	for _, size := range []int{0, 1, 15, 16, 17, 4096} {
+		pt := make([]byte, size)
+		for i := range pt {
+			pt[i] = byte(i % 251)
+		}
+		env, err := SealBytes(key, pt)
+		if err != nil {
+			t.Fatalf("SealBytes(%d): %v", size, err)
+		}
+		if want := BinaryEnvelopeMinBytes + size; len(env) != want {
+			t.Fatalf("envelope for %d bytes is %d long, want %d", size, len(env), want)
+		}
+		if !IsBinaryEnvelope(env) {
+			t.Fatalf("SealBytes(%d) output does not sniff as an envelope", size)
+		}
+		if bytes.Contains(env, pt) && size > 16 {
+			t.Fatalf("SealBytes(%d) leaked the plaintext into the envelope", size)
+		}
+		got, err := OpenBytes(key, env)
+		if err != nil {
+			t.Fatalf("OpenBytes(%d): %v", size, err)
+		}
+		if !bytes.Equal(got, pt) {
+			t.Fatalf("round-trip mismatch at %d bytes", size)
+		}
+	}
+
+	a, _ := SealBytes(key, []byte("same"))
+	b, _ := SealBytes(key, []byte("same"))
+	if bytes.Equal(a, b) {
+		t.Fatal("two seals of the same bytes are identical — the nonce is not fresh")
+	}
+}
+
+// TestOpenBytes_Rejects proves OpenBytes fails closed and distinguishes "this
+// was never encrypted" (ErrNotEnvelope) from "this will not open" (ErrDecrypt),
+// which is what lets callers skip plaintext files instead of erroring on them.
+func TestOpenBytes_Rejects(t *testing.T) {
+	key := crossClientKey()
+	env, err := SealBytes(key, []byte(binaryVectorPlaintext))
+	if err != nil {
+		t.Fatalf("SealBytes: %v", err)
+	}
+
+	for name, input := range map[string][]byte{
+		"plain text":      []byte("just a normal file, not encrypted at all"),
+		"empty":           {},
+		"magic but short": []byte("HRBC2" + strings.Repeat("x", 10)),
+		"wrong magic":     append([]byte("HRBX9"), env[5:]...),
+		"exactly min-1":   make([]byte, BinaryEnvelopeMinBytes-1),
+	} {
+		if _, err := OpenBytes(key, input); !errors.Is(err, ErrNotEnvelope) {
+			t.Errorf("OpenBytes(%s): err = %v, want ErrNotEnvelope", name, err)
+		}
+	}
+
+	// A STRING envelope shares the same 5-byte magic, so it sniffs as binary and
+	// fails at authentication rather than at the structural check. Pinned so the
+	// overlap is a known, deliberate property rather than a surprise: the two
+	// never mix in practice (string envelopes live in note fields, binary ones in
+	// blob bytes), and every other client sniffs on the magic alone — narrowing
+	// it here would break the format we are matching.
+	strEnv := []byte("HRBC2.AAECAwQFBgcICQoL.FGe1aaCR4nXiNfKr04YcFISiyIPEgI0uXE_6tfgGWQw")
+	if _, err := OpenBytes(key, strEnv); !errors.Is(err, ErrDecrypt) {
+		t.Errorf("OpenBytes(string envelope): err = %v, want ErrDecrypt", err)
+	}
+
+	// Structurally an envelope, but tampered: must be ErrDecrypt, not silence.
+	tampered := append([]byte(nil), env...)
+	tampered[len(tampered)-1] ^= 0xff
+	if _, err := OpenBytes(key, tampered); !errors.Is(err, ErrDecrypt) {
+		t.Errorf("OpenBytes(tampered): err = %v, want ErrDecrypt", err)
+	}
+
+	wrongKey := make([]byte, 32)
+	if _, err := OpenBytes(wrongKey, env); !errors.Is(err, ErrDecrypt) {
+		t.Errorf("OpenBytes(wrong key): err = %v, want ErrDecrypt", err)
+	}
+}
+
+// TestIsBinaryEnvelope_ShortPrefix pins the trap that has shipped twice on other
+// Harbor clients: sniffing fewer than BinaryEnvelopeMinBytes makes every input
+// answer false, which turns "skip files already encrypted" into "skip all".
+func TestIsBinaryEnvelope_ShortPrefix(t *testing.T) {
+	env, err := SealBytes(crossClientKey(), []byte(binaryVectorPlaintext))
+	if err != nil {
+		t.Fatalf("SealBytes: %v", err)
+	}
+	if BinaryEnvelopeMinBytes != 33 {
+		t.Fatalf("BinaryEnvelopeMinBytes = %d, want 33 (5 magic + 12 iv + 16 tag)", BinaryEnvelopeMinBytes)
+	}
+	if IsBinaryEnvelope(env[:BinaryEnvelopeMinBytes-1]) {
+		t.Fatal("a too-short prefix sniffed as an envelope")
+	}
+	if !IsBinaryEnvelope(env[:BinaryEnvelopeMinBytes]) {
+		t.Fatal("a prefix of exactly BinaryEnvelopeMinBytes did not sniff as an envelope")
 	}
 }

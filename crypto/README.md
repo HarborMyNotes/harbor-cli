@@ -73,12 +73,34 @@ contract):
 - An encrypted note may have an **empty title** (sent as `""`, not an envelope);
   `content` must always be a valid envelope.
 
-### Attachments (binary envelope — not yet implemented in the CLI)
+### Attachments (binary envelope)
 
 ```
 "HRBC2"(5 ASCII bytes) ‖ iv(12) ‖ ciphertext ‖ tag(16)   // raw bytes
 resources.hash = sha256(the whole binary envelope)
 ```
+
+- **AES-256-GCM** under the **master key** — the same key as note fields. There is
+  no per-note or per-resource key.
+- **AAD: NONE.** Attachments are sealed with a nil/empty AAD. This is the
+  finalized rule, and it is what web, macOS/iOS, Android and Windows already do;
+  binding AAD here would make files written by the CLI unreadable by all of them.
+  Integrity is instead bound by the content address: the server stores
+  `hash = sha256(envelope)`, computed over the ciphertext.
+- Because the hash covers ciphertext and every seal uses a fresh nonce,
+  **dedup only works across identical ciphertext** — in practice, never. Accepted.
+- The **minimum envelope is 33 bytes** (5 + 12 + 16). Anything sniffing for the
+  magic must read at least that many bytes, or every input answers "not
+  encrypted"; that bug has shipped twice on other clients. Use
+  `crypto.BinaryEnvelopeMinBytes`.
+- `filename` and `mime` stay **plaintext** on the resource record (an accepted
+  metadata leak, matching the other clients), and `size` is the **envelope** size,
+  not the plaintext size.
+- ⚠️ A **string** envelope begins with the same 5-byte magic, so magic-sniffing
+  cannot distinguish the two. They never mix in practice — string envelopes live
+  in note fields, binary ones in blob bytes.
+
+Go: `crypto.SealBytes` / `crypto.OpenBytes` / `crypto.IsBinaryEnvelope`.
 
 ## Writing an encrypted note
 

@@ -209,3 +209,59 @@ func TestFetchURLDownloadError(t *testing.T) {
 		}
 	}
 }
+
+// TestUploadBytesMultipart proves the in-memory upload path sends exactly the
+// bytes it is given (no re-reading from disk), stamps is_encrypted, and keeps
+// the caller's filename and MIME rather than deriving them from the ciphertext.
+func TestUploadBytesMultipart(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 201, `{"hash":"abc","filename":"secret.pdf","is_encrypted":true}`)
+	defer srv.Close()
+
+	sealed := []byte("HRBC2\x00\x01\x02ciphertext-not-plaintext")
+	if _, err := testClient(srv.URL).UploadBytes(sealed, "application/pdf", "secret.pdf", true); err != nil {
+		t.Fatalf("UploadBytes error: %v", err)
+	}
+	if rec.Path != "/files/upload" {
+		t.Errorf("path = %s", rec.Path)
+	}
+	if !strings.HasPrefix(rec.ContentType, "multipart/form-data") {
+		t.Errorf("content-type = %q", rec.ContentType)
+	}
+	body := string(rec.Body)
+	for _, want := range []string{"ciphertext-not-plaintext", "secret.pdf", "application/pdf", "is_encrypted", "true"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("multipart body missing %q: %s", want, body)
+		}
+	}
+}
+
+// TestUploadBytesOmitsEncryptedFlag proves is_encrypted is sent only when true,
+// so an ordinary upload is not mislabelled.
+func TestUploadBytesOmitsEncryptedFlag(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 201, `{"hash":"abc"}`)
+	defer srv.Close()
+
+	if _, err := testClient(srv.URL).UploadBytes([]byte("plain"), "text/plain", "a.txt", false); err != nil {
+		t.Fatalf("UploadBytes error: %v", err)
+	}
+	if strings.Contains(string(rec.Body), "is_encrypted") {
+		t.Errorf("is_encrypted should be omitted when false: %s", rec.Body)
+	}
+}
+
+// TestDetectMIME resolves the original file's type, which the encrypted upload
+// path needs before it replaces the bytes with an opaque envelope.
+func TestDetectMIME(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a.txt")
+	if err := os.WriteFile(path, []byte("hello"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := DetectMIME(path); !strings.HasPrefix(got, "text/plain") {
+		t.Errorf("DetectMIME = %q, want text/plain…", got)
+	}
+	if got := DetectMIME(filepath.Join(t.TempDir(), "missing")); got != "" {
+		t.Errorf("DetectMIME(missing) = %q, want \"\"", got)
+	}
+}
