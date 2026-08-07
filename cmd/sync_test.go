@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -318,43 +319,58 @@ func TestWarnDefaultNotebookEncryptSpeaksOnce(t *testing.T) {
 	}
 }
 
-// TestNoNotebookRecordsAreConstructedByTheCLI is the CLI's whole "the sync engine
-// cannot produce the banned pair" obligation, discharged structurally.
+// TestNoNotebookRecordsAreConstructedByTheCLI is the canary over the CLI's "the
+// sync engine cannot produce the banned pair" property.
 //
-// The CLI keeps no offline queue: `sync push` forwards a JSON file the user
-// wrote, and the only sync record the CLI builds itself is the crypto keystore.
-// So there is no client-side state that could hold a default notebook with
-// default_encrypt on. This test fails the day that stops being true — if someone
-// adds code that constructs a "notebook" sync record, the guarantee needs
-// rethinking rather than silently lapsing.
+// The property holds by construction: the CLI keeps no offline queue, and there
+// are exactly two SyncPush call sites — this file's push command, which forwards
+// a JSON file the USER wrote, and cmd/crypto.go, which pushes the keystore. So
+// there is no client-side state that could hold a default notebook with
+// default_encrypt on.
+//
+// This test is a canary, NOT a proof. It walks the whole module and greps for a
+// notebook type tag, which catches the obvious regression — someone building a
+// notebook envelope inline — but a determined one slips past: a struct with a
+// json tag, a const indirection, or a value assembled at runtime. Treat a
+// failure here as certain, and a pass as "nothing obvious", not as a guarantee.
+// A real proof would parse with go/ast and follow the values into SyncPush.
 func TestNoNotebookRecordsAreConstructedByTheCLI(t *testing.T) {
 	// A regex, not a fixed string: gofmt aligns struct-literal keys to the longest
 	// one, so the spacing after "type" changes with the other keys in the map. An
-	// exact-match check passes on the most natural envelope shape and is worthless.
+	// exact-match check passes on the most natural envelope shape.
 	banned := regexp.MustCompile(`"type"\s*:\s*"notebook"`)
 
-	roots := []string{".", "../client", "../crypto", "../config"}
+	// Walk the whole module from its root rather than a hardcoded package list, so
+	// a new package cannot be invisible to this simply by existing.
 	scanned := 0
-	for _, root := range roots {
-		files, err := filepath.Glob(filepath.Join(root, "*.go"))
+	err := filepath.WalkDir("..", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			t.Fatal(err)
+			return err
 		}
-		for _, f := range files {
-			if strings.HasSuffix(f, "_test.go") {
-				continue
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", "build", "dist", "vendor", "node_modules":
+				return filepath.SkipDir
 			}
-			src, err := os.ReadFile(f)
-			if err != nil {
-				t.Fatal(err)
-			}
-			scanned++
-			if banned.Match(src) {
-				t.Errorf("%s constructs a notebook sync record — the CLI's 'no local state can hold the banned pair' guarantee no longer holds by construction", f)
-			}
+			return nil
 		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		src, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		scanned++
+		if banned.Match(src) {
+			t.Errorf("%s constructs a notebook sync record — the CLI's 'no local state can hold the banned pair' property no longer holds by construction", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if scanned < 20 {
+	if scanned < 40 {
 		t.Fatalf("only scanned %d files — the walk is not reaching the source tree", scanned)
 	}
 }

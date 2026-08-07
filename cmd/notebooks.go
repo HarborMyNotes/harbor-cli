@@ -195,8 +195,10 @@ func mapNotebookError(err error) error {
 // no notebook land, and none of those writers can client-side encrypt — so a
 // note the user believes is sealed would arrive there in the clear.
 //
-// The CLI refuses locally instead of letting the request 422 so the user gets the
-// reason without a round trip, and so the failure reads the same offline as on.
+// The CLI refuses locally instead of letting the request 422, so the user gets the
+// reason and the fix without spending a write. A request that states both fields
+// needs no network at all; the single-flag cases still read the notebook first,
+// so offline they surface the read error rather than this refusal.
 // The wording matches app.harbor.my internal/notebooks/notebooks.go exactly
 // (issue app.harbor.my#1338); web shows the same sentence.
 const defaultCannotEncryptMessage = "the default notebook can't encrypt notes by default — forwarded email, imports, and notes with no notebook land there; encrypt a different notebook instead"

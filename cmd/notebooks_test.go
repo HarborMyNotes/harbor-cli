@@ -191,7 +191,9 @@ func TestDefaultCannotEncryptServerMessageIsNotParaphrased(t *testing.T) {
 // rule is how a user learns to distrust one of them.
 func TestLocalRefusalMatchesTheServerWording(t *testing.T) {
 	const serverMessage = "The default notebook can't encrypt notes by default — forwarded email, imports, and notes with no notebook land there; encrypt a different notebook instead."
-	normalized := strings.TrimSuffix(strings.ToLower(serverMessage), ".")
+	// Lower only the FIRST character. Lowercasing the whole sentence would demand
+	// the CLI mangle a proper noun if the server copy ever gains one.
+	normalized := strings.TrimSuffix(strings.ToLower(serverMessage[:1])+serverMessage[1:], ".")
 	if defaultCannotEncryptMessage != normalized {
 		t.Errorf("the local refusal has drifted from the server's copy:\n local: %s\nserver: %s", defaultCannotEncryptMessage, normalized)
 	}
