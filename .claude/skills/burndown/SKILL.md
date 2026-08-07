@@ -62,6 +62,54 @@ reason written down where he'll see it. Never block on a question. When an issue
   network down) so every remaining issue would fail the same way, stop the run with one
   clear summary — don't spray ten identical failure comments across the board.
 
+## Every pause gets a TL;DR
+
+**Whenever you stop and hand control back to Spicer, end the message with a short
+plain-language TL;DR** — the same thing `/tldr` would produce, appended under a
+`**TL;DR**` heading. He reads the TL;DR first and decides from there whether to scroll up
+for the full detail. He should never have to type `/tldr` to get it.
+
+- **Write the full version too.** The TL;DR is an addition, not a replacement — keep the
+  detailed explanation above it.
+- **Only when you're actually pausing** — asking a question, reporting a blocker, finishing
+  an issue and handing back, or ending the run. Narrating progress mid-work ("running the
+  tests now", "the fresh-eyes agent found two things, fixing them") is thinking out loud,
+  not a pause: no TL;DR.
+- **Shape:** a few bullets, non-technical, what he needs to know and what needs his
+  decision. Per his global preferences — bottom line first, no drama, no jargon.
+
+## Keep the parent context light — delegate
+
+**Push work into subagents wherever it can go.** The parent agent is the orchestrator: it
+owns the queue, the decisions, and what gets said to Spicer. It should not be the thing
+that reads twelve files to find a call site or scrolls a thousand lines of test output.
+A burndown run can span many issues, and a parent that fills its context on issue #1 gets
+worse at issue #5.
+
+Delegate by default:
+
+- **Codebase reconnaissance** — "where does X live", "what calls Y", "how does this repo do
+  Z" → an `Explore` or `general-purpose` agent. Ask for the conclusion and the
+  `file:line` anchors, not file dumps.
+- **The fresh-eyes review** (step 4 below) — already a subagent, and mandatory.
+- **Self-contained implementation** of a well-specified change, when the spec is settled and
+  the acceptance criteria are unambiguous. Hand over the issue number, the plan, and the
+  repo conventions; get back a summary of what changed.
+- **Noisy verification** — long test runs, multi-step CLI E2E walkthroughs against a test
+  environment, log spelunking. Ask for a verdict plus the few lines of output worth pasting
+  into the PR.
+- **Research across repos** — reading the server docs in `app.harbor.my`, checking what
+  another client did for parity.
+
+Keep in the parent: the queue and board updates, choosing the next issue, the merge, every
+judgment call about scope or ambiguity, and everything said to Spicer. **Never delegate a
+decision that should stop and ask him** — a subagent has no way to reach him, so an
+ambiguity handed to a subagent silently becomes a guess.
+
+Run independent subagents concurrently in one message. Verify what a subagent claims before
+acting on it — agents get things confidently wrong, and the parent is accountable for what
+lands.
+
 ## The queue
 
 All the IDs, so nothing needs discovering at runtime:

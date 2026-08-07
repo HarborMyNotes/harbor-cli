@@ -23,8 +23,10 @@
 //
 // All base64url is UNPADDED (RawURLEncoding), matching the server's structural
 // validator. The AEAD additional-authenticated-data (AAD) for a field is the
-// note id immediately followed by the field name ("title" or "content"), with no
-// separator, so an envelope cannot be transplanted to another note or field.
+// UTF-8 bytes of "<noteID>:<fieldName>" — the note id, a literal colon, then
+// "title" or "content" — so an envelope cannot be transplanted to another note
+// or field. That exact byte sequence is the cross-client interop contract shared
+// with web, macOS/iOS, Android and Windows; see fieldAAD and crypto/README.md.
 package crypto
 
 import (
@@ -234,10 +236,18 @@ func RewrapMasterKey(k *Keystore, oldPass, newPass string, p Argon2Params) (stri
 }
 
 // fieldAAD builds the AEAD additional-authenticated-data for a note field: the
-// note id immediately followed by the field name, no separator. This binds an
-// envelope to exactly one note and one field.
+// UTF-8 bytes of "<recordID>:<fieldName>". This binds an envelope to exactly one
+// note and one field, so a content envelope can never be replayed as that note's
+// title nor moved to another note.
+//
+// The colon is load-bearing and is NOT a local choice: this exact byte sequence
+// is the cross-client interop contract, defined canonically by the web client
+// (app.harbor.my web/src/lib/crypto/envelope.ts) and matched byte-for-byte by
+// macOS/iOS, Android and Windows. Change it and notes sealed here stop opening
+// everywhere else. See crypto/README.md and the crossClientVector literal pinned
+// in crypto_test.go.
 func fieldAAD(recordID, fieldName string) []byte {
-	return []byte(recordID + fieldName)
+	return []byte(recordID + ":" + fieldName)
 }
 
 // SealField encrypts a note field's plaintext into an HRBC2 envelope under the
@@ -247,6 +257,18 @@ func SealField(masterKey []byte, recordID, fieldName, plaintext string) (string,
 	nonce := make([]byte, nonceLen)
 	if _, err := rand.Read(nonce); err != nil {
 		return "", fmt.Errorf("generating nonce: %w", err)
+	}
+	return sealFieldWithNonce(masterKey, recordID, fieldName, plaintext, nonce)
+}
+
+// sealFieldWithNonce is SealField with the nonce supplied rather than generated.
+// It exists so tests can reproduce the shared cross-client known-answer vector
+// byte for byte, the same way harbor-swift and harbor-windows make their nonce
+// injectable. Production code must always use SealField: reusing a nonce under
+// the same key breaks AES-GCM catastrophically.
+func sealFieldWithNonce(masterKey []byte, recordID, fieldName, plaintext string, nonce []byte) (string, error) {
+	if len(nonce) != nonceLen {
+		return "", fmt.Errorf("nonce must be %d bytes, got %d", nonceLen, len(nonce))
 	}
 	aead, err := newAEAD(masterKey)
 	if err != nil {

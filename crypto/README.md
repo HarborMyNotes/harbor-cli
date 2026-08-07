@@ -57,10 +57,19 @@ contract):
 - **AES-256-GCM** under the **master key**, a **fresh random 12-byte nonce** per
   operation (never reuse).
 - **base64url is UNPADDED** (`RawURLEncoding`) — matches the server validator.
-- **AAD** = the UTF-8 bytes of `noteID + fieldName`, **id first, no separator**;
-  `fieldName` is the literal `"title"` or `"content"`. e.g. `"9c2e…title"`. This
-  binds an envelope to one note and one field; the same AAD must be supplied to
-  decrypt or GCM authentication fails.
+- **AAD** = the UTF-8 bytes of `recordID + ":" + fieldName` — **id first, a
+  literal colon, then the field name**; `fieldName` is the literal `"title"` or
+  `"content"`. e.g. `"9c2e…:title"`. This binds an envelope to one note and one
+  field; the same AAD must be supplied to decrypt or GCM authentication fails.
+  ⚠️ **This byte sequence is the cross-client interop contract, not a local
+  choice.** The canonical definition lives in the web client
+  (`app.harbor.my` → `web/src/lib/crypto/envelope.ts`); macOS/iOS, Android and
+  Windows all match it byte-for-byte, and so must this CLI. The separator was
+  missing here until #86, which made every CLI-sealed note undecryptable by every
+  other client. The shared known-answer vector is pinned as a literal in
+  `crypto_test.go` (`crossClientVector`, asserted in both directions by
+  `TestSealField_CrossClientVector` and `TestOpenField_CrossClientVector`) so it
+  cannot drift again.
 - An encrypted note may have an **empty title** (sent as `""`, not an envelope);
   `content` must always be a valid envelope.
 
