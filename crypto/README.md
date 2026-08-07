@@ -91,7 +91,7 @@ resources.hash = sha256(the whole binary envelope)
   **dedup only works across identical ciphertext** — in practice, never. Accepted.
 - The **minimum envelope is 33 bytes** (5 + 12 + 16). Anything sniffing for the
   magic must read at least that many bytes, or every input answers "not
-  encrypted"; that bug has shipped twice on other clients. Use
+  encrypted"; that bug has shipped on another client before. Use
   `crypto.BinaryEnvelopeMinBytes`.
 - `filename` and `mime` stay **plaintext** on the resource record (an accepted
   metadata leak, matching the other clients), and `size` is the **envelope** size,

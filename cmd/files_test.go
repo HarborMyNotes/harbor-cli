@@ -6,11 +6,14 @@ package cmd
 import (
 	"bytes"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/HarborMyNotes/harbor-cli/client"
 	"github.com/HarborMyNotes/harbor-cli/crypto"
 )
 
@@ -206,5 +209,91 @@ func TestFilesKeyRefusals(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("refusal missing %q: %v", want, err)
 		}
+	}
+}
+
+// TestUploadEncryptedSendsEnvelopeNotPlaintext is the regression guard for the
+// bug this feature replaced: an upload that stamped the resource is_encrypted
+// while putting the file on the server in the clear. It asserts against the
+// actual multipart body on the wire, so reverting to a plaintext upload fails
+// here even though every other test would still pass.
+func TestUploadEncryptedSendsEnvelopeNotPlaintext(t *testing.T) {
+	const marker = "ATTACHMENT-PLAINTEXT-MARKER-12345"
+
+	var body []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ = io.ReadAll(r.Body)
+		if r.URL.Path != "/files/upload" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"hash":"abc","filename":"secret.txt","is_encrypted":true}`))
+	}))
+	defer srv.Close()
+
+	path := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(path, []byte(marker), 0644); err != nil {
+		t.Fatal(err)
+	}
+	key := newMasterKey(t)
+	if _, err := uploadEncrypted(client.NewClient(srv.URL, "at_test"), key, path, "", ""); err != nil {
+		t.Fatalf("uploadEncrypted: %v", err)
+	}
+
+	if bytes.Contains(body, []byte(marker)) {
+		t.Fatal("the plaintext reached the server — the bytes were not encrypted before upload")
+	}
+	if !bytes.Contains(body, []byte("HRBC2")) {
+		t.Fatal("no HRBC2 envelope in the multipart body")
+	}
+	// Filename and MIME come from the ORIGINAL file, not from the ciphertext.
+	for _, want := range []string{"secret.txt", "text/plain", "is_encrypted"} {
+		if !bytes.Contains(body, []byte(want)) {
+			t.Errorf("multipart body missing %q", want)
+		}
+	}
+
+	// And what was sent must decrypt back to the original file.
+	start := bytes.Index(body, []byte("HRBC2"))
+	sealed := body[start : start+crypto.BinaryEnvelopeMinBytes+len(marker)]
+	got, err := crypto.OpenBytes(key, sealed)
+	if err != nil {
+		t.Fatalf("the uploaded envelope does not decrypt: %v", err)
+	}
+	if string(got) != marker {
+		t.Fatalf("decrypted = %q, want %q", got, marker)
+	}
+}
+
+// TestFilesKeyNoKeystore covers the other refusal branch: a passphrase is set
+// but the account has no keys yet.
+func TestFilesKeyNoKeystore(t *testing.T) {
+	resetSession()
+	t.Cleanup(resetSession)
+	t.Setenv("HARBOR_PASSPHRASE", "pw")
+	t.Setenv("HOME", t.TempDir())
+
+	sessionUnlockd, sessionKey, sessionErr = true, nil, errNoKeystore
+	_, err := filesKey(nil, nil)
+	if err == nil {
+		t.Fatal("expected a refusal when no keystore exists")
+	}
+	for _, want := range []string{"crypto setup", "nothing was uploaded"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal missing %q: %v", want, err)
+		}
+	}
+}
+
+// TestFilesKeyHappyPath proves filesKey returns the unlocked key unchanged, so
+// the refusal wrapper cannot break the working case.
+func TestFilesKeyHappyPath(t *testing.T) {
+	key := newMasterKey(t)
+	unlockedSession(t, key)
+	got, err := filesKey(nil, nil)
+	if err != nil {
+		t.Fatalf("filesKey: %v", err)
+	}
+	if !bytes.Equal(got, key) {
+		t.Fatal("filesKey returned a different key")
 	}
 }

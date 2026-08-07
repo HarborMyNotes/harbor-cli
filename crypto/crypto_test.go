@@ -566,8 +566,8 @@ func TestOpenBytes_Rejects(t *testing.T) {
 	}
 }
 
-// TestIsBinaryEnvelope_ShortPrefix pins the trap that has shipped twice on other
-// Harbor clients: sniffing fewer than BinaryEnvelopeMinBytes makes every input
+// TestIsBinaryEnvelope_ShortPrefix pins the trap that has shipped on another
+// Harbor client: sniffing fewer than BinaryEnvelopeMinBytes makes every input
 // answer false, which turns "skip files already encrypted" into "skip all".
 func TestIsBinaryEnvelope_ShortPrefix(t *testing.T) {
 	env, err := SealBytes(crossClientKey(), []byte(binaryVectorPlaintext))

@@ -313,8 +313,8 @@ func IsEnvelope(s string) bool {
 //
 // Exported because sniffing fewer bytes than this makes IsBinaryEnvelope answer
 // false for EVERY input, which silently turns "skip the ones already encrypted"
-// into "skip all of them". That exact bug has shipped twice on other Harbor
-// clients; read at least this many bytes before sniffing.
+// into "skip all of them". That exact bug has shipped on another Harbor client
+// before; read at least this many bytes before sniffing.
 const BinaryEnvelopeMinBytes = len(EnvelopeVersion) + nonceLen + tagLen
 
 // SealBytes encrypts raw bytes into the HRBC2 BINARY envelope used for

@@ -148,29 +148,46 @@ deduplicate against an existing blob.`,
 		if err != nil {
 			return err
 		}
-		content, err := os.ReadFile(path)
+		data, err := uploadEncrypted(c, key, path, mimeType, filename)
 		if err != nil {
-			return fmt.Errorf("cannot read file: %w", err)
-		}
-		// Resolve both from the ORIGINAL file, before sealing — sniffing the
-		// envelope would record every encrypted upload as octet-stream.
-		if filename == "" {
-			filename = filepath.Base(path)
-		}
-		if mimeType == "" {
-			mimeType = client.DetectMIME(path)
-		}
-		sealed, err := crypto.SealBytes(key, content)
-		if err != nil {
-			return fmt.Errorf("encrypting %s: %w", filepath.Base(path), err)
-		}
-		data, err := c.UploadBytes(sealed, mimeType, filename, true)
-		if err != nil {
-			return mapFileError(err)
+			return err
 		}
 		printResult(data, displayResource)
 		return nil
 	},
+}
+
+// uploadEncrypted seals a file on this machine and uploads the envelope, so the
+// server never receives the plaintext.
+//
+// It is a named function rather than inline RunE so a test can point it at a
+// mock server and assert what actually goes on the wire. That matters more here
+// than usual: the bug this replaced was an upload that stamped the resource
+// is_encrypted while sending the file in the clear, and every unit test still
+// passed. Asserting the multipart body carries the envelope and NOT the
+// plaintext is the only check that catches a regression to it.
+func uploadEncrypted(c *client.Client, key []byte, path, mimeType, filename string) ([]byte, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read file: %w", err)
+	}
+	// Resolve both from the ORIGINAL file, before sealing — sniffing the
+	// envelope would record every encrypted upload as octet-stream.
+	if filename == "" {
+		filename = filepath.Base(path)
+	}
+	if mimeType == "" {
+		mimeType = client.DetectMIME(path)
+	}
+	sealed, err := crypto.SealBytes(key, content)
+	if err != nil {
+		return nil, fmt.Errorf("encrypting %s: %w", filepath.Base(path), err)
+	}
+	data, err := c.UploadBytes(sealed, mimeType, filename, true)
+	if err != nil {
+		return nil, mapFileError(err)
+	}
+	return data, nil
 }
 
 // filesGetCmd shows the presigned download URL + basic metadata for a blob.
@@ -294,9 +311,14 @@ func filesKey(c *client.Client, creds *config.Credentials) ([]byte, error) {
 // authentication tag lives at the end.
 //
 // With no passphrase it REFUSES rather than writing ciphertext into a file the
-// user will think is their document — matching web, macOS/iOS, Android and
-// Windows, none of which hand over bytes they cannot read. wantCiphertext is the
-// explicit opt-out for backups and moving bytes between machines.
+// user will think is their document. That matches web and macOS/iOS, which both
+// decline to hand over bytes they cannot read. Android and Windows still have
+// surfaces that pass the raw envelope through (Android opens the presigned URL
+// in a browser; Windows' in-note save path writes ciphertext even when
+// unlocked) — those are bugs on those clients, not a different design, so
+// refusing here is the parity-correct behaviour rather than a deviation.
+// wantCiphertext is the explicit opt-out for backups and moving bytes between
+// machines.
 func decryptDownload(c *client.Client, creds *config.Credentials, body io.Reader, wantCiphertext bool) (io.Reader, error) {
 	head := make([]byte, crypto.BinaryEnvelopeMinBytes)
 	n, err := io.ReadFull(body, head)
@@ -334,7 +356,11 @@ func decryptDownload(c *client.Client, creds *config.Credentials, body io.Reader
 	}
 	plain, err := crypto.OpenBytes(key, sealed)
 	if err != nil {
-		return nil, fmt.Errorf("this file did not decrypt with your key, so nothing was written: %w", err)
+		// Also reachable for a plaintext file that happens to begin with the
+		// ASCII bytes "HRBC2" — magic-sniffing cannot tell those apart, so name
+		// the escape hatch rather than insisting the key is wrong.
+		return nil, fmt.Errorf("this file did not decrypt with your key, so nothing was written "+
+			"(if it was never encrypted, re-run with --ciphertext to write it as stored): %w", err)
 	}
 	return bytes.NewReader(plain), nil
 }
