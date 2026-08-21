@@ -427,7 +427,7 @@ your shell. One-shot: `harbor account export --wait --download ~/Downloads`.
 
 | Command | What it does | Key flags |
 |---|---|---|
-| `harbor import enex <file.enex>` | Import an Evernote export | `--notebook`, `--filename` |
+| `harbor import enex <file.enex>` | Import an Evernote export (uploads straight to storage in chunks, then waits for the import) | `--notebook`, `--filename`, `--no-wait`, `--poll-interval`, `--timeout` |
 | `harbor import status <job-id>` | Poll an import job | |
 | `harbor export enex` | Export notes to `.enex` | `--notebook` *or* `--notes id1,id2`, `--include-resources`, `--output` (`-`=stdout) |
 

@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -92,6 +93,9 @@ func newAPIMock(t *testing.T, routes map[string]mockReply) *apiMock {
 			Method: r.Method, Path: r.URL.Path, Query: r.URL.Query(), Body: string(body),
 		})
 		if m.handler != nil {
+			// Recording the request consumed the body; hand a fresh reader to the
+			// handler so one that branches on the payload sees it.
+			r.Body = io.NopCloser(bytes.NewReader(body))
 			m.handler(w, r)
 			return
 		}

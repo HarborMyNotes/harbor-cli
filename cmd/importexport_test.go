@@ -4,19 +4,24 @@
 package cmd
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
 )
 
-// TestDisplayImportJobInline verifies the inline (201) summary shows the
-// counters and does NOT print the "poll it" hint.
-func TestDisplayImportJobInline(t *testing.T) {
+// TestDisplayImportJobWaited verifies the summary shows the counters and does
+// NOT print the "poll it" hint when the command already waited for the result.
+func TestDisplayImportJobWaited(t *testing.T) {
 	importEnexAsync = false
 	data := []byte(`{"data":{"import_job_id":"job-123","status":"completed","total_notes":12,"imported_notes":11,"skipped_notes":0,"failed_notes":1}}`)
 	out := captureStdout(t, func() { displayImportJob(data) })
@@ -24,42 +29,86 @@ func TestDisplayImportJobInline(t *testing.T) {
 		t.Errorf("import job summary missing fields:\n%s", out)
 	}
 	if strings.Contains(out, "import status") {
-		t.Errorf("inline import should not print the poll hint:\n%s", out)
+		t.Errorf("a waited-for import should not print the poll hint:\n%s", out)
 	}
 }
 
-// TestDisplayImportJobAsync verifies the enqueued (202) summary prints the
-// follow-up poll command with the job id.
-func TestDisplayImportJobAsync(t *testing.T) {
+// TestDisplayImportJobNoWait verifies a --no-wait import prints the follow-up
+// poll command with the job id — the only route back to the outcome.
+func TestDisplayImportJobNoWait(t *testing.T) {
 	importEnexAsync = true
 	defer func() { importEnexAsync = false }()
 	data := []byte(`{"data":{"import_job_id":"job-async","status":"queued","total_notes":0}}`)
 	out := captureStdout(t, func() { displayImportJob(data) })
 	if !strings.Contains(out, "harbor import status job-async") {
-		t.Errorf("async import should print the poll hint:\n%s", out)
+		t.Errorf("a --no-wait import should print the poll hint:\n%s", out)
 	}
 }
 
 // TestDisplayImportStatusWithErrors verifies the poll view renders counters and
 // the per-note error table, mapping a job-level index (-1) to "job".
 func TestDisplayImportStatusWithErrors(t *testing.T) {
-	data := []byte(`{"data":{"id":"job-9","status":"partial","total_notes":12,"imported_notes":11,"skipped_notes":0,"failed_notes":1,"updated_at":1750000000000,"errors":[{"note_index":7,"title":"Broken note","reason":"resource 0: invalid base64 data"}]}}`)
+	data := []byte(`{"data":{"id":"job-9","status":"partial","total_notes":12,"imported_notes":11,"skipped_notes":0,"failed_notes":1,"updated_at":1750000000000,"errors":[{"note_index":7,"title":"Broken note","reason":"attachment_unreadable"}]}}`)
 	out := captureStdout(t, func() { displayImportStatus(data) })
-	if !containsSub(out, "job-9", "partial", "Broken note", "invalid base64") {
+	if !containsSub(out, "job-9", "partial", "Broken note", "corrupted") {
 		t.Errorf("import status missing fields:\n%s", out)
 	}
 	if !strings.Contains(out, "7") {
 		t.Errorf("per-note index missing:\n%s", out)
+	}
+	// The wire value is a code from a closed set the API says never to render.
+	if strings.Contains(out, "attachment_unreadable") {
+		t.Errorf("the raw reason code leaked to the user:\n%s", out)
 	}
 }
 
 // TestDisplayImportStatusJobLevelError verifies a note_index of -1 renders as a
 // job-level error rather than a literal "-1".
 func TestDisplayImportStatusJobLevelError(t *testing.T) {
-	data := []byte(`{"data":{"id":"job-x","status":"failed","errors":[{"note_index":-1,"title":"","reason":"import aborted"}]}}`)
+	data := []byte(`{"data":{"id":"job-x","status":"failed","failure_reason":"not_enex","errors":[{"note_index":-1,"title":"","reason":"not_enex"}]}}`)
 	out := captureStdout(t, func() { displayImportStatus(data) })
-	if !strings.Contains(out, "job") || !strings.Contains(out, "import aborted") {
+	// The job's own reason is the half that says whether re-running can help, so
+	// it has to appear under the counters rather than only in the error table.
+	if !strings.Contains(out, "Why:") || !strings.Contains(out, "isn't an Evernote export") {
+		t.Errorf("job-level failure reason not rendered:\n%s", out)
+	}
+	// And the errors list restating it is the same sentence twice.
+	if strings.Contains(out, "Errors:") {
+		t.Errorf("the job-level error only restates the reason above:\n%s", out)
+	}
+
+	// A job-level error that says something the reason did not still shows.
+	data = []byte(`{"data":{"id":"job-y","status":"failed","failure_reason":"","errors":[{"note_index":-1,"title":"","reason":"storage_unavailable"}]}}`)
+	out = captureStdout(t, func() { displayImportStatus(data) })
+	if !containsSub(out, "Errors:", "job", "temporarily unavailable") {
 		t.Errorf("job-level error not rendered:\n%s", out)
+	}
+}
+
+// TestImportReasonSentence pins the contract that a failure CODE is never shown
+// to the user, including a code this build has never heard of — an unknown value
+// must fall back to the generic sentence rather than be printed raw.
+func TestImportReasonSentence(t *testing.T) {
+	if got := importReasonSentence(""); got != "" {
+		t.Errorf("no code should render nothing, got %q", got)
+	}
+	if got := importReasonSentence("note_too_large"); !strings.Contains(got, "per-note limit") {
+		t.Errorf("note_too_large = %q", got)
+	}
+	if got := importReasonSentence("a_code_from_the_future"); got != importReasonSentences["unknown"] {
+		t.Errorf("an unrecognised code must fall back to the generic sentence, got %q", got)
+	}
+
+	// file_truncated means two different things on a note, and only the job's own
+	// reason tells them apart: a cut-off upload is worth retrying, an Evernote
+	// export that ends mid-note is not — it has to be re-exported.
+	cutOff := importNoteReasonSentence("file_truncated", "")
+	shortExport := importNoteReasonSentence("file_truncated", "truncated_source")
+	if cutOff == shortExport {
+		t.Error("a cut-off upload and a short Evernote export must not read the same")
+	}
+	if !strings.Contains(shortExport, "re-export") {
+		t.Errorf("a truncated source must point at re-exporting, got %q", shortExport)
 	}
 }
 
@@ -77,8 +126,8 @@ func TestDisplayImportStatusNoErrors(t *testing.T) {
 // and other codes pass through unchanged.
 func TestMapImportExportError(t *testing.T) {
 	cases := map[string]string{
-		"invalid_enex":                 "well-formed",
 		"enex_too_large":               "maximum import size",
+		"import_upload_incomplete":     "did not finish",
 		"cannot_import_into_encrypted": "encrypted notebook",
 	}
 	for code, sub := range cases {
@@ -213,21 +262,379 @@ func containsSub(s string, subs ...string) bool {
 }
 
 // ===========================================================================
+// The direct-to-storage upload (#101)
+// ===========================================================================
+
+// importStub is a stub Harbor API plus a stub object store, wired together the
+// way the real pair are: the API hands out presigned URLs that point at the
+// store, and the store is the only thing that ever sees the file's bytes.
+//
+// It exists because the interesting assertions about this command are about
+// TRAFFIC — which calls were made, in what order, and above all that no request
+// to the API carried the .enex — and none of those survive testing the helpers
+// in isolation.
+type importStub struct {
+	api      *apiMock
+	storage  *httptest.Server
+	partSize int64
+
+	// puts holds the bytes of each part, keyed by part number, so a test can
+	// reassemble what the store received and compare it with the file on disk.
+	puts map[int]string
+	// failPart, when non-zero, makes that part's PUT fail — the trigger for the
+	// abort path.
+	failPart int
+	// statuses is the sequence the poller reports; the last entry repeats.
+	statuses []string
+	polls    int
+}
+
+// newImportStub starts the API/storage pair. partSize is the chunk size the
+// stub's plan advertises, so a test can force several parts out of a small file.
+func newImportStub(t *testing.T, partSize int64, statuses ...string) *importStub {
+	t.Helper()
+	st := &importStub{partSize: partSize, puts: map[int]string{}, statuses: statuses}
+
+	st.storage = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n, _ := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/part/"))
+		if n == st.failPart {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte("<Error><Code>AccessDenied</Code></Error>"))
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		st.puts[n] = string(body)
+		w.Header().Set("ETag", fmt.Sprintf("%q", "etag-"+strconv.Itoa(n)))
+	}))
+	t.Cleanup(st.storage.Close)
+
+	st.api = newAPIMock(t, map[string]mockReply{})
+	st.api.handler = st.serve
+	return st
+}
+
+// serve answers the five API calls the import flow makes.
+func (st *importStub) serve(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	w.Header().Set("Content-Type", "application/json")
+
+	switch {
+	case r.URL.Path == "/api/v1/import/enex/uploads":
+		var req map[string]any
+		_ = json.Unmarshal(body, &req)
+		total := int64(req["total_bytes"].(float64))
+		count := (total + st.partSize - 1) / st.partSize
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprintf(w, `{"data":{"import_job_id":"job-1","status":"awaiting_upload","part_size":%d,"part_count":%d}}`,
+			st.partSize, count)
+
+	case strings.HasSuffix(r.URL.Path, "/parts"):
+		var req struct {
+			PartNumbers []int `json:"part_numbers"`
+		}
+		_ = json.Unmarshal(body, &req)
+		parts := make([]string, 0, len(req.PartNumbers))
+		for _, n := range req.PartNumbers {
+			parts = append(parts, fmt.Sprintf(`{"part_number":%d,"url":%q}`, n,
+				st.storage.URL+"/part/"+strconv.Itoa(n)))
+		}
+		fmt.Fprintf(w, `{"data":{"parts":[%s],"expires_in_seconds":21600}}`, strings.Join(parts, ","))
+
+	case strings.HasSuffix(r.URL.Path, "/complete"):
+		w.WriteHeader(http.StatusAccepted)
+		fmt.Fprint(w, `{"data":{"import_job_id":"job-1","status":"queued"}}`)
+
+	case strings.HasSuffix(r.URL.Path, "/abort"):
+		fmt.Fprint(w, `{"data":{"id":"job-1","status":"aborted"}}`)
+
+	case strings.HasPrefix(r.URL.Path, "/api/v1/import/enex/"):
+		i := min(st.polls, len(st.statuses)-1)
+		st.polls++
+		fmt.Fprint(w, st.statuses[i])
+
+	default:
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+// assembled returns the parts the store received, joined back in order.
+func (st *importStub) assembled() string {
+	var sb strings.Builder
+	for n := 1; n <= len(st.puts); n++ {
+		sb.WriteString(st.puts[n])
+	}
+	return sb.String()
+}
+
+// writeENEX writes a fixture file of the given size and returns its path.
+func writeENEX(t *testing.T, size int) string {
+	t.Helper()
+	path := t.TempDir() + "/notes.enex"
+	body := strings.Repeat("A", size)
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestImportEnexUsesDirectUpload is the regression for the bug this command had:
+// it posted the .enex to POST /import/enex, a route the server deleted, so every
+// import 404'd. It must now run the four-call upload, and — the part that made
+// the old route unshippable — not one byte of the file may travel through the
+// API.
+func TestImportEnexUsesDirectUpload(t *testing.T) {
+	st := newImportStub(t, 4, `{"data":{"id":"job-1","status":"completed","total_notes":3,"imported_notes":3,"errors":[]}}`)
+	file := writeENEX(t, 10)
+
+	out, err := runCLI(t, st.api, "import", "enex", file, "--poll-interval", "1ms")
+	if err != nil {
+		t.Fatalf("import enex: %v\n%s", err, out)
+	}
+
+	want := []string{
+		"POST /api/v1/import/enex/uploads",
+		"POST /api/v1/import/enex/uploads/job-1/parts",
+		"POST /api/v1/import/enex/uploads/job-1/complete",
+		"GET /api/v1/import/enex/job-1",
+	}
+	if got := st.api.calls(); !slices.Equal(got, want) {
+		t.Errorf("call sequence = %v, want %v", got, want)
+	}
+	// A 10-byte file in 4-byte chunks is three parts, the last a remainder, and
+	// they must reassemble byte-for-byte.
+	if len(st.puts) != 3 {
+		t.Errorf("parts uploaded = %d, want 3", len(st.puts))
+	}
+	if got := st.assembled(); got != strings.Repeat("A", 10) {
+		t.Errorf("the store received %q", got)
+	}
+	// The whole point of the new path: the bytes never reach the API.
+	for _, req := range st.api.requests {
+		if strings.Contains(req.Body, "AAAA") {
+			t.Errorf("%s %s carried the file's bytes: %s", req.Method, req.Path, req.Body)
+		}
+	}
+	if !containsSub(out, "job-1", "completed") {
+		t.Errorf("the final counters should be printed:\n%s", out)
+	}
+}
+
+// TestImportEnexSendsOptionsOnCreate verifies --notebook and --filename survive
+// the move: both now ride the create-upload body, and --filename still defaults
+// to the file's base name (it names the auto-created notebook).
+func TestImportEnexSendsOptionsOnCreate(t *testing.T) {
+	done := `{"data":{"id":"job-1","status":"completed","total_notes":1,"imported_notes":1,"errors":[]}}`
+
+	st := newImportStub(t, 64, done)
+	file := writeENEX(t, 8)
+	if _, err := runCLI(t, st.api, "import", "enex", file,
+		"--notebook", "nb1", "--filename", "My Export.enex", "--poll-interval", "1ms"); err != nil {
+		t.Fatalf("import enex: %v", err)
+	}
+	body := st.api.bodyOf(t, "POST /api/v1/import/enex/uploads")
+	if body["target_notebook_id"] != "nb1" {
+		t.Errorf("target_notebook_id = %v", body["target_notebook_id"])
+	}
+	if body["filename"] != "My Export.enex" {
+		t.Errorf("filename = %v", body["filename"])
+	}
+	if body["total_bytes"] != float64(8) {
+		t.Errorf("total_bytes = %v, want the file's real size", body["total_bytes"])
+	}
+
+	// Without --filename the file's base name is what names the notebook.
+	st2 := newImportStub(t, 64, done)
+	if _, err := runCLI(t, st2.api, "import", "enex", file, "--poll-interval", "1ms"); err != nil {
+		t.Fatalf("import enex: %v", err)
+	}
+	if got := st2.api.bodyOf(t, "POST /api/v1/import/enex/uploads")["filename"]; got != "notes.enex" {
+		t.Errorf("filename = %v, want the file's base name", got)
+	}
+}
+
+// TestImportEnexNoWaitStopsAtComplete pins the documented --no-wait contract:
+// the command returns as soon as the upload is accepted, never polls, and hands
+// back the job id plus the command that reads its outcome.
+func TestImportEnexNoWaitStopsAtComplete(t *testing.T) {
+	st := newImportStub(t, 64, `{"data":{"id":"job-1","status":"running"}}`)
+	file := writeENEX(t, 8)
+
+	out, err := runCLI(t, st.api, "import", "enex", file, "--no-wait")
+	if err != nil {
+		t.Fatalf("import enex --no-wait: %v", err)
+	}
+	if st.polls != 0 {
+		t.Errorf("--no-wait must not poll (polled %d times)", st.polls)
+	}
+	if !strings.Contains(out, "harbor import status job-1") {
+		t.Errorf("--no-wait should hand back the poll command:\n%s", out)
+	}
+}
+
+// TestImportEnexAbortsAFailedUpload covers the acceptance criterion behind
+// Ctrl-C: an upload that does not finish must be cancelled server-side. Leaving
+// it means the job sits in awaiting_upload with a half-written multipart object
+// behind it. A rejected chunk is the same shape of failure as an interrupt and
+// is what a test can actually provoke.
+func TestImportEnexAbortsAFailedUpload(t *testing.T) {
+	st := newImportStub(t, 4, `{"data":{"id":"job-1","status":"completed"}}`)
+	st.failPart = 2
+	file := writeENEX(t, 10)
+
+	out, err := runCLI(t, st.api, "import", "enex", file, "--poll-interval", "1ms")
+	if err == nil {
+		t.Fatalf("a failed upload must not exit 0:\n%s", out)
+	}
+	if !slices.Contains(st.api.calls(), "POST /api/v1/import/enex/uploads/job-1/abort") {
+		t.Errorf("the upload was never aborted: %v", st.api.calls())
+	}
+	// Nothing was staged, so nothing may be completed or polled either.
+	for _, call := range st.api.calls() {
+		if strings.HasSuffix(call, "/complete") {
+			t.Errorf("a failed upload must not be completed: %v", st.api.calls())
+		}
+	}
+}
+
+// TestImportEnexRejectsAnEmptyFile catches a zero-byte file locally. The size is
+// declared up front and is what the server chunks by, so an empty file can only
+// come back as a validation error on a request that could never have worked.
+func TestImportEnexRejectsAnEmptyFile(t *testing.T) {
+	st := newImportStub(t, 64)
+	file := writeENEX(t, 0)
+
+	if _, err := runCLI(t, st.api, "import", "enex", file); err == nil {
+		t.Fatal("an empty file must not be uploaded")
+	}
+	if len(st.api.calls()) != 0 {
+		t.Errorf("nothing should have been sent: %v", st.api.calls())
+	}
+}
+
+// TestImportEnexExitsNonZeroAndStillPrintsCounters is the end-to-end regression
+// for #69: the counters stay on stdout — they are the answer the user came for —
+// while the exit code says the import did not fully land.
+func TestImportEnexExitsNonZeroAndStillPrintsCounters(t *testing.T) {
+	st := newImportStub(t, 64,
+		`{"data":{"id":"job-1","status":"partial","total_notes":12,"imported_notes":11,"skipped_notes":0,"failed_notes":1,"errors":[]}}`)
+	file := writeENEX(t, 8)
+
+	out, err := runCLI(t, st.api, "import", "enex", file, "--poll-interval", "1ms")
+	if err == nil {
+		t.Fatal("an import that lost a note must not exit 0")
+	}
+	if got := exitCodeFor(err); got != exitError {
+		t.Errorf("exit code = %d, want %d", got, exitError)
+	}
+	if !strings.Contains(out, "job-1") || !strings.Contains(out, "11") {
+		t.Errorf("the counters must still be printed:\n%s", out)
+	}
+}
+
+// TestImportEnexWaitsThroughQueuedAndRunning proves the default really does wait
+// rather than returning on the first answer, and that a job still in flight is
+// not mistaken for one that failed.
+func TestImportEnexWaitsThroughQueuedAndRunning(t *testing.T) {
+	st := newImportStub(t, 64,
+		`{"data":{"id":"job-1","status":"queued","total_notes":0}}`,
+		`{"data":{"id":"job-1","status":"running","total_notes":9,"imported_notes":4}}`,
+		`{"data":{"id":"job-1","status":"completed","total_notes":9,"imported_notes":9,"errors":[]}}`)
+	file := writeENEX(t, 8)
+
+	out, err := runCLI(t, st.api, "import", "enex", file, "--poll-interval", "1ms")
+	if err != nil {
+		t.Fatalf("import enex: %v\n%s", err, out)
+	}
+	if st.polls != 3 {
+		t.Errorf("polls = %d, want 3 (queued, running, completed)", st.polls)
+	}
+	if !strings.Contains(out, "completed") {
+		t.Errorf("the final status should be printed:\n%s", out)
+	}
+}
+
+// TestImportEnexTimeoutReportsWhereItGotTo covers giving up on the wait. The
+// import keeps running on the server, so the error must say so and name the
+// command that reads its outcome — and the last status seen still gets printed,
+// because that is what the user waited for.
+func TestImportEnexTimeoutReportsWhereItGotTo(t *testing.T) {
+	st := newImportStub(t, 64, `{"data":{"id":"job-1","status":"running","total_notes":9,"imported_notes":4}}`)
+	file := writeENEX(t, 8)
+
+	out, err := runCLI(t, st.api, "import", "enex", file, "--poll-interval", "1ms", "--timeout", "1ms")
+	if err == nil {
+		t.Fatal("a wait that timed out must not exit 0")
+	}
+	if !containsSub(err.Error(), "harbor import status job-1") {
+		t.Errorf("the timeout should name the follow-up command: %v", err)
+	}
+	if !strings.Contains(out, "running") {
+		t.Errorf("the last status seen should still be printed:\n%s", out)
+	}
+}
+
+// TestImportProgressLine covers the stderr progress copy: a queued job says it is
+// waiting, a running one counts notes, and a terminal one says nothing (the
+// result card that follows is the answer).
+func TestImportProgressLine(t *testing.T) {
+	queued := importProgressLine(map[string]any{"status": "queued"})
+	if !strings.Contains(queued, "Queued") {
+		t.Errorf("queued = %q", queued)
+	}
+	running := importProgressLine(map[string]any{
+		"status": "running", "total_notes": 120.0, "imported_notes": 38.0, "failed_notes": 2.0,
+	})
+	if !containsSub(running, "40", "120") {
+		t.Errorf("running should count every note it has finished with: %q", running)
+	}
+	if got := importProgressLine(map[string]any{"status": "completed"}); got != "" {
+		t.Errorf("a terminal job needs no progress line, got %q", got)
+	}
+}
+
+// TestImportPartURLs verifies the presign response is indexed by part number, so
+// the upload loop pairs chunks with URLs regardless of the order they came back.
+func TestImportPartURLs(t *testing.T) {
+	urls := importPartURLs([]byte(`{"data":{"parts":[{"part_number":2,"url":"u2"},{"part_number":1,"url":"u1"}]}}`))
+	if urls[1] != "u1" || urls[2] != "u2" {
+		t.Errorf("urls = %v", urls)
+	}
+}
+
+// TestImportIsTerminal pins which statuses end a poll. aborted belongs with the
+// failures: a cancelled upload imported nothing and polling it forever would
+// hang the command.
+func TestImportIsTerminal(t *testing.T) {
+	for _, s := range []string{"completed", "partial", "failed", "aborted"} {
+		if !importIsTerminal(s) {
+			t.Errorf("%s should be terminal", s)
+		}
+	}
+	for _, s := range []string{"awaiting_upload", "queued", "running", ""} {
+		if importIsTerminal(s) {
+			t.Errorf("%s should not be terminal", s)
+		}
+	}
+}
+
+// ===========================================================================
 // An import that lost notes (#69 sweep)
 // ===========================================================================
 //
-// import enex answers 201/202 whether it imported every note or none of them —
-// the outcome is in the body's counters — so before this an import that dropped
-// every note exited 0 and a script moved on believing the data was in Harbor.
+// An import is accepted whether it goes on to import every note or none of them
+// — the outcome is in the body's counters — so before this an import that
+// dropped every note exited 0 and a script moved on believing the data was in
+// Harbor.
 
-// TestImportJobFailureFlagsLostNotes covers the three shapes that mean notes
-// did not make it: the API's own `partial` and `failed` statuses, and a
-// non-zero failed_notes count under any status.
+// TestImportJobFailureFlagsLostNotes covers the shapes that mean notes did not
+// make it: the API's `partial`, `failed` and `aborted` statuses, and a non-zero
+// failed_notes count under any status.
 func TestImportJobFailureFlagsLostNotes(t *testing.T) {
 	cases := map[string]string{
 		"partial":              `{"data":{"import_job_id":"job-1","status":"partial","total_notes":12,"imported_notes":11,"failed_notes":1}}`,
 		"failed":               `{"data":{"import_job_id":"job-2","status":"failed","total_notes":12,"imported_notes":0,"failed_notes":12}}`,
-		"failures while green": `{"data":{"import_job_id":"job-3","status":"completed","total_notes":12,"imported_notes":11,"failed_notes":1}}`,
+		"aborted":              `{"data":{"id":"job-3","status":"aborted","total_notes":12,"imported_notes":0}}`,
+		"failures while green": `{"data":{"import_job_id":"job-4","status":"completed","total_notes":12,"imported_notes":11,"failed_notes":1}}`,
 	}
 	for name, body := range cases {
 		err := importJobFailure([]byte(body))
@@ -244,14 +651,32 @@ func TestImportJobFailureFlagsLostNotes(t *testing.T) {
 	}
 
 	// The per-note reasons live behind the poller, so the error has to say so —
-	// the counters alone cannot tell the user what went wrong.
-	err := importJobFailure([]byte(`{"data":{"import_job_id":"job-1","status":"partial","total_notes":2,"imported_notes":1,"failed_notes":1}}`))
-	var apiErr *client.APIError
-	if !errors.As(err, &apiErr) {
+	// the counters alone cannot tell the user what went wrong. The poller names
+	// the job `id` where the complete call names it `import_job_id`; both have to
+	// produce a usable follow-up command.
+	for _, body := range []string{
+		`{"data":{"import_job_id":"job-1","status":"partial","total_notes":2,"imported_notes":1,"failed_notes":1}}`,
+		`{"data":{"id":"job-1","status":"partial","total_notes":2,"imported_notes":1,"failed_notes":1}}`,
+	} {
+		err := importJobFailure([]byte(body))
+		var apiError *client.APIError
+		if !errors.As(err, &apiError) {
+			t.Fatalf("want an *client.APIError, got %T", err)
+		}
+		if got := apiError.Details["per-note reasons"]; got != "harbor import status job-1" {
+			t.Errorf("details should point at the poller, got %v", apiError.Details)
+		}
+	}
+
+	// A job-level failure explains itself, and that explanation is what says
+	// whether re-running the same file can possibly help.
+	err := importJobFailure([]byte(`{"data":{"id":"job-9","status":"failed","failure_reason":"truncated_source","total_notes":2,"imported_notes":0}}`))
+	var apiError *client.APIError
+	if !errors.As(err, &apiError) {
 		t.Fatalf("want an *client.APIError, got %T", err)
 	}
-	if got := apiErr.Details["per-note reasons"]; got != "harbor import status job-1" {
-		t.Errorf("details should point at the poller, got %v", apiErr.Details)
+	if why, _ := apiError.Details["reason"].(string); !strings.Contains(why, "re-export") {
+		t.Errorf("a truncated source should point at re-exporting, got %v", apiError.Details["reason"])
 	}
 }
 
@@ -259,38 +684,14 @@ func TestImportJobFailureFlagsLostNotes(t *testing.T) {
 // queued import in particular has not failed at anything — it has not run yet.
 func TestImportJobFailureStaysQuietWhenNothingWasLost(t *testing.T) {
 	cases := map[string]string{
-		"clean inline import": `{"data":{"import_job_id":"job-1","status":"completed","total_notes":12,"imported_notes":12,"failed_notes":0}}`,
-		"enqueued import":     `{"data":{"import_job_id":"job-2","status":"queued","total_notes":0,"imported_notes":0,"failed_notes":0}}`,
-		"awaiting upload":     `{"data":{"import_job_id":"job-3","status":"awaiting_upload"}}`,
-		"unparseable body":    `<html>nope</html>`,
+		"clean import":     `{"data":{"import_job_id":"job-1","status":"completed","total_notes":12,"imported_notes":12,"failed_notes":0}}`,
+		"enqueued import":  `{"data":{"import_job_id":"job-2","status":"queued","total_notes":0,"imported_notes":0,"failed_notes":0}}`,
+		"awaiting upload":  `{"data":{"import_job_id":"job-3","status":"awaiting_upload"}}`,
+		"unparseable body": `<html>nope</html>`,
 	}
 	for name, body := range cases {
 		if err := importJobFailure([]byte(body)); err != nil {
 			t.Errorf("%s: want no error, got %v", name, err)
 		}
-	}
-}
-
-// TestImportEnexCommandExitsNonZeroAndStillPrintsCounters is the end-to-end
-// regression: the counters stay on stdout — they are the answer the user came
-// for — while the exit code says the import did not fully land.
-func TestImportEnexCommandExitsNonZeroAndStillPrintsCounters(t *testing.T) {
-	m := newAPIMock(t, map[string]mockReply{
-		"POST /api/v1/import/enex": {Status: 201, Body: `{"data":{"import_job_id":"job-1","status":"partial","total_notes":12,"imported_notes":11,"skipped_notes":0,"failed_notes":1}}`},
-	})
-	file := t.TempDir() + "/notes.enex"
-	if err := os.WriteFile(file, []byte(`<en-export></en-export>`), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	out, err := runCLI(t, m, "import", "enex", file)
-	if err == nil {
-		t.Fatal("an import that lost a note must not exit 0")
-	}
-	if got := exitCodeFor(err); got != exitError {
-		t.Errorf("exit code = %d, want %d", got, exitError)
-	}
-	if !strings.Contains(out, "job-1") || !strings.Contains(out, "11") {
-		t.Errorf("the counters must still be printed:\n%s", out)
 	}
 }
