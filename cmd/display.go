@@ -447,6 +447,36 @@ func printTable(headers []string, rows [][]string) {
 	t.Render()
 }
 
+// printTableWrapped renders a table like printTable but soft-wraps one column to
+// widthMax characters (1-based column number) instead of letting a long cell
+// stretch the whole table past the terminal. Used where a cell holds a sentence
+// rather than a field — truncating those loses the half that says what to do.
+func printTableWrapped(headers []string, rows [][]string, col, widthMax int) {
+	if len(rows) == 0 {
+		fmt.Println("No results.")
+		return
+	}
+	t := newTable()
+	headerRow := make(table.Row, len(headers))
+	for i, h := range headers {
+		headerRow[i] = h
+	}
+	t.AppendHeader(headerRow)
+	for _, row := range rows {
+		tr := make(table.Row, len(row))
+		for i, cell := range row {
+			tr[i] = cell
+		}
+		t.AppendRow(tr)
+	}
+	// WrapSoft breaks on word boundaries; the default enforcer cuts mid-word,
+	// which is what makes a wrapped sentence hard to read in the first place.
+	t.SetColumnConfigs([]table.ColumnConfig{
+		{Number: col, WidthMax: widthMax, WidthMaxEnforcer: text.WrapSoft},
+	})
+	t.Render()
+}
+
 // printKV renders a vertical key/value detail view (one row per pair).
 func printKV(pairs [][2]string) {
 	t := newTable()

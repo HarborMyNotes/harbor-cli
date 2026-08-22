@@ -214,7 +214,7 @@ See `harbor search --help`.
 | `harbor support` | Contact Harbor support (category, subject, message, attachments). |
 | `harbor account export/exports/export-status/export-delete` | Data export: ENEX or HTML, whole account or one notebook, with `--wait` and `--download`. |
 | `harbor account delete/cancel-delete` | Schedule (and cancel) account deletion. |
-| `harbor import enex <file>` / `harbor export enex` | Evernote ENEX interchange. |
+| `harbor import enex <file>` / `harbor export enex` | Evernote ENEX interchange. The import uploads straight to storage in chunks (any size), then waits for the import to finish — `--no-wait` returns as soon as it is queued. |
 | `harbor status` | Server health (liveness, readiness, version). |
 | `harbor api-version` | Server build version. |
 | `harbor openapi` | Fetch the OpenAPI 3.0 spec. |
@@ -312,10 +312,11 @@ where the server answers `200`:
   which USNs landed and which changes to re-resolve. A `conflict` is not a
   refusal (the server hands back the record you need to resolve it), so that
   stays `0`.
-- **`harbor import enex`** exits `1` when the import came back `partial` or
-  `failed`, or reported failed notes; the counters are still printed, and
-  `harbor import status <job-id>` has the per-note reasons. An import that was
-  merely *enqueued* has not failed at anything yet, so it stays `0`.
+- **`harbor import enex`** waits for the import and exits `1` when it came back
+  `partial`, `failed` or `aborted`, or reported failed notes; the counters are
+  still printed, and `harbor import status <job-id>` has the per-note reasons.
+  With `--no-wait` the import has not run yet, so a merely *enqueued* one stays
+  `0` — read its outcome from `harbor import status`.
 - **`harbor status`** exits `1` when the server is not ready, after printing the
   readiness table.
 

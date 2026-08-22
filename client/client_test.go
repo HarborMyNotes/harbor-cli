@@ -133,8 +133,9 @@ func TestDoGetSetsHeadersAndQuery(t *testing.T) {
 // The three request-building sites in this package are covered: requestWithStatus
 // (every doGet/doPost/doPatch/doPut/doDelete/doJSON/doMultipart), rawRequest
 // (doGetRaw and the file downloads), and rawPostWithRefresh (the ENEX export
-// stream). The fourth site, FetchURL, hits a presigned non-Harbor URL and must
-// NOT carry the header — that is pinned by TestFetchURLSkipsHarborHeaders.
+// stream). The remaining two, FetchURL and putImportPart, hit presigned
+// non-Harbor URLs and must NOT carry the header — that is pinned by
+// TestFetchURLSkipsHarborHeaders and TestUploadImportPartSkipsHarborHeaders.
 func TestPlatformHeaderOnEveryTransport(t *testing.T) {
 	// enex is the streaming ENEX export body; it is not a JSON envelope, so it
 	// stands in for any raw response the client streams back.
@@ -289,10 +290,11 @@ func TestPlatformHeaderSurvivesRefreshRetry(t *testing.T) {
 // exemptRequestBuilders is the deliberate, documented exception list — adding to
 // it should be a conscious decision made in review, which is the point.
 func TestEveryRequestBuilderSetsCommonHeaders(t *testing.T) {
-	// FetchURL targets a presigned storage URL whose credentials live in the
-	// query string. It is not a Harbor API endpoint, so it must send neither the
-	// bearer token nor the platform header.
-	exemptRequestBuilders := map[string]bool{"FetchURL": true}
+	// Both exemptions target a presigned storage URL whose credentials live in
+	// the query string — a download for FetchURL, an import chunk for
+	// putImportPart. Neither is a Harbor API endpoint, so they must send neither
+	// the bearer token nor the platform header.
+	exemptRequestBuilders := map[string]bool{"FetchURL": true, "putImportPart": true}
 
 	fset := token.NewFileSet()
 

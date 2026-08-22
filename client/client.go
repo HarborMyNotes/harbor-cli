@@ -36,6 +36,14 @@ type Client struct {
 	// HTTPClient performs the requests. Defaults to a 30s-timeout client.
 	HTTPClient *http.Client
 
+	// StorageHTTPClient performs direct-to-storage transfers — today the
+	// presigned part PUTs of a large import. It is separate from HTTPClient
+	// because that one's 30-second timeout is sized for small JSON calls and a
+	// single 64 MiB chunk on an ordinary connection takes longer than that. It
+	// carries no overall timeout: a part upload is bounded by the request
+	// context (Ctrl-C) and by the presigned URL's own expiry.
+	StorageHTTPClient *http.Client
+
 	// Verbose, when true, makes callers surface request ids / HTTP status.
 	Verbose bool
 
@@ -80,7 +88,18 @@ func NewClient(baseURL, accessToken string) *Client {
 		HTTPClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		StorageHTTPClient: &http.Client{},
 	}
+}
+
+// storageClient returns the client used for direct-to-storage transfers,
+// falling back to the request client when a hand-built Client left it nil so a
+// zero-value field can never nil-panic mid-upload.
+func (c *Client) storageClient() *http.Client {
+	if c.StorageHTTPClient != nil {
+		return c.StorageHTTPClient
+	}
+	return c.HTTPClient
 }
 
 // Origin returns the scheme+host root of the API by stripping the trailing
@@ -173,7 +192,7 @@ func (c *Client) doJSON(method, path string, body any) ([]byte, error) {
 
 // doMultipart performs a multipart/form-data POST: extra text fields plus one
 // file part. The whole body is buffered so the request can be safely retried
-// after a transparent token refresh. Used by file upload and ENEX import.
+// after a transparent token refresh. Used by file upload.
 func (c *Client) doMultipart(path string, fields map[string]string, fileField, filename string, fileContent io.Reader) ([]byte, error) {
 	full, err := c.buildURL(path, nil)
 	if err != nil {
