@@ -189,9 +189,16 @@ harbor notes update "$NOTE_ID" --notebook "$ARCHIVE_NB" --json   # move to anoth
 ```
 
 > **Lossy-conversion warning:** `--format markdown` on read is *best-effort*. If a
-> note contains colors, `<harbor-embed>` attachments, alignment, or intricate
-> tables, **round-trip via HTML** (fetch `--format html`, edit, update
-> `--format html`) so you don't silently drop that formatting. See `formatting.md`.
+> note contains colors, `<harbor-embed>` attachments, alignment, intricate tables,
+> or **collapsed outline sections** (`data-collapsed`), **round-trip via HTML**
+> (fetch `--format html`, edit, update `--format html`) so you don't silently drop
+> them. See `formatting.md`.
+>
+> **The fold is the one the CLI warns you about.** Markdown has nowhere to store a
+> fold, so a Markdown update un-folds the whole note. When that is about to happen
+> the CLI prints a line on stderr naming how many go, then writes anyway — no text
+> is lost, only the collapsed view. Redo the edit with `--format html` when the
+> outline matters.
 
 Every update is snapshotted — you can review or undo via `harbor history`
 (see below), so edits are safe.
@@ -450,6 +457,9 @@ has copy-paste recipes and the full allowlist.
   they can't be searched, appended to, shared, or converted — leave them alone
   unless the user has a client that handles encryption.
 - **Markdown read-back is best-effort** — round-trip rich notes via HTML.
+- **A Markdown `notes update` flattens collapsed outlines** (`data-collapsed`,
+  see `formatting.md`). The CLI warns on stderr and proceeds; `--format html`
+  is the way to keep the folds.
 - **404 `not_found`** usually means a wrong or expunged id, or a trashed note
   fetched without `--deleted`/`--include-deleted`. Re-list to get the right id.
 - **`note_too_large`** = body over 5 MiB; **`note_title_too_long`** = title over

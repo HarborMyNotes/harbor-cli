@@ -334,6 +334,11 @@ func planDecrypt(c *client.Client, key []byte, noteID, format string, allowTaskL
 	if err := guardConversionTaskLoss(c, noteID, plainContent, format, allowTaskLoss); err != nil {
 		return nil, err
 	}
+	// --format markdown asks the server to re-render the decrypted body, and a
+	// note sealed as HTML can be carrying folds that the render drops. The same
+	// plaintext is both sides of the comparison: it is what the note holds now and
+	// what is about to be written back.
+	warnFoldFlattening(noteID, plainContent, plainContent, format)
 	return body, nil
 }
 
