@@ -234,6 +234,10 @@ are printed after the move.`,
 			if err != nil {
 				return err
 			}
+			// Markdown has nowhere to store a fold, so the same read that protected
+			// the tasks also says whether this write flattens the note's outline.
+			// A warning, not a refusal — see cmd/note_folds.go.
+			warnFoldFlattening(args[0], str(note, "content"), content, format)
 		}
 		// Encryption follows the notebook: --notebook into a notebook that encrypts
 		// by default SEALS the note, and the ciphertext rides out in this same PATCH
