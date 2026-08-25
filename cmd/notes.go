@@ -362,9 +362,12 @@ func notesConfirmPermanentDelete(yes bool) error {
 	return confirmDestructive(notesDeletePermanentConfirmation, jsonOutput, stdinIsInteractive(), yes, askLine)
 }
 
-// notesExportFormats are the per-note export kinds. Markdown is the only one
-// the endpoint renders today; the flag exists so adding another is a value here
-// rather than a new flag users have to learn.
+// notesExportFormats are the per-note export kinds. The flag exists so that a
+// second one is a new VALUE rather than a new flag users have to learn.
+//
+// Adding one is not only a value here: the format lives in the endpoint's own
+// path (export.md), so a new entry needs a client method to reach it. Adding it
+// to this list alone would accept the flag and return Markdown anyway.
 var notesExportFormats = []string{"markdown"}
 
 // notesExportFormat reads and validates --format against that list.
@@ -443,11 +446,12 @@ of that INTO the note. Use 'harbor notes get <id> --format markdown' for that.`,
 
 		// Read the header BEFORE draining the body: the same endpoint answers
 		// .md or .zip, and the response is the only thing that knows which.
-		path := accountExportOutputPath(out, filenameFromContentDisposition(resp.Header.Get("Content-Disposition")))
-		if path != "-" {
-			// A directory still here means the response named no filename to put in
-			// it. os.Create would fail with "is a directory", which reads like the
-			// user's path was wrong when the header was.
+		filename := filenameFromContentDisposition(resp.Header.Get("Content-Disposition"))
+		path := accountExportOutputPath(out, filename)
+		if filename == "" && path != "-" {
+			// Without a name from the response there is nothing to put in a
+			// directory. os.Create would report "is a directory", which reads like
+			// the user's path was wrong when it was the header.
 			if info, serr := os.Stat(path); serr == nil && info.IsDir() {
 				return fmt.Errorf("the server did not name the file, so %s is all there is to go on — give --output a filename instead of a directory", path)
 			}

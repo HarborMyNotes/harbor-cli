@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
 	"github.com/HarborMyNotes/harbor-cli/config"
@@ -242,8 +243,11 @@ between machines).`,
 				return derr
 			}
 			body = resp.Body
+			// Base, because this becomes the output path when --output is
+			// omitted and the name arrives over the network: one holding ".."
+			// would write outside the directory the command was run in.
 			if fn := filenameFromContentDisposition(resp.Header.Get("Content-Disposition")); fn != "" {
-				suggestedName = fn
+				suggestedName = filepath.Base(fn)
 			}
 		} else {
 			meta, derr := c.GetFileDownload(hash)
@@ -417,20 +421,16 @@ func writeOutput(path string, r io.Reader) (int64, error) {
 // filenameFromContentDisposition extracts a filename from a Content-Disposition
 // header, if present.
 //
-// It parses the header properly rather than scanning for the next ";", because
-// the name in it is often a note TITLE and titles contain semicolons. Quoted
-// per the spec, `filename="Q3 planning; Dana.md"` cut at the first ";" yields
-// "Q3 planning" — no extension, so nothing opens it, and two such notes
-// exported into one directory silently overwrite each other.
-//
-// Parsing also picks up RFC 5987's filename* form, which a server may send
-// instead for a non-ASCII name.
-//
-// A header too malformed to parse falls back to the naive scan: some filename
-// is better than none, and the caller's own --output is the only alternative.
+// It parses rather than scanning for the next ";" because the name is often a
+// note TITLE, and titles contain semicolons: quoted per the spec,
+// `filename="Q3 planning; Dana.md"` is one name, not two. Parsing also picks up
+// RFC 5987's filename* form. A header too malformed to parse falls through to
+// the scan, which still recovers a usable name from most of them.
 func filenameFromContentDisposition(cd string) string {
 	if _, params, err := mime.ParseMediaType(cd); err == nil {
-		if name := params["filename"]; name != "" {
+		// Go decodes filename* without checking what it decoded to, and prefers it
+		// over filename — so a broken one must not beat a good plain name.
+		if name := params["filename"]; name != "" && utf8.ValidString(name) {
 			return name
 		}
 	}
