@@ -81,7 +81,7 @@ type noteMovePlan struct {
 // one of them; a sealed move pays one more read inside planEncrypt. Moving a note
 // is a deliberate, occasional act, which is the only reason that is an acceptable
 // price.
-func prepareNoteMove(c *client.Client, creds *config.Credentials, noteID string, body, note map[string]any) (noteMovePlan, error) {
+func prepareNoteMove(c *client.Client, creds *config.Credentials, noteID string, body, note map[string]any, yes bool) (noteMovePlan, error) {
 	dest, moving := body["notebook_id"].(string)
 	if !moving {
 		return noteMovePlan{}, nil
@@ -152,6 +152,12 @@ func prepareNoteMove(c *client.Client, creds *config.Credentials, noteID string,
 		// sealing it again would wrap the envelope in an envelope.
 		return noteMovePlan{}, nil
 	}
+	// The seal is going to land, so the history is going to be deleted. This is
+	// the last point at which nothing has been written: ask here, not in the
+	// caller, because only this function knows the move seals.
+	if err := confirmSealedMove(c, noteID, num(note, "usn"), yes); err != nil {
+		return noteMovePlan{}, err
+	}
 	mergeSealIntoUpdate(body, seal)
 	// The body being sent is now an envelope, and a content_format alongside it
 	// would be a claim about bytes the server will never look at. planEncrypt does
@@ -190,6 +196,130 @@ func mergeSealIntoUpdate(body, seal map[string]any) {
 		}
 		body[k] = v
 	}
+}
+
+// ===========================================================================
+// Asking before the history goes
+// ===========================================================================
+//
+// Sealing a note hard-deletes every earlier version of it, and `notes encrypt`
+// asks before it does that. This path destroys the same rows without asking, and
+// it is the WORSE of the two to leave silent: the user ran a command to move a
+// note. The encryption is a property of the destination notebook and the history
+// deletion is a consequence of the encryption, so nothing they typed mentions
+// versions at all. `notes encrypt` at least announces its own subject.
+//
+// So it asks — but ONLY when there is history to lose. That qualifier is the
+// whole design. A prompt on every move into an encrypting notebook would fire
+// overwhelmingly often on notes with nothing to destroy, which is how a
+// confirmation becomes a keystroke people learn to type through; and the one
+// that matters would arrive looking exactly like the hundred that did not. A
+// note with no earlier versions loses nothing when it is sealed, so there is
+// nothing to consent to and the move stays silent.
+//
+// The cost is one metadata GET on the sealing path only. Plain moves, move-outs
+// and no-op notebook echoes never reach here.
+
+// sealedMoveConfirmation is what a move that seals asks before it writes.
+//
+// The wording leads with the MOVE rather than with the encryption, the reverse
+// of notesEncryptConfirmation, and for the reason that makes this path different:
+// the user asked to move a note and did not ask for encryption at all. Naming
+// the notebook as the source of it is the part that makes the question
+// answerable — otherwise the prompt reads as a non-sequitur about a command they
+// did not run.
+var sealedMoveConfirmation = registerConfirmation("harbor notes update", confirmation{
+	Warning: "This DELETES every earlier version of this note. The notebook you are moving it\n" +
+		"into keeps its notes encrypted, so the move seals the note — and sealing discards\n" +
+		"the note's whole version history on the server, permanently. It cannot be\n" +
+		"recovered from another device. The current contents are kept and sealed;\n" +
+		"everything 'harbor history list' would have shown you is destroyed.",
+	Prompt:      `Type "yes" to confirm: `,
+	Affirmative: "yes",
+	Unattended:  "refusing to delete this note's version history without confirmation — pass --yes",
+	Aborted:     "aborted — the note has not been moved",
+})
+
+// sealedMoveHistoryCount reports how many EARLIER versions the seal is about to
+// destroy, and — separately — whether that could be established at all.
+//
+// The second return exists for the same reason isNotebookMove has one: "no
+// history" and "could not tell" are different answers and must not collapse into
+// each other. Reading a failed lookup as zero would skip the confirmation
+// precisely when the CLI knows least, which is the bug this whole file is
+// closing, one level down.
+//
+// PAGING.TOTAL IS NOT THE ANSWER. The server snapshots on every write, so a note
+// that has only ever been saved once still has one history row — and that row is
+// its CURRENT contents, which a seal preserves. Counting it would make this
+// confirmation fire on every note in existence, which is the failure mode the
+// whole "only when there is something to lose" design exists to avoid: a prompt
+// that always appears is one people answer without reading, and the note that
+// really did have ten versions would look exactly like the note that had none.
+//
+// So the newest snapshot is compared against the note's own usn. Equal means it
+// is the current state and does not count; anything else means every row is
+// genuinely older and all of them do. One request either way — limit=1 with the
+// newest row first is all it takes.
+func sealedMoveHistoryCount(c *client.Client, noteID string, currentUSN float64) (int, bool) {
+	data, err := c.ListNoteHistory(noteID, map[string]string{
+		"limit": "1",
+		"order": "-usn_at_snapshot",
+	})
+	if err != nil {
+		return 0, false
+	}
+	p, ok := client.DecodePaging(data)
+	if !ok {
+		return 0, false
+	}
+	total := int(p.Total)
+	if total == 0 {
+		return 0, true
+	}
+	items := client.CollectionItems(data)
+	if len(items) == 0 {
+		// A total with no row to inspect. Cannot rule out that one of them is the
+		// current state, so count them all and let the user decide.
+		return total, true
+	}
+	if num(parseJSON(items[0]), "usn_at_snapshot") == currentUSN {
+		return total - 1, true
+	}
+	return total, true
+}
+
+// confirmSealedMove gates the sealed move, resolving the ambient state and
+// handing the decision to the shared confirmDestructive.
+//
+// An unreadable history FAILS CLOSED and asks, which is deliberate: the thing on
+// the other side is irreversible, so the cost of asking when there was nothing to
+// destroy is one prompt, and the cost of not asking when there was is the data.
+// In a script that refusal is real — a --json move that would seal now needs
+// --yes if the history endpoint could not be reached — and that is the correct
+// direction to fail, because the alternative is destroying versions nobody was
+// ever asked about.
+func confirmSealedMove(c *client.Client, noteID string, currentUSN float64, yes bool) error {
+	// --yes is consent already given, so the read below would only produce a
+	// number nobody is going to be shown.
+	if yes {
+		return nil
+	}
+	n, known := sealedMoveHistoryCount(c, noteID, currentUSN)
+
+	// Nothing to lose, nothing to consent to — see the section comment above.
+	if known && n == 0 {
+		return nil
+	}
+	if !jsonOutput && stdinIsInteractive() {
+		if known {
+			fmt.Printf("About to move and seal this note, deleting %d earlier %s of it.\n",
+				n, pluralize(n, "version", "versions"))
+		} else {
+			fmt.Println("About to move and seal this note. Its version history could not be read, so this may delete earlier versions of it.")
+		}
+	}
+	return confirmDestructive(sealedMoveConfirmation, jsonOutput, stdinIsInteractive(), yes, askLine)
 }
 
 // isNotebookMove reports whether an update's destination is a genuine move away

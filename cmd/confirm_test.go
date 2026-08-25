@@ -250,17 +250,37 @@ var irreversibleClientCalls = []string{
 // nothing failed. A command is only asking first if the thing it calls actually
 // ends up at the one function that reads an answer.
 func TestEveryIrreversibleCommandAsksFirst(t *testing.T) {
-	// Every gate is reached through a helper named *Confirm*/*confirm*, so this
-	// looks for a CALL rather than the word. That distinction is load-bearing:
-	// scanning the whole declaration for "confirm" passed even with the gate
-	// deleted, because the help text says "you will be asked to confirm".
-	confirmCall := regexp.MustCompile(`(?i)\b(\w*confirm\w*)\(`)
+	// BOTH halves of the question follow helpers, and they have to. A RunE that
+	// calls neither the destructive client method nor the gate by name is the
+	// normal shape once a command grows past a few lines — `notes update` reaches
+	// ConvertNoteToEncrypted through writeNoteUpdate and its confirmation through
+	// prepareNoteMove, and neither name appears in its RunE at all. Scanning only
+	// the literal RunE text let that command destroy a note's whole version
+	// history without ever entering this check.
+	//
+	// Names are taken from CALL POSITION rather than by matching the word
+	// "confirm", and then resolved against real package functions. Prose cannot
+	// survive that: help text has no call parens, and an identifier that is not a
+	// package-level function reaches nothing.
+	anyCall := regexp.MustCompile(`\b(\w+)\(`)
 	bodies := packageFuncBodies(t)
 
 	for _, block := range cobraCommandBlocks(t) {
+		called := []string{}
+		for _, m := range anyCall.FindAllStringSubmatch(block.runE, -1) {
+			called = append(called, m[1])
+		}
+
 		call := ""
 		for _, c := range irreversibleClientCalls {
-			if strings.Contains(block.runE, c) {
+			found := strings.Contains(block.runE, c)
+			for _, name := range called {
+				if found {
+					break
+				}
+				found = reachesClientCall(name, c, bodies, map[string]bool{})
+			}
+			if found {
 				call = strings.TrimSuffix(c, "(")
 				break
 			}
@@ -269,8 +289,8 @@ func TestEveryIrreversibleCommandAsksFirst(t *testing.T) {
 			continue
 		}
 		gated := false
-		for _, m := range confirmCall.FindAllStringSubmatch(block.runE, -1) {
-			if reachesConfirmDestructive(m[1], bodies, map[string]bool{}) {
+		for _, name := range called {
+			if reachesConfirmDestructive(name, bodies, map[string]bool{}) {
 				gated = true
 				break
 			}
@@ -280,6 +300,32 @@ func TestEveryIrreversibleCommandAsksFirst(t *testing.T) {
 				block.varName, block.use, call)
 		}
 	}
+}
+
+// reachesClientCall reports whether calling name eventually issues the client
+// call target — directly, or through however many package-level helpers sit in
+// between. It is the mirror image of reachesConfirmDestructive, and exists
+// because a destructive call hidden in a helper is exactly as invisible to a
+// literal text scan as a confirmation hidden in one.
+
+func reachesClientCall(name, target string, bodies map[string]string, seen map[string]bool) bool {
+	if seen[name] {
+		return false // a cycle; going round again reaches nothing new
+	}
+	seen[name] = true
+	body, ok := bodies[name]
+	if !ok {
+		return false
+	}
+	if strings.Contains(body, target) {
+		return true
+	}
+	for _, m := range regexp.MustCompile(`\b(\w+)\(`).FindAllStringSubmatch(body, -1) {
+		if reachesClientCall(m[1], target, bodies, seen) {
+			return true
+		}
+	}
+	return false
 }
 
 // reachesConfirmDestructive reports whether calling name eventually reaches the

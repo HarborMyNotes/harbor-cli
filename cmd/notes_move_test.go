@@ -52,6 +52,25 @@ type moveMock struct {
 	// makes the server's answer change BETWEEN the caller's read and the seal's.
 	onNoteRead func(noteID string, reads int)
 	reads      map[string]int
+
+	// historyEarlier is how many GENUINELY OLDER versions the note has. The wire
+	// shape is derived from it rather than set directly, because the real server
+	// also snapshots the note's CURRENT contents — so a note with nothing older
+	// still reports one row, and a stub that reported zero would let a broken
+	// count pass here and fire on every note in production.
+	//
+	// It defaults to zero because that is what the seal-mechanics tests in this
+	// file are about; a note with older versions would make every one of them
+	// stop to ask a question they are not testing.
+	historyEarlier int
+
+	// historyNoCurrentSnapshot drops the current-state row, leaving only older
+	// ones — a note whose latest write was never snapshotted.
+	historyNoCurrentSnapshot bool
+
+	// historyStatus, when non-zero, fails every history read with that status:
+	// the "could not establish whether there is anything to destroy" case.
+	historyStatus int
 }
 
 // newMoveMock starts the stub around a set of notebooks and notes.
@@ -82,6 +101,8 @@ func newMoveMock(t *testing.T, notebooks []map[string]any, notes ...map[string]a
 				"data":   []any{},
 				"paging": map[string]any{"limit": 500, "offset": 0, "total": 0, "has_more": false},
 			})
+		case r.Method == http.MethodGet && strings.HasSuffix(p, "/history"):
+			mm.writeHistory(w, strings.TrimSuffix(strings.TrimPrefix(p, "notes/"), "/history"))
 		case r.Method == http.MethodGet && p == "notes":
 			mm.writeNoteList(w, r.URL.Query().Get("notebook_id"))
 		case r.Method == http.MethodGet && strings.HasPrefix(p, "notes/"):
@@ -163,6 +184,58 @@ func (mm *moveMock) writeNoteList(w http.ResponseWriter, notebookID string) {
 		"data":   items,
 		"paging": map[string]any{"limit": 500, "offset": 0, "total": len(items), "has_more": false},
 	})
+}
+
+// writeHistory answers GET /notes/:id/history the way the real server does:
+// newest row first, and a note that has been written at all carries a snapshot
+// of its CURRENT contents alongside any older ones.
+//
+// Only the newest row is emitted because that is all the caller reads — it needs
+// paging.total and one usn to tell "the current state" from "something older".
+func (mm *moveMock) writeHistory(w http.ResponseWriter, noteID string) {
+	if mm.historyStatus != 0 {
+		writeJSON(w, mm.historyStatus, map[string]any{"error": map[string]any{
+			"code": "internal", "message": "boom",
+		}})
+		return
+	}
+	total := mm.historyEarlier
+	rows := []any{}
+	newest := num(mm.notes[noteID], "usn")
+	if mm.historyNoCurrentSnapshot {
+		// Nothing snapshotted the latest write, so the newest row is older than
+		// the note itself and every row counts.
+		newest--
+	} else {
+		total++
+	}
+	if total > 0 {
+		rows = append(rows, map[string]any{
+			"id":              "v0000000-0000-4000-8000-000000000000",
+			"usn_at_snapshot": newest,
+			"is_encrypted":    false,
+			"content_hash":    "deadbeefdeadbeef",
+			"created_at":      float64(1750000000000),
+		})
+	}
+	writeJSON(w, 200, map[string]any{
+		"data": rows,
+		"paging": map[string]any{
+			"limit": 1, "offset": 0, "total": total, "has_more": total > 1,
+		},
+	})
+}
+
+// historyReads counts GET /notes/:id/history requests, so a test can assert the
+// history was consulted — or, more often, that it was not.
+func historyReads(mm *moveMock) int {
+	n := 0
+	for _, r := range mm.m.requests {
+		if r.Method == http.MethodGet && strings.HasSuffix(r.Path, "/history") {
+			n++
+		}
+	}
+	return n
 }
 
 // applyPatch behaves like the server's note update: apply only the fields the
@@ -1156,8 +1229,12 @@ func TestSealedMoveKeepsTheCompareAndSetOnTheFirstRead(t *testing.T) {
 		}
 	}
 
+	// --yes because the interleaved save is exactly the case the history check
+	// cannot resolve — the newest snapshot now belongs to the other device's
+	// write, so the confirmation fires and an unattended run refuses before ever
+	// reaching the write this test is about.
 	_, err := runCLI(t, mm.m, "notes", "update", moveNoteID,
-		"--notebook", nbLocked, "--format", "html", "--content", "<p>Rewritten</p>")
+		"--notebook", nbLocked, "--format", "html", "--content", "<p>Rewritten</p>", "--yes")
 
 	body := mm.m.bodyOf(t, "PATCH /api/v1/notes/"+moveNoteID)
 	if got, _ := body["base_usn"].(float64); got != 88 {
@@ -1489,5 +1566,279 @@ func TestDecryptSweepAsksAboutTheNotebookOnce(t *testing.T) {
 	}
 	if reads != 1 {
 		t.Errorf("the sweep read the same notebook %d times; two notes should cost one lookup", reads)
+	}
+}
+
+// ===========================================================================
+// Asking before the history goes
+// ===========================================================================
+//
+// The move is the one path that destroys a note's version history without the
+// user having asked for encryption at all, so these pin BOTH halves of the
+// answer: it asks when there is something to lose, and it stays silent when
+// there is not. The silence is as load-bearing as the question — a prompt that
+// fires on every move is one people learn to type through.
+
+// TestSealedMoveAsksBeforeItDeletesTheHistory is the gap this issue closes: the
+// note had versions, the move was about to destroy them, and nothing asked.
+func TestSealedMoveAsksBeforeItDeletesTheHistory(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	mm := newMoveMock(t, moveNotebooks(), movePlaintextNote())
+	mm.historyEarlier = 4
+	asked := answerPrompt(t, "yes")
+
+	out, err := runCLI(t, mm.m, "notes", "update", moveNoteID, "--notebook", nbLocked)
+	if err != nil {
+		t.Fatalf("notes update --notebook: %v", err)
+	}
+
+	if len(*asked) != 1 {
+		t.Fatalf("the move asked %d times, want exactly one question: %v", len(*asked), *asked)
+	}
+	if got := patchesTo(mm, moveNoteID); got != 1 {
+		t.Errorf("an answered confirmation sent %d writes, want 1", got)
+	}
+	// The count is what makes the question answerable. "This deletes history" is
+	// a policy; "this deletes 4 earlier versions" is a decision.
+	if !strings.Contains(out, "deleting 4 earlier versions") {
+		t.Errorf("the prompt never said how much was about to be destroyed:\n%s", out)
+	}
+	if !strings.Contains(out, sealedMoveConfirmation.Warning) {
+		t.Errorf("the registered warning never reached the user:\n%s", out)
+	}
+}
+
+// TestSealedMoveAbortedWritesNothing is the half that matters most: a refusal
+// must leave the note plaintext, where it was, with its history intact.
+func TestSealedMoveAbortedWritesNothing(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	mm := newMoveMock(t, moveNotebooks(), movePlaintextNote())
+	mm.historyEarlier = 4
+	answerPrompt(t, "no")
+
+	_, err := runCLI(t, mm.m, "notes", "update", moveNoteID, "--notebook", nbLocked)
+
+	if err == nil {
+		t.Fatal("answering anything but yes still moved and sealed the note")
+	}
+	if !strings.Contains(err.Error(), "the note has not been moved") {
+		t.Errorf("the refusal does not say the note stayed put:\n%s", err)
+	}
+	if got := patchesTo(mm, moveNoteID); got != 0 {
+		t.Errorf("the refusal still wrote %d times — the confirmation is after the write, not before it", got)
+	}
+	stored := mm.notes[moveNoteID]
+	if enc, _ := stored["is_encrypted"].(bool); enc {
+		t.Error("the note was sealed anyway")
+	}
+	if stored["notebook_id"] != nbPlain {
+		t.Errorf("the note moved anyway: notebook_id = %v", stored["notebook_id"])
+	}
+}
+
+// TestSealedMoveWithNoHistoryNeverAsks pins the silence deliberately rather than
+// by omission, and it is the test that keeps the whole design honest.
+//
+// The server snapshots on write, so this note DOES have a history row — one, and
+// it holds the contents the note has right now, which a seal keeps. Nothing is
+// lost, so nothing is asked. Counting that row instead would fire this
+// confirmation on every note that has ever been saved, which is precisely the
+// prompt fatigue the "only when there is something to lose" rule exists to
+// prevent.
+func TestSealedMoveWithNoHistoryNeverAsks(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	mm := newMoveMock(t, moveNotebooks(), movePlaintextNote())
+	mm.historyEarlier = 0
+	// "no" so that asking at all would abort the move and fail the assertions
+	// below, rather than passing on a prompt nobody noticed.
+	asked := answerPrompt(t, "no")
+
+	if _, err := runCLI(t, mm.m, "notes", "update", moveNoteID, "--notebook", nbLocked); err != nil {
+		t.Fatalf("a move with no history to lose stopped to ask: %v", err)
+	}
+
+	if len(*asked) != 0 {
+		t.Errorf("the move asked about destroying a history that does not exist: %v", *asked)
+	}
+	if got := patchesTo(mm, moveNoteID); got != 1 {
+		t.Errorf("the move sent %d writes, want 1", got)
+	}
+}
+
+// TestSealedMoveRefusesUnattended keeps a script from consenting on the user's
+// behalf. Nobody is at the keyboard, so the only honest answers are "refuse" and
+// "destroy it silently" — and --yes is how a script says which one it meant.
+func TestSealedMoveRefusesUnattended(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	mm := newMoveMock(t, moveNotebooks(), movePlaintextNote())
+	mm.historyEarlier = 4
+	pipedStdin(t)
+
+	_, err := runCLI(t, mm.m, "notes", "update", moveNoteID, "--notebook", nbLocked)
+
+	if err == nil {
+		t.Fatal("an unattended run destroyed a note's version history without being asked to")
+	}
+	if !strings.Contains(err.Error(), "--yes") {
+		t.Errorf("the refusal never names the flag that would have worked:\n%s", err)
+	}
+	if got := patchesTo(mm, moveNoteID); got != 0 {
+		t.Errorf("the refusal still wrote %d times", got)
+	}
+}
+
+// TestSealedMoveWithYesNeitherAsksNorReads pins the escape hatch and its cost.
+// --yes is consent already given, so the history read would produce a number
+// nobody is going to be shown — a scripted move should not pay a request for it.
+func TestSealedMoveWithYesNeitherAsksNorReads(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	mm := newMoveMock(t, moveNotebooks(), movePlaintextNote())
+	mm.historyEarlier = 4
+	pipedStdin(t)
+
+	if _, err := runCLI(t, mm.m, "notes", "update", moveNoteID, "--notebook", nbLocked, "--yes"); err != nil {
+		t.Fatalf("notes update --notebook --yes: %v", err)
+	}
+
+	if got := patchesTo(mm, moveNoteID); got != 1 {
+		t.Errorf("--yes sent %d writes, want 1", got)
+	}
+	if got := historyReads(mm); got != 0 {
+		t.Errorf("--yes still spent %d history reads on a question it had already answered", got)
+	}
+}
+
+// TestUnreadableHistoryStillAsks is the fail-closed case. "No history" and
+// "could not tell" are different answers, and reading the second as the first
+// would skip the confirmation exactly when the CLI knows least — which is the
+// bug this file closes, one level down.
+func TestUnreadableHistoryStillAsks(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	mm := newMoveMock(t, moveNotebooks(), movePlaintextNote())
+	mm.historyStatus = 500
+	pipedStdin(t)
+
+	_, err := runCLI(t, mm.m, "notes", "update", moveNoteID, "--notebook", nbLocked)
+
+	if err == nil {
+		t.Fatal("an unreadable history was treated as an empty one, and the move destroyed it unasked")
+	}
+	if !strings.Contains(err.Error(), "--yes") {
+		t.Errorf("the refusal never names the flag that would have worked:\n%s", err)
+	}
+	if got := patchesTo(mm, moveNoteID); got != 0 {
+		t.Errorf("the refusal still wrote %d times", got)
+	}
+}
+
+// TestUnreadableHistorySaysSoAtThePrompt keeps the fail-closed branch honest to
+// a person: it must not claim a version count it never got.
+func TestUnreadableHistorySaysSoAtThePrompt(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	mm := newMoveMock(t, moveNotebooks(), movePlaintextNote())
+	mm.historyStatus = 500
+	asked := answerPrompt(t, "yes")
+
+	out, err := runCLI(t, mm.m, "notes", "update", moveNoteID, "--notebook", nbLocked)
+	if err != nil {
+		t.Fatalf("notes update --notebook: %v", err)
+	}
+
+	if len(*asked) != 1 {
+		t.Fatalf("the move asked %d times, want one", len(*asked))
+	}
+	if !strings.Contains(out, "could not be read") {
+		t.Errorf("the prompt invented certainty it did not have:\n%s", out)
+	}
+	if strings.Contains(out, "deleting 0 earlier") {
+		t.Errorf("the prompt reported a count it never received:\n%s", out)
+	}
+}
+
+// TestPlainMoveNeverReadsHistory keeps the new read on the path that needs it. A
+// move that seals nothing destroys nothing, so asking the server about versions
+// would be a round trip bought for a question never asked.
+func TestPlainMoveNeverReadsHistory(t *testing.T) {
+	lockedSession(t)
+	note := movePlaintextNote()
+	note["notebook_id"] = nbLocked
+	mm := newMoveMock(t, moveNotebooks(), note)
+	mm.historyEarlier = 4
+
+	if _, err := runCLI(t, mm.m, "notes", "update", moveNoteID, "--notebook", nbPlain); err != nil {
+		t.Fatalf("notes update --notebook: %v", err)
+	}
+
+	if got := historyReads(mm); got != 0 {
+		t.Errorf("a plain move spent %d history reads", got)
+	}
+}
+
+// TestSealedMoveStillPrintsTheCaveatAfterConfirming keeps the two mechanisms
+// from replacing each other. The confirmation is consent; the caveat on the way
+// out is the record of what happened, and --yes skips only the first.
+func TestSealedMoveStillPrintsTheCaveatAfterConfirming(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	mm := newMoveMock(t, moveNotebooks(), movePlaintextNote())
+	mm.historyEarlier = 4
+	pipedStdin(t)
+
+	var err error
+	said := captureStderr(t, func() {
+		_, err = runCLI(t, mm.m, "notes", "update", moveNoteID, "--notebook", nbLocked, "--yes")
+	})
+	if err != nil {
+		t.Fatalf("notes update --notebook --yes: %v", err)
+	}
+
+	for _, line := range strings.Split(historyLossCaveat, "\n") {
+		if !strings.Contains(said, line) {
+			t.Errorf("the confirmation replaced the after-the-fact caveat instead of adding to it — missing %q:\n%s", line, said)
+		}
+	}
+}
+
+// TestSnapshotsOlderThanTheNoteAllCount is the other side of that comparison. A
+// note whose latest write was never snapshotted has no current-state row to
+// discount, so every row the server holds is genuinely older and every one of
+// them is about to go.
+func TestSnapshotsOlderThanTheNoteAllCount(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	mm := newMoveMock(t, moveNotebooks(), movePlaintextNote())
+	mm.historyEarlier = 2
+	mm.historyNoCurrentSnapshot = true
+	asked := answerPrompt(t, "yes")
+
+	out, err := runCLI(t, mm.m, "notes", "update", moveNoteID, "--notebook", nbLocked)
+	if err != nil {
+		t.Fatalf("notes update --notebook: %v", err)
+	}
+
+	if len(*asked) != 1 {
+		t.Fatalf("the move asked %d times, want one", len(*asked))
+	}
+	if !strings.Contains(out, "deleting 2 earlier versions") {
+		t.Errorf("a note with no current-state snapshot had one discounted anyway:\n%s", out)
+	}
+}
+
+// TestTheCountExcludesTheVersionBeingKept states the arithmetic outright, so a
+// change to it fails here rather than quietly overstating what a move destroys.
+// The server reports one row more than this number; the extra one is the note as
+// it is now, and the seal keeps it.
+func TestTheCountExcludesTheVersionBeingKept(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	mm := newMoveMock(t, moveNotebooks(), movePlaintextNote())
+	mm.historyEarlier = 1
+	answerPrompt(t, "yes")
+
+	out, err := runCLI(t, mm.m, "notes", "update", moveNoteID, "--notebook", nbLocked)
+	if err != nil {
+		t.Fatalf("notes update --notebook: %v", err)
+	}
+
+	// Singular, and one — not the two rows the server actually holds.
+	if !strings.Contains(out, "deleting 1 earlier version of it") {
+		t.Errorf("the count is wrong or reads as a plural:\n%s", out)
 	}
 }
