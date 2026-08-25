@@ -82,6 +82,10 @@ func TestFilenameFromContentDisposition(t *testing.T) {
 		// Go decodes filename* without checking the result and prefers it over
 		// filename, so a broken one must not beat a good plain name.
 		`attachment; filename="fallback.md"; filename*=UTF-8''%E2%82`: "fallback.md",
+		// Legitimate non-ASCII must survive the validity check that rejects the
+		// row above — note titles are whatever the user typed.
+		`attachment; filename*=UTF-8''%E5%9B%9B%E5%8D%8A%E6%9C%9F.md`: "四半期.md",
+		`attachment; filename="Plan 🚢.md"`:                            "Plan 🚢.md",
 	}
 	for in, want := range cases {
 		if got := filenameFromContentDisposition(in); got != want {

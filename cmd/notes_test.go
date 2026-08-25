@@ -386,3 +386,25 @@ func TestNotesExportSaysWhenTheServerNamedNoFile(t *testing.T) {
 		t.Errorf("the error blames the wrong thing:\n%s", err)
 	}
 }
+
+// TestNotesExportBlamesTheServerOnlyWhenItNamedNothing keeps the refusal above
+// from misattributing. A directory that happens to share the note's exported
+// name is the user's filesystem, not a server that failed to name the file, and
+// saying otherwise sends them looking in the wrong place.
+func TestNotesExportBlamesTheServerOnlyWhenItNamedNothing(t *testing.T) {
+	m := noteExportMock(t, "Plan.md", "text/markdown; charset=utf-8", "# Plan\n")
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.Mkdir("Plan.md", 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := runCLI(t, m, "notes", "export", "n1", "--output", ".")
+
+	if err == nil {
+		t.Fatal("the export wrote over a directory")
+	}
+	if strings.Contains(err.Error(), "did not name the file") {
+		t.Errorf("the server named the file; the directory in the way is the user's:\n%s", err)
+	}
+}
