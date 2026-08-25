@@ -57,6 +57,9 @@ type mockRequest struct {
 	Path   string
 	Query  url.Values
 	Body   string
+	// Auth is the Authorization header, so a test can pin which calls are
+	// authenticated and which deliberately are not.
+	Auth string
 }
 
 // mockReply is a canned response for a "METHOD /path" route.
@@ -91,6 +94,7 @@ func newAPIMock(t *testing.T, routes map[string]mockReply) *apiMock {
 		body, _ := io.ReadAll(r.Body)
 		m.requests = append(m.requests, mockRequest{
 			Method: r.Method, Path: r.URL.Path, Query: r.URL.Query(), Body: string(body),
+			Auth: r.Header.Get("Authorization"),
 		})
 		if m.handler != nil {
 			// Recording the request consumed the body; hand a fresh reader to the
@@ -145,6 +149,19 @@ func (m *apiMock) bodyOf(t *testing.T, methodAndPath string) map[string]any {
 	}
 	t.Fatalf("bodyOf(%s): no such request in %v", methodAndPath, m.calls())
 	return nil
+}
+
+// authOf returns the Authorization header of the first request matching
+// "METHOD /path", so a test can prove a call was or was not authenticated.
+func (m *apiMock) authOf(t *testing.T, methodAndPath string) string {
+	t.Helper()
+	for _, r := range m.requests {
+		if r.Method+" "+r.Path == methodAndPath {
+			return r.Auth
+		}
+	}
+	t.Fatalf("authOf(%s): no such request in %v", methodAndPath, m.calls())
+	return ""
 }
 
 // queryOf returns the query parameters of the first request matching

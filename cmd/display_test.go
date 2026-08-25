@@ -105,6 +105,61 @@ func TestBytesHuman(t *testing.T) {
 	}
 }
 
+// TestLimitBytesHuman pins the upload-limit formatter apart from bytesHuman:
+// base-1024 with no trailing ".0", and an offending size that always rounds UP
+// so it can never print as the cap it broke.
+//
+// Every exact binary multiple rounds the same way under both modes, so the
+// discriminating cases below carry the weight — without them either half of
+// the rounding rule could be flipped and still pass.
+func TestLimitBytesHuman(t *testing.T) {
+	nearest := map[int64]string{
+		0:         "0 B",
+		512:       "512 B",
+		1024:      "1 KB",
+		1536:      "1.5 KB",
+		1048576:   "1 MB",
+		104857600: "100 MB",
+		115343360: "110 MB",
+	}
+	for in, want := range nearest {
+		if got := limitBytesHuman(in, false); got != want {
+			t.Errorf("limitBytesHuman(%d, false) = %q, want %q", in, got, want)
+		}
+	}
+
+	// One byte over a 100 MB cap must not render as "100 MB", or the refusal
+	// contradicts itself.
+	if got := limitBytesHuman(104857601, true); got != "100.1 MB" {
+		t.Errorf("limitBytesHuman(104857601, true) = %q, want %q", got, "100.1 MB")
+	}
+	// Values where nearest and round-up genuinely disagree, so the mode is
+	// pinned rather than incidentally satisfied.
+	for _, tc := range []struct {
+		n              int64
+		nearest, upped string
+	}{
+		{1050, "1 KB", "1.1 KB"},
+		{1075, "1 KB", "1.1 KB"},
+		{104862000, "100 MB", "100.1 MB"},
+	} {
+		if got := limitBytesHuman(tc.n, false); got != tc.nearest {
+			t.Errorf("limitBytesHuman(%d, false) = %q, want %q", tc.n, got, tc.nearest)
+		}
+		if got := limitBytesHuman(tc.n, true); got != tc.upped {
+			t.Errorf("limitBytesHuman(%d, true) = %q, want %q", tc.n, got, tc.upped)
+		}
+	}
+	// An exact multiple gains nothing from rounding up.
+	if got := limitBytesHuman(115343360, true); got != "110 MB" {
+		t.Errorf("limitBytesHuman(115343360, true) = %q, want %q", got, "110 MB")
+	}
+	// bytesHuman still keeps its decimal for table columns.
+	if got := bytesHuman(104857600); got != "100.0 MB" {
+		t.Errorf("bytesHuman must keep its .0 for tables, got %q", got)
+	}
+}
+
 func TestCommaNum(t *testing.T) {
 	cases := map[int64]string{
 		0:       "0",

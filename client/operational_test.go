@@ -130,3 +130,27 @@ func TestOperationalProbesSendNoAuthHeader(t *testing.T) {
 		t.Errorf("auth header = %q, want empty for public probe", rec.Auth)
 	}
 }
+
+// TestClientFlagsHitsOrigin verifies /client-flags is requested at the server
+// ORIGIN (no /api/v1 prefix) and that the bare document comes back with the
+// upload policy intact. Whether the request carries a bearer is a property of
+// the caller's client, and the upload probe's own test pins that.
+func TestClientFlagsHitsOrigin(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 200, `{"offline_priming":true,"max_upload_bytes":104857600,"allowed_mime":"*"}`)
+	defer srv.Close()
+
+	data, err := NewClient(srv.URL+"/api/v1", "").ClientFlags()
+	if err != nil {
+		t.Fatalf("ClientFlags error: %v", err)
+	}
+	if rec.Method != "GET" {
+		t.Errorf("method = %s, want GET", rec.Method)
+	}
+	if rec.Path != "/client-flags" {
+		t.Errorf("path = %q, want /client-flags (origin, no /api/v1)", rec.Path)
+	}
+	if !strings.Contains(string(data), `"max_upload_bytes":104857600`) {
+		t.Errorf("body = %s", data)
+	}
+}

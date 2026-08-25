@@ -39,3 +39,23 @@ func (c *Client) Version() ([]byte, error) {
 func (c *Client) OpenAPI() ([]byte, error) {
 	return c.doGet("/openapi.json", nil)
 }
+
+// ClientFlags fetches the server's runtime flag document from the root
+// /client-flags endpoint and returns the raw body.
+//
+// Like the health probes it lives at the server ROOT (no /api/v1 prefix) and is
+// public, so it is built from c.Origin() and dispatched through the low-level
+// request method with allowRefresh false.
+//
+// It carries the per-file upload policy — max_upload_bytes and allowed_mime —
+// which is the server's answer to "what will you accept?", published so a
+// client can screen a file before spending a user's bandwidth on it. The
+// document is a bare JSON object with no {"data": …} envelope, matching its
+// root-level neighbours.
+//
+// Every consumer must fail OPEN: an unreachable or older server means "do not
+// pre-validate, send it and let the server decide", never a hardcoded fallback
+// number that would refuse good files the day an operator raises the cap.
+func (c *Client) ClientFlags() ([]byte, error) {
+	return c.request(http.MethodGet, c.Origin()+"/client-flags", nil, "", false)
+}

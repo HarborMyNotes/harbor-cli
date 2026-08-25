@@ -11,9 +11,11 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
@@ -134,6 +136,10 @@ deduplicate against an existing blob.`,
 			return err
 		}
 		path, mimeType, filename := args[0], stringFlag(cmd, "mime"), stringFlag(cmd, "filename")
+
+		if err := checkUploadSize(c, path); err != nil {
+			return err
+		}
 
 		if !boolFlag(cmd, "encrypted") {
 			data, uerr := c.UploadFile(path, mimeType, filename, false)
@@ -370,20 +376,106 @@ func decryptDownload(c *client.Client, creds *config.Credentials, body io.Reader
 	return bytes.NewReader(plain), nil
 }
 
-// mapFileError gives friendly messages for file-specific codes.
+// mapFileError gives friendly messages for file-specific codes while keeping
+// the typed *client.APIError, so the display layer can still render the code
+// line, the detail bullets and --verbose's http/request_id, and --json still
+// reports the code the server sent rather than a generic cli_error.
+//
+// Only the message is swapped; every other field is carried through. A code
+// this does not recognise passes through untouched, which is what keeps the
+// plan-limit walkthrough and its exit code working for uploads.
 func mapFileError(err error) error {
 	var apiErr *client.APIError
-	if errors.As(err, &apiErr) {
-		switch apiErr.Code {
-		case "file_too_large":
-			return errors.New("the file exceeds the maximum upload size")
-		case "unsupported_type":
-			return errors.New("that media type is not allowed by the server policy")
-		case "blob_missing":
-			return errors.New("the blob bytes are not stored")
-		}
+	if !errors.As(err, &apiErr) {
+		return err
 	}
-	return err
+	var friendly string
+	switch apiErr.Code {
+	case "file_too_large":
+		friendly = "the file exceeds the maximum upload size"
+	case "unsupported_type":
+		friendly = "that media type is not allowed by the server policy"
+	case "blob_missing":
+		friendly = "the blob bytes are not stored"
+	default:
+		return err
+	}
+	rewritten := *apiErr
+	rewritten.Message = friendly
+	return &rewritten
+}
+
+// uploadPolicyProbeTimeout bounds the /client-flags fetch that precedes an
+// upload. The document is tiny and static, so anything slower than this is a
+// sick network — and waiting on it costs more than the pre-check saves.
+const uploadPolicyProbeTimeout = 5 * time.Second
+
+// uploadSizeCap returns the server's published per-file upload cap in bytes, or
+// 0 when it cannot be established.
+//
+// Zero means "check nothing". An unreachable or older server, a malformed
+// document, or a missing field all fail OPEN and leave the upload behaving
+// exactly as it did before this check existed. There is deliberately no
+// fallback constant: a client that invents the cap refuses perfectly good files
+// the day an operator raises FILES_MAX_UPLOAD_BYTES, which is a worse failure
+// than the round-trip it saves.
+func uploadSizeCap(c *client.Client) int64 {
+	// A dedicated anonymous client, for two reasons. /client-flags is public, so
+	// the probe needs no bearer. And it must not inherit the 30-second timeout
+	// sized for real API calls: this check exists to SAVE the user time, so on a
+	// network that swallows packets it has to give up quickly and let the upload
+	// try, rather than doubling the wait before the same failure.
+	probe := client.NewClient(c.BaseURL, "")
+	probe.HTTPClient = &http.Client{Timeout: uploadPolicyProbeTimeout}
+
+	data, err := probe.ClientFlags()
+	if err != nil {
+		return 0
+	}
+	limit := int64(num(parseJSON(data), "max_upload_bytes"))
+	if limit <= 0 {
+		return 0
+	}
+	return limit
+}
+
+// checkUploadSize refuses an over-cap file before a single byte is streamed,
+// naming the file, its size and the limit.
+//
+// The comparison is ">", not ">=", mirroring the server's own predicate: a file
+// sized exactly at the cap is accepted, and a client that refused it would
+// block an upload the server would take with no round-trip to explain why.
+//
+// The refusal carries the server's own file_too_large code rather than a bare
+// string, so catching it early is indistinguishable from catching it late: a
+// script reading --json branches on the same code either way, and the terminal
+// prints the same two lines.
+//
+// It measures the file as it sits on disk. With --encrypted the HRBC2 envelope
+// adds 33 bytes, so a file within 33 bytes of the cap still reaches the server
+// and is refused there — the same answer either way, and it keeps the message
+// honest about the size the user can actually see.
+//
+// The local checks come first so a typo'd path costs no network round-trip.
+func checkUploadSize(c *client.Client, path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		// Not ours to report: the upload opens the file next and says something
+		// better about why it could not be read.
+		return nil
+	}
+	if info.IsDir() {
+		return fmt.Errorf("%q is a directory", filepath.Base(path))
+	}
+	limit := uploadSizeCap(c)
+	if limit <= 0 || info.Size() <= limit {
+		return nil
+	}
+	return &client.APIError{
+		Code: "file_too_large",
+		Message: fmt.Sprintf("%q is %s — the per-file limit is %s",
+			filepath.Base(path), limitBytesHuman(info.Size(), true), limitBytesHuman(limit, false)),
+	}
 }
 
 // ===========================================================================
