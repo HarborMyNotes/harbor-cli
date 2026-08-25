@@ -376,16 +376,14 @@ func decryptDownload(c *client.Client, creds *config.Credentials, body io.Reader
 	return bytes.NewReader(plain), nil
 }
 
-// mapFileError gives friendly messages for file-specific codes while KEEPING
-// the typed *client.APIError.
+// mapFileError gives friendly messages for file-specific codes while keeping
+// the typed *client.APIError, so the display layer can still render the code
+// line, the detail bullets and --verbose's http/request_id, and --json still
+// reports the code the server sent rather than a generic cli_error.
 //
-// It returns a copy with only the message swapped rather than a bare
-// errors.New: replacing the value threw away everything but the prose, so a
-// refused upload lost its "code:" line, its detail bullets and --verbose's
-// http/request_id, and --json reported a generic cli_error instead of what the
-// server actually said. Codes this does not recognise are passed through
-// untouched, which is what keeps the plan-limit walkthrough and its exit code
-// working for uploads.
+// Only the message is swapped; every other field is carried through. A code
+// this does not recognise passes through untouched, which is what keeps the
+// plan-limit walkthrough and its exit code working for uploads.
 func mapFileError(err error) error {
 	var apiErr *client.APIError
 	if !errors.As(err, &apiErr) {
@@ -448,22 +446,36 @@ func uploadSizeCap(c *client.Client) int64 {
 // sized exactly at the cap is accepted, and a client that refused it would
 // block an upload the server would take with no round-trip to explain why.
 //
+// The refusal carries the server's own file_too_large code rather than a bare
+// string, so catching it early is indistinguishable from catching it late: a
+// script reading --json branches on the same code either way, and the terminal
+// prints the same two lines.
+//
 // It measures the file as it sits on disk. With --encrypted the HRBC2 envelope
 // adds 33 bytes, so a file within 33 bytes of the cap still reaches the server
 // and is refused there — the same answer either way, and it keeps the message
-// honest about the size the user can actually see. A path we cannot stat is
-// left alone so the upload can report why it could not be read.
+// honest about the size the user can actually see.
+//
+// The local checks come first so a typo'd path costs no network round-trip.
 func checkUploadSize(c *client.Client, path string) error {
-	limit := uploadSizeCap(c)
-	if limit <= 0 {
-		return nil
-	}
 	info, err := os.Stat(path)
-	if err != nil || info.IsDir() || info.Size() <= limit {
+	if err != nil {
+		// Not ours to report: the upload opens the file next and says something
+		// better about why it could not be read.
 		return nil
 	}
-	return fmt.Errorf("%q is %s — the per-file limit is %s",
-		filepath.Base(path), limitBytesHuman(info.Size(), true), limitBytesHuman(limit, false))
+	if info.IsDir() {
+		return fmt.Errorf("%q is a directory", filepath.Base(path))
+	}
+	limit := uploadSizeCap(c)
+	if limit <= 0 || info.Size() <= limit {
+		return nil
+	}
+	return &client.APIError{
+		Code: "file_too_large",
+		Message: fmt.Sprintf("%q is %s — the per-file limit is %s",
+			filepath.Base(path), limitBytesHuman(info.Size(), true), limitBytesHuman(limit, false)),
+	}
 }
 
 // ===========================================================================

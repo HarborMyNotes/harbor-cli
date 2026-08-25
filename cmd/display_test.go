@@ -108,6 +108,10 @@ func TestBytesHuman(t *testing.T) {
 // TestLimitBytesHuman pins the upload-limit formatter apart from bytesHuman:
 // base-1024 with no trailing ".0", and an offending size that always rounds UP
 // so it can never print as the cap it broke.
+//
+// Every exact binary multiple rounds the same way under both modes, so the
+// discriminating cases below carry the weight — without them either half of
+// the rounding rule could be flipped and still pass.
 func TestLimitBytesHuman(t *testing.T) {
 	nearest := map[int64]string{
 		0:         "0 B",
@@ -128,6 +132,23 @@ func TestLimitBytesHuman(t *testing.T) {
 	// contradicts itself.
 	if got := limitBytesHuman(104857601, true); got != "100.1 MB" {
 		t.Errorf("limitBytesHuman(104857601, true) = %q, want %q", got, "100.1 MB")
+	}
+	// Values where nearest and round-up genuinely disagree, so the mode is
+	// pinned rather than incidentally satisfied.
+	for _, tc := range []struct {
+		n              int64
+		nearest, upped string
+	}{
+		{1050, "1 KB", "1.1 KB"},
+		{1075, "1 KB", "1.1 KB"},
+		{104862000, "100 MB", "100.1 MB"},
+	} {
+		if got := limitBytesHuman(tc.n, false); got != tc.nearest {
+			t.Errorf("limitBytesHuman(%d, false) = %q, want %q", tc.n, got, tc.nearest)
+		}
+		if got := limitBytesHuman(tc.n, true); got != tc.upped {
+			t.Errorf("limitBytesHuman(%d, true) = %q, want %q", tc.n, got, tc.upped)
+		}
 	}
 	// An exact multiple gains nothing from rounding up.
 	if got := limitBytesHuman(115343360, true); got != "110 MB" {

@@ -386,22 +386,109 @@ func writeSized(t *testing.T, name string, n int) string {
 // An over-cap file must be refused before a single byte is streamed — the whole
 // point of publishing the policy — so the test asserts the absence of the
 // upload call as much as the message.
+//
+// The cap and the file size are chosen so that nearest and round-up rounding
+// DISAGREE for both numbers (1050 B is 1 KB nearest but 1.1 KB rounded up;
+// 1075 B likewise). Rounder values let either half of the rounding rule be
+// flipped without any test noticing, which is how the self-contradicting
+// "is 1 KB — the per-file limit is 1 KB" gets back in.
 func TestFilesUploadRefusesOverCapBeforeStreaming(t *testing.T) {
-	m := uploadMock(t, 200, `{"max_upload_bytes":1024,"allowed_mime":"*"}`)
-	path := writeSized(t, "big.bin", 2000)
+	m := uploadMock(t, 200, `{"max_upload_bytes":1050,"allowed_mime":"*"}`)
+	path := writeSized(t, "big.bin", 1075)
 
 	_, err := runCLI(t, m, "files", "upload", path)
 	if err == nil {
 		t.Fatal("expected a refusal, got nil")
 	}
-	want := `"big.bin" is 2 KB — the per-file limit is 1 KB`
-	if err.Error() != want {
-		t.Errorf("message = %q, want %q", err.Error(), want)
+
+	// Catching it early must be indistinguishable from catching it late, so the
+	// refusal carries the server's own code and --json reports it.
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("refusal must carry the API error shape, got %T: %v", err, err)
 	}
+	if apiErr.Code != "file_too_large" {
+		t.Errorf("code = %q, want file_too_large (--json would report cli_error)", apiErr.Code)
+	}
+	want := `"big.bin" is 1.1 KB — the per-file limit is 1 KB`
+	if apiErr.Message != want {
+		t.Errorf("message = %q, want %q", apiErr.Message, want)
+	}
+
 	for _, call := range m.calls() {
 		if strings.HasPrefix(call, "POST") {
 			t.Errorf("refused upload still sent %s (calls: %v)", call, m.calls())
 		}
+	}
+}
+
+// Fail open means the cap is UNKNOWN, not a guess. Asserting the exact zero is
+// what stops a fallback constant reappearing: a default of 100 MB sails past
+// any test that merely checks an over-cap file still uploads, because the test
+// file is smaller than the invented number.
+func TestUploadSizeCapIsZeroWhenUnknown(t *testing.T) {
+	serve := func(t *testing.T, status int, body string) *client.Client {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(srv.Close)
+		return client.NewClient(srv.URL+"/api/v1", "")
+	}
+
+	unknown := map[string]struct {
+		status int
+		body   string
+	}{
+		"probe fails":   {500, `{"error":{"code":"internal_error","message":"boom"}}`},
+		"field missing": {200, `{"offline_priming":true}`},
+		"unparseable":   {200, `not json`},
+		"empty body":    {200, ``},
+		"zero cap":      {200, `{"max_upload_bytes":0}`},
+		"negative cap":  {200, `{"max_upload_bytes":-1}`},
+	}
+	for name, tc := range unknown {
+		t.Run(name, func(t *testing.T) {
+			if got := uploadSizeCap(serve(t, tc.status, tc.body)); got != 0 {
+				t.Errorf("uploadSizeCap = %d, want 0 — a guessed cap refuses files the server would take", got)
+			}
+		})
+	}
+
+	// The positive control: a published cap really is read, so the zeros above
+	// are proving fail-open rather than a probe that never works at all.
+	if got := uploadSizeCap(serve(t, 200, `{"max_upload_bytes":104857600}`)); got != 104857600 {
+		t.Errorf("uploadSizeCap = %d, want 104857600", got)
+	}
+}
+
+// A directory can never be uploaded, so it is named as one instead of dying
+// downstream inside the multipart copy.
+func TestFilesUploadRefusesADirectory(t *testing.T) {
+	m := uploadMock(t, 200, `{"max_upload_bytes":104857600,"allowed_mime":"*"}`)
+
+	_, err := runCLI(t, m, "files", "upload", t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "is a directory") {
+		t.Fatalf("error = %v, want a directory refusal", err)
+	}
+	for _, call := range m.calls() {
+		if strings.HasPrefix(call, "POST") {
+			t.Errorf("refused directory still sent %s", call)
+		}
+	}
+}
+
+// A path that does not exist is a purely local fact, so it must not cost a
+// network round-trip before the user is told.
+func TestFilesUploadDoesNotProbeForAMissingPath(t *testing.T) {
+	m := uploadMock(t, 200, `{"max_upload_bytes":104857600,"allowed_mime":"*"}`)
+
+	if _, err := runCLI(t, m, "files", "upload", filepath.Join(t.TempDir(), "nope.png")); err == nil {
+		t.Fatal("expected an error for a missing path")
+	}
+	if len(m.calls()) != 0 {
+		t.Errorf("missing path still hit the network: %v", m.calls())
 	}
 }
 
@@ -447,9 +534,9 @@ func TestFilesUploadFailsOpenWithoutAPublishedCap(t *testing.T) {
 	}
 }
 
-// The friendlier prose must not cost the user the diagnostics: replacing the
-// typed error dropped the code line, the detail bullets and --verbose's
-// http/request_id, and made --json report a generic cli_error.
+// The friendlier prose must not cost the user the diagnostics — the code line,
+// the detail bullets and --verbose's http/request_id all come off the typed
+// value, and --json reports its code.
 func TestMapFileErrorKeepsTheAPIError(t *testing.T) {
 	original := &client.APIError{
 		Code:      "file_too_large",
