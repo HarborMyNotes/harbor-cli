@@ -1828,7 +1828,7 @@ func TestClearRemovesTheCachedKeystore(t *testing.T) {
 	}
 
 	m := clearMock(t, "completed")
-	if _, err := runCLI(t, m, "account", "clear", "--confirm", accountClearConfirmPhrase, "--yes", "--json"); err != nil {
+	if _, err := runCLIInHome(t, home, m, "account", "clear", "--confirm", accountClearConfirmPhrase, "--yes", "--json"); err != nil {
 		t.Fatalf("account clear: %v", err)
 	}
 
@@ -1936,7 +1936,7 @@ func TestClearKeepsTheCredentials(t *testing.T) {
 	}
 
 	m := clearMock(t, "completed")
-	if _, err := runCLI(t, m, "account", "clear", "--confirm", accountClearConfirmPhrase, "--yes", "--json"); err != nil {
+	if _, err := runCLIInHome(t, home, m, "account", "clear", "--confirm", accountClearConfirmPhrase, "--yes", "--json"); err != nil {
 		t.Fatalf("account clear: %v", err)
 	}
 
@@ -1966,7 +1966,7 @@ func TestClearDropsTheKeystoreEvenWhenItGivesUpWaiting(t *testing.T) {
 	t.Cleanup(func() { accountClearPollTimeoutVar = orig })
 	accountClearPollTimeoutVar = time.Nanosecond
 
-	_, err := runCLI(t, m, "account", "clear", "--confirm", accountClearConfirmPhrase, "--yes", "--json")
+	_, err := runCLIInHome(t, home, m, "account", "clear", "--confirm", accountClearConfirmPhrase, "--yes", "--json")
 
 	if err == nil {
 		t.Fatal("the wait never gave up")
