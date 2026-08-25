@@ -1983,7 +1983,10 @@ func TestClearDropsTheKeystoreEvenWhenItGivesUpWaiting(t *testing.T) {
 // sends the other — the exact crossover the two phrases exist to prevent, and
 // invisible to a compiler. This asserts each bundle agrees with itself.
 func TestEachGateAsksForThePhraseItSends(t *testing.T) {
-	for _, g := range []accountGate{accountClearGate, accountDeleteGate} {
+	if len(accountGates) < 2 {
+		t.Fatalf("only %d gates registered; the scan is broken, so this proves nothing", len(accountGates))
+	}
+	for _, g := range accountGates {
 		if g.gate.Affirmative != g.phrase {
 			t.Errorf("the %s gate asks for %q and sends %q", g.verb, g.gate.Affirmative, g.phrase)
 		}
@@ -2104,5 +2107,68 @@ func TestClearPollNeedsThe404sBackToBack(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `"completed"`) {
 		t.Errorf("the poll did not reach the finished job:\n%s", data)
+	}
+}
+
+// TestClearProgressStaysOffStdout keeps the human run's stdout to what the
+// command produced. The poll can print several lines before the job finishes,
+// and stdout is the table — anything else there is output nobody asked for in
+// the middle of a document.
+func TestClearProgressStaysOffStdout(t *testing.T) {
+	noClearSleep(t)
+	pipedPassword(t, "correct-horse")
+	m := clearMock(t, "queued", "running", "completed")
+
+	out, err := runCLI(t, m, "account", "clear", "--confirm", accountClearConfirmPhrase, "--yes")
+	if err != nil {
+		t.Fatalf("account clear: %v", err)
+	}
+
+	for _, leaked := range []string{"clearing —", "Ctrl-C"} {
+		if strings.Contains(out, leaked) {
+			t.Errorf("poll progress reached stdout (%q):\n%s", leaked, out)
+		}
+	}
+	if !strings.Contains(out, "Job ID") {
+		t.Errorf("stdout lost the thing it is for:\n%s", out)
+	}
+}
+
+// TestClearDropsTheKeystoreBeforeItWaits is the Ctrl-C case. The wait is not a
+// reliable moment to drop the cache: Ctrl-C ends the wait and not the clear, and
+// the progress line says so — so a cache dropped only afterwards survives on a
+// server that is destroying the keystore it describes.
+func TestClearDropsTheKeystoreBeforeItWaits(t *testing.T) {
+	pipedPassword(t, "correct-horse")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := config.SaveKeystoreBlob("HRBK1-stale-blob"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The poll blocks until the test has looked, standing in for a person who
+	// hits Ctrl-C while it runs.
+	looked := make(chan struct{})
+	orig := accountClearSleep
+	t.Cleanup(func() { accountClearSleep = orig })
+	accountClearSleep = func(time.Duration) {
+		select {
+		case <-looked:
+		default:
+			if got, _ := config.LoadKeystoreBlob(); got != "" {
+				t.Errorf("the stale keystore is still there while the wait runs: %q", got)
+			}
+			close(looked)
+		}
+	}
+
+	m := clearMock(t, "queued", "completed")
+	if _, err := runCLIInHome(t, home, m, "account", "clear", "--confirm", accountClearConfirmPhrase, "--yes", "--json"); err != nil {
+		t.Fatalf("account clear: %v", err)
+	}
+	select {
+	case <-looked:
+	default:
+		t.Fatal("the command never waited, so this proved nothing")
 	}
 }

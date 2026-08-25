@@ -50,11 +50,22 @@ type accountGate struct {
 // newAccountGate builds one from the confirmation alone.
 //
 // The phrase is TAKEN from the wording rather than passed alongside it, so the
-// words a user is asked to type and the words sent to the server are one value
-// with one source. A bundle whose prompt and payload disagree cannot be written.
+// words a user is asked to type and the words sent to the server have one
+// source. The fields stay writable from inside this package, so this is the
+// shape to copy rather than a rule the compiler enforces — what enforces it is
+// TestEachGateAsksForThePhraseItSends, over every gate this file registers.
 func newAccountGate(verb string, c confirmation) accountGate {
-	return accountGate{phrase: c.Affirmative, verb: verb, gate: c}
+	g := accountGate{phrase: c.Affirmative, verb: verb, gate: c}
+	accountGates = append(accountGates, g)
+	return g
 }
+
+// accountGates is every gate declared above, built as they are declared rather
+// than listed by hand — the same reason destructiveConfirmations is. A list
+// somebody has to remember to append to only stays complete while they do, and
+// the test that walks this one is what holds each gate to asking for the phrase
+// it sends.
+var accountGates []accountGate
 
 const (
 	// accountClearPollInterval is how often the clear job is asked whether it has
@@ -884,7 +895,8 @@ var accountClearGate = newAccountGate("clear", accountClearConfirmation)
 // that no clear job exists. Everything else waits for the ceiling, which says
 // the job is still running rather than implying it went wrong.
 //
-// Progress goes to stderr so '--json' stays a document.
+// Progress is suppressed entirely under --json, and goes to stderr otherwise:
+// the flag's output is a document, and a human's is not the place for it either.
 func accountPollClear(c *client.Client, interval, timeout time.Duration) ([]byte, error) {
 	if interval <= 0 {
 		interval = accountClearPollInterval
@@ -1008,6 +1020,20 @@ and only then reports success. Pass --no-wait to be handed the job instead.`,
 			return mapAccountError(err)
 		}
 
+		// AS SOON AS THE SERVER ACCEPTS THE JOB, not after the wait. The keystore
+		// goes with everything else, so the cached copy is about to describe a
+		// master key for data that no longer exists — and ensureKeystoreBlob
+		// PREFERS the cache, so the next encrypted write would seal against a
+		// keystore the server has never heard of.
+		//
+		// The wait is not a reliable moment to do it: Ctrl-C ends the wait, not
+		// the clear, and the line below invites exactly that. Dropping a cache
+		// early costs one sync fetch, which re-caches; dropping it late can cost
+		// a note nobody can open.
+		if cerr := config.ClearKeystoreBlob(); cerr != nil {
+			fmt.Fprintln(os.Stderr, dim("could not remove the cached keystore: "+cerr.Error()))
+		}
+
 		job := parseJSON(client.UnwrapData(data))
 		var waitErr error
 		if !boolFlag(cmd, "no-wait") && !accountClearIsTerminal(str(job, "status")) {
@@ -1016,18 +1042,6 @@ and only then reports success. Pass --no-wait to be handed the job instead.`,
 				data = polled
 			}
 			waitErr = perr
-		}
-
-		// The server destroyed the keystore with everything else, so the cached
-		// copy now describes a master key for data that no longer exists. Left
-		// behind, the next encryption operation would work against a keystore the
-		// server has never heard of.
-		//
-		// It is cleared on a failed job, and on a wait this command gave up on,
-		// for the same reason: either may still have taken the keystore, and a
-		// stale cache is the worse of the two things to be left holding.
-		if cerr := config.ClearKeystoreBlob(); cerr != nil {
-			fmt.Fprintln(os.Stderr, dim("could not remove the cached keystore: "+cerr.Error()))
 		}
 
 		// Printed before the wait's own error is returned, so a caller that gave
