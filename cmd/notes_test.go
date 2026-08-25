@@ -342,3 +342,47 @@ func TestEncryptedNoteExportSaysWhy(t *testing.T) {
 		}
 	}
 }
+
+// TestNotesExportChecksFlagsBeforeCredentials keeps a typo answering the typo. A
+// logged-out user who mistypes --format should not be sent to log in first, only
+// to find out afterwards that the value was never going to work.
+func TestNotesExportChecksFlagsBeforeCredentials(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("HARBOR_TOKEN", "")
+	t.Setenv("HARBOR_API_URL", "")
+	resetCommandState(t)
+	prepareCommandTree()
+
+	rootCmd.SetArgs([]string{"notes", "export", "n1", "--format", "pdf", "--output", "-"})
+	err := rootCmd.Execute()
+
+	if err == nil {
+		t.Fatal("an unsupported --format was accepted")
+	}
+	if !strings.Contains(err.Error(), "markdown") {
+		t.Errorf("a logged-out user was told about their credentials instead of their typo:\n%s", err)
+	}
+}
+
+// TestNotesExportSaysWhenTheServerNamedNoFile keeps the blame in the right
+// place. Falling through to os.Create on a directory reports "is a directory",
+// which reads like the path was wrong when it was the response.
+func TestNotesExportSaysWhenTheServerNamedNoFile(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{})
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		// No Content-Disposition at all.
+		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("# Plan\n"))
+	}
+	dir := t.TempDir()
+
+	_, err := runCLI(t, m, "notes", "export", "n1", "--output", dir)
+
+	if err == nil {
+		t.Fatal("a nameless response wrote something anyway")
+	}
+	if !strings.Contains(err.Error(), "did not name the file") {
+		t.Errorf("the error blames the wrong thing:\n%s", err)
+	}
+}

@@ -6,6 +6,7 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
@@ -419,16 +420,19 @@ of that INTO the note. Use 'harbor notes get <id> --format markdown' for that.`,
   harbor notes export 9c2e... --zip --output bundle.zip
   harbor notes export 9c2e... --output -          # stream to stdout`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, _, err := loadClientFromConfig()
-		if err != nil {
-			return err
-		}
+		// The flags are checked before the credentials so a typo answers the typo.
+		// Loading first means a logged-out user is told to log in, fixes that, and
+		// only then finds out the format was never going to work.
 		if _, err := notesExportFormat(cmd); err != nil {
 			return err
 		}
 		out := stringFlag(cmd, "output")
 		if out == "" {
 			return errors.New("--output is required (use - for stdout, or a directory to take the server's filename)")
+		}
+		c, _, err := loadClientFromConfig()
+		if err != nil {
+			return err
 		}
 
 		resp, err := c.ExportNoteMarkdown(args[0], boolFlag(cmd, "zip"))
@@ -440,6 +444,14 @@ of that INTO the note. Use 'harbor notes get <id> --format markdown' for that.`,
 		// Read the header BEFORE draining the body: the same endpoint answers
 		// .md or .zip, and the response is the only thing that knows which.
 		path := accountExportOutputPath(out, filenameFromContentDisposition(resp.Header.Get("Content-Disposition")))
+		if path != "-" {
+			// A directory still here means the response named no filename to put in
+			// it. os.Create would fail with "is a directory", which reads like the
+			// user's path was wrong when the header was.
+			if info, serr := os.Stat(path); serr == nil && info.IsDir() {
+				return fmt.Errorf("the server did not name the file, so %s is all there is to go on — give --output a filename instead of a directory", path)
+			}
+		}
 		n, err := writeOutput(path, resp.Body)
 		if err != nil {
 			return err

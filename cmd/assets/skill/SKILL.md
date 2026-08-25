@@ -187,7 +187,9 @@ body, so to make a *targeted* change you fetch the current body, modify it, and
 write it back:
 
 ```bash
-# 1. Fetch the current body to a temp file.
+# 1. Fetch the current BODY to a temp file. (Not 'notes export' — that writes a
+#    document with front matter and a title heading, which would end up inside
+#    the note when you write it back.)
 #    Plain note → markdown round-trips cleanly:
 harbor notes get "$NOTE_ID" --format markdown --json | jq -r '.content' > /tmp/note.md
 #    Rich note (colors/embeds/complex tables) → use HTML to avoid lossy conversion:

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"os"
 	"path/filepath"
 	"strings"
@@ -415,7 +416,24 @@ func writeOutput(path string, r io.Reader) (int64, error) {
 
 // filenameFromContentDisposition extracts a filename from a Content-Disposition
 // header, if present.
+//
+// It parses the header properly rather than scanning for the next ";", because
+// the name in it is often a note TITLE and titles contain semicolons. Quoted
+// per the spec, `filename="Q3 planning; Dana.md"` cut at the first ";" yields
+// "Q3 planning" — no extension, so nothing opens it, and two such notes
+// exported into one directory silently overwrite each other.
+//
+// Parsing also picks up RFC 5987's filename* form, which a server may send
+// instead for a non-ASCII name.
+//
+// A header too malformed to parse falls back to the naive scan: some filename
+// is better than none, and the caller's own --output is the only alternative.
 func filenameFromContentDisposition(cd string) string {
+	if _, params, err := mime.ParseMediaType(cd); err == nil {
+		if name := params["filename"]; name != "" {
+			return name
+		}
+	}
 	const marker = "filename="
 	i := strings.Index(cd, marker)
 	if i < 0 {

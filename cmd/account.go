@@ -137,8 +137,8 @@ var accountExportsCmd = &cobra.Command{
 	Use:   "exports",
 	Short: "Show this account's current exports (one per format)",
 	Args:  cobra.NoArgs,
-	Long: `List the most recent export per format — at most two rows, one ENEX and one
-HTML. A format you have never exported is simply absent.
+	Long: `List the most recent export per format — at most three rows, one ENEX, one
+HTML and one Markdown. A format you have never exported is simply absent.
 
 Export state lives on the server, not in this shell: this is how you find the
 export you started on another machine (or before you closed the terminal and
@@ -932,7 +932,7 @@ func displayExportJobCard(data []byte, downloading bool) {
 	}
 }
 
-// displayExportList renders the account's export slots — at most two rows, one
+// displayExportList renders the account's export slots — at most three rows, one
 // per format. An account with no exports gets a plain sentence and the command
 // that starts one, not an empty table.
 func displayExportList(data []byte) {

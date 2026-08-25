@@ -57,11 +57,24 @@ func TestWriteOutputToFileAndStdout(t *testing.T) {
 	}
 }
 
+// TestFilenameFromContentDisposition covers the shapes the header actually
+// arrives in.
+//
+// The semicolon rows are the ones that matter. A note title is free text, so
+// semicolons in it are ordinary, and `notes export` names its file from the
+// title — cutting the header at the first ";" turns "Q3 planning; Dana.md" into
+// "Q3 planning": no extension, so nothing opens it, and two such notes exported
+// into one directory overwrite each other.
 func TestFilenameFromContentDisposition(t *testing.T) {
 	cases := map[string]string{
-		`attachment; filename="diagram.png"`: "diagram.png",
-		`attachment; filename=report.pdf`:    "report.pdf",
-		`inline`:                             "",
+		`attachment; filename="diagram.png"`:           "diagram.png",
+		`attachment; filename=report.pdf`:              "report.pdf",
+		`inline`:                                       "",
+		`attachment; filename="Q3 planning; Dana.md"`:  "Q3 planning; Dana.md",
+		`attachment; filename="Café ünïcode probe.md"`: "Café ünïcode probe.md",
+		`attachment; filename*=UTF-8''Caf%C3%A9.md`:    "Café.md",
+		`attachment; filename="Plan.zip"; size=42`:     "Plan.zip",
+		`attachment`: "",
 	}
 	for in, want := range cases {
 		if got := filenameFromContentDisposition(in); got != want {
