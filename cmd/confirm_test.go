@@ -250,17 +250,37 @@ var irreversibleClientCalls = []string{
 // nothing failed. A command is only asking first if the thing it calls actually
 // ends up at the one function that reads an answer.
 func TestEveryIrreversibleCommandAsksFirst(t *testing.T) {
-	// Every gate is reached through a helper named *Confirm*/*confirm*, so this
-	// looks for a CALL rather than the word. That distinction is load-bearing:
-	// scanning the whole declaration for "confirm" passed even with the gate
-	// deleted, because the help text says "you will be asked to confirm".
-	confirmCall := regexp.MustCompile(`(?i)\b(\w*confirm\w*)\(`)
+	// BOTH halves of the question follow helpers, and they have to. A RunE that
+	// calls neither the destructive client method nor the gate by name is the
+	// normal shape once a command grows past a few lines — `notes update` reaches
+	// ConvertNoteToEncrypted through writeNoteUpdate and its confirmation through
+	// prepareNoteMove, and neither name appears in its RunE at all. Scanning only
+	// the literal RunE text let that command destroy a note's whole version
+	// history without ever entering this check.
+	//
+	// Names are taken from CALL POSITION rather than by matching the word
+	// "confirm", and then resolved against real package functions. Prose cannot
+	// survive that: help text has no call parens, and an identifier that is not a
+	// package-level function reaches nothing.
 	bodies := packageFuncBodies(t)
+	reaches := irreversibleReach(t)
 
 	for _, block := range cobraCommandBlocks(t) {
+		called := []string{}
+		for _, m := range callName.FindAllStringSubmatch(block.runE, -1) {
+			called = append(called, m[1])
+		}
+
 		call := ""
 		for _, c := range irreversibleClientCalls {
-			if strings.Contains(block.runE, c) {
+			found := strings.Contains(block.runE, c)
+			for _, name := range called {
+				if found {
+					break
+				}
+				found = reaches[name][c]
+			}
+			if found {
 				call = strings.TrimSuffix(c, "(")
 				break
 			}
@@ -269,8 +289,8 @@ func TestEveryIrreversibleCommandAsksFirst(t *testing.T) {
 			continue
 		}
 		gated := false
-		for _, m := range confirmCall.FindAllStringSubmatch(block.runE, -1) {
-			if reachesConfirmDestructive(m[1], bodies, map[string]bool{}) {
+		for _, name := range called {
+			if reachesConfirmDestructive(name, bodies, map[string]bool{}) {
 				gated = true
 				break
 			}
@@ -280,6 +300,74 @@ func TestEveryIrreversibleCommandAsksFirst(t *testing.T) {
 				block.varName, block.use, call)
 		}
 	}
+}
+
+// callName matches an identifier in call position. It is package-level because
+// the walks below run it over every function body in the package, and compiling
+// it per frame would dominate their cost.
+var callName = regexp.MustCompile(`\b(\w+)\(`)
+
+// irreversibleReach is the reachability map the guard below asks its questions
+// of, built in one place so a test can assert what went into it. Methods are
+// part of the input, and that is the whole reason this is not inlined: wiring
+// the closure back to functions alone would silently reopen the blind spot the
+// method scan exists to close.
+func irreversibleReach(t *testing.T) map[string]map[string]bool {
+	t.Helper()
+	return irreversibleCallClosure(packageCallableBodies(t, packageFuncBodies(t)))
+}
+
+// irreversibleCallClosure maps every package function to the irreversible client
+// calls it can reach — its own body's, plus everything its callees can reach,
+// however many helpers deep. It is the mirror image of what
+// reachesConfirmDestructive does for the gate, and exists for the same reason: a
+// destructive call hidden in a helper is exactly as invisible to a literal text
+// scan as a confirmation hidden in one.
+//
+// It is a single fixed point over the whole call graph because the question is
+// asked for every command against every destructive call: resolving each pair by
+// its own walk repeats the same traversals O(commands x calls) times, and this
+// check runs in every CI job.
+//
+// METHODS COUNT HERE, and they do not for the gate. An unresolvable name reaches
+// no confirmation, which makes a command look ungated and fails the test — safe.
+// The same blind spot on this side makes a command look harmless, so a
+// destructive call moved into a method would leave the gate deletable with
+// nothing failing. Both are indexed by bare name, and a name shared by a
+// function and a method merges their bodies: an over-approximation, which on
+// this side means asking too often rather than missing a destroyed history.
+func irreversibleCallClosure(bodies map[string]string) map[string]map[string]bool {
+	callees := map[string][]string{}
+	reaches := map[string]map[string]bool{}
+
+	for name, body := range bodies {
+		reaches[name] = map[string]bool{}
+		for _, c := range irreversibleClientCalls {
+			if strings.Contains(body, c) {
+				reaches[name][c] = true
+			}
+		}
+		for _, m := range callName.FindAllStringSubmatch(body, -1) {
+			callees[name] = append(callees[name], m[1])
+		}
+	}
+
+	// Propagate along call edges until nothing new appears. Cycles terminate on
+	// their own: a round that adds nothing is the last one.
+	for changed := true; changed; {
+		changed = false
+		for name, called := range callees {
+			for _, callee := range called {
+				for c := range reaches[callee] {
+					if !reaches[name][c] {
+						reaches[name][c] = true
+						changed = true
+					}
+				}
+			}
+		}
+	}
+	return reaches
 }
 
 // reachesConfirmDestructive reports whether calling name eventually reaches the
@@ -299,12 +387,70 @@ func reachesConfirmDestructive(name string, bodies map[string]string, seen map[s
 	if !ok {
 		return false
 	}
-	for _, m := range regexp.MustCompile(`\b(\w+)\(`).FindAllStringSubmatch(body, -1) {
+	for _, m := range callName.FindAllStringSubmatch(body, -1) {
 		if reachesConfirmDestructive(m[1], bodies, seen) {
 			return true
 		}
 	}
 	return false
+}
+
+// packageCallableBodies is packageFuncBodies plus every METHOD body, keyed by
+// method name, for the destructive-call closure to walk.
+//
+// Bodies are concatenated rather than replaced when a method and a function
+// share a name. The closure only ever asks "can this reach a destructive call",
+// so blending two bodies can over-report and never under-report — and
+// over-reporting here means a command is asked to prove it confirms, which is
+// the answer this check should default to.
+func packageCallableBodies(t *testing.T, funcs map[string]string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for name, body := range funcs {
+		out[name] = body
+	}
+	for name, body := range packageMethodBodies(t) {
+		out[name] += "\n" + body
+	}
+	return out
+}
+
+// packageMethodBodies collects method bodies keyed by the method's own name,
+// receiver discarded.
+func packageMethodBodies(t *testing.T) map[string]string {
+	t.Helper()
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := regexp.MustCompile(`(?m)^func \([^)]+\) (\w+)\(`)
+	nextDecl := regexp.MustCompile(`(?m)^(var|func) `)
+
+	out := map[string]string{}
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(src)
+		for _, m := range marker.FindAllStringSubmatchIndex(text, -1) {
+			rest := text[m[1]:]
+			end := len(rest)
+			if next := nextDecl.FindStringIndex(rest); next != nil {
+				end = next[0]
+			}
+			out[text[m[2]:m[3]]] += "\n" + rest[:end]
+		}
+	}
+	// The package is written in free functions, so this is a handful, not a
+	// census. It is a tripwire for the scan regressing to zero, nothing more.
+	if len(out) < 3 {
+		t.Fatalf("only found %d methods in the sources; the scan is broken, so the closure below proves less than it claims", len(out))
+	}
+	return out
 }
 
 // packageFuncBodies returns every package-level function in the command sources,
@@ -476,5 +622,60 @@ func TestEveryConfirmationRefusesAWrongAnswer(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestTheClosureSeesMethods pins the half of the scan that has no destructive
+// call to exercise it today.
+//
+// Nothing in cmd/ currently reaches an irreversible client call through a
+// method, so the edge the closure walks is real but unexercised — and if the
+// method scan or its wiring regressed, TestEveryIrreversibleCommandAsksFirst
+// would keep passing while a call moved behind a receiver became invisible to
+// it. The split is asserted in both directions, because it is deliberate: the
+// gate half must NOT see methods, where an unresolvable name is what makes an
+// ungated command fail.
+func TestTheClosureSeesMethods(t *testing.T) {
+	funcs := packageFuncBodies(t)
+	callable := packageCallableBodies(t, funcs)
+
+	// The map the guard actually consults, not just the scan behind it — wiring
+	// it back to functions alone is the cheapest way to undo this.
+	if _, ok := irreversibleReach(t)["announce"]; !ok {
+		t.Error("the guard's reachability map has no methods in it, so a destructive call behind a receiver reaches nothing")
+	}
+
+	// A method that exists for its side effects on the sealed-move path, so it is
+	// the natural one to notice going missing.
+	const method, marker = "announce", "printHistoryCaveat("
+
+	if body, ok := funcs[method]; ok && strings.Contains(body, marker) {
+		t.Errorf("packageFuncBodies has started indexing methods; the gate half relies on an unresolvable name failing closed")
+	}
+	body, ok := callable[method]
+	if !ok {
+		t.Fatalf("the method scan found no %q; a destructive call behind a receiver would be invisible to the guard", method)
+	}
+	if !strings.Contains(body, marker) {
+		t.Errorf("%q was indexed but its body did not come with it, so the closure walks nothing", method)
+	}
+}
+
+// TestTheClosurePropagatesThroughHelpers pins the fixed point itself on a graph
+// small enough to reason about: three frames and a cycle, none of which name a
+// destructive call except the last.
+func TestTheClosurePropagatesThroughHelpers(t *testing.T) {
+	reaches := irreversibleCallClosure(map[string]string{
+		"outer":     "middle(",
+		"middle":    "inner( outer(",
+		"inner":     "c.EmptyTrash(",
+		"unrelated": "printResult(",
+	})
+
+	if !reaches["outer"]["c.EmptyTrash("] {
+		t.Error("the closure stops before the third frame, so a destructive call two helpers deep is invisible")
+	}
+	if reaches["unrelated"]["c.EmptyTrash("] {
+		t.Error("the closure reports a call that is not reachable, which would demand confirmations of harmless commands")
 	}
 }

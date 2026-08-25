@@ -344,6 +344,14 @@ Write flags on `harbor notes create`: `--encrypt` (force, needs the passphrase),
 - `notes update` re-seals an already-encrypted note; it refuses to write plaintext
   into one without `HARBOR_PASSPHRASE`. `notes append` is unsupported on encrypted
   notes; encrypted notes can't be searched, shared, or exported.
+- **`notes update --notebook <default_encrypt notebook>` seals the note as part of
+  the move**, in one write, so it is never sitting there readable. It needs
+  `HARBOR_PASSPHRASE` or the move is refused with nothing written. Sealing
+  **hard-deletes every earlier version** of the note server-side, so the move asks
+  for confirmation when the note has any — which means `--json` and other
+  non-interactive runs are refused unless you pass `--yes`. A note whose only
+  stored version is its current contents loses nothing and moves silently.
+  Moving a note back OUT does not decrypt it; encryption is per-note.
 - Interop format (HRBK1 keystore + HRBC2 envelope) is documented in `crypto/README.md`.
 
 ---

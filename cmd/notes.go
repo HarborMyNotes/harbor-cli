@@ -198,7 +198,13 @@ BEFORE you move one:
 
 So a note moved into an encrypting notebook loses every earlier version of itself
 and is unreadable from then on, but any file attached to it is not. Both caveats
-are printed after the move.`,
+are printed after the move.
+
+Because that history does not come back, a move that seals ASKS FIRST — but only
+when the note actually has earlier versions to lose. A note with nothing older
+than its current contents is sealed silently, since there is nothing to destroy.
+Pass --yes to skip the question; in --json or non-interactive use it is required
+to get past it, but only on the moves that would actually destroy something.`,
 	Example: `  harbor notes update 9c2e... --title "Plan (final)"
   harbor notes update 9c2e... --file updated.md
   harbor notes update 9c2e... --content "# Rewritten" --keep-tasks
@@ -243,7 +249,7 @@ are printed after the move.`,
 		// by default SEALS the note, and the ciphertext rides out in this same PATCH
 		// rather than in a second one — so the note is never sitting in an encrypting
 		// notebook readable. A refusal here writes nothing and moves nothing.
-		move, err := prepareNoteMove(c, creds, args[0], body, note)
+		move, err := prepareNoteMove(c, creds, args[0], body, note, boolFlag(cmd, "yes"))
 		if err != nil {
 			return err
 		}
@@ -510,6 +516,7 @@ func init() {
 	notesUpdateCmd.Flags().String("notebook", "", "Move to this notebook id")
 	notesUpdateCmd.Flags().String("source-url", "", "Source URL attribute")
 	notesUpdateCmd.Flags().String("author", "", "Author attribute")
+	notesUpdateCmd.Flags().Bool("yes", false, "Skip the confirmation a sealed move asks when it would destroy the note's version history")
 	addContentFlags(notesUpdateCmd)
 	addTaskLossFlags(notesUpdateCmd)
 

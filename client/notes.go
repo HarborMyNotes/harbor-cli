@@ -37,7 +37,9 @@ func (c *Client) UpdateNote(id string, body map[string]any) ([]byte, error) {
 // disagrees with the note's new is_encrypted state, so this call discards the
 // note's entire version history — not a tombstone, and note_history does not
 // sync, so nothing is recoverable from another device. Callers must confirm
-// first; see notesEncryptConfirmation in cmd/notes_convert.go.
+// first, and both of them do: notesEncryptConfirmation in cmd/notes_convert.go
+// for `notes encrypt`, and sealedMoveConfirmation in cmd/notes_move.go for a
+// move into a notebook that encrypts by default.
 func (c *Client) ConvertNoteToEncrypted(id string, body map[string]any) ([]byte, error) {
 	return c.doPatch("/notes/"+id, body)
 }

@@ -188,6 +188,15 @@ harbor notes update "$NOTE_ID" --title "Q3 Plan (final)" --json
 harbor notes update "$NOTE_ID" --notebook "$ARCHIVE_NB" --json   # move to another notebook
 ```
 
+> **Moving into an encrypt-by-default notebook is not just a move.** It SEALS the
+> note in the same write, which needs `HARBOR_PASSPHRASE` (without it the move is
+> refused and nothing is written), and sealing **hard-deletes the note's version
+> history** on the server. If the note has earlier versions, the CLI asks first —
+> so in `--json` or any non-interactive run it refuses instead, naming `--yes`.
+> Pass `--yes` once you mean it. A note with nothing older than its current
+> contents moves silently. Check the destination with
+> `harbor notebooks get <id> --json` if you are not sure.
+
 > **Lossy-conversion warning:** `--format markdown` on read is *best-effort*. If a
 > note contains colors, `<harbor-embed>` attachments, alignment, intricate tables,
 > or **collapsed outline sections** (`data-collapsed`), **round-trip via HTML**
