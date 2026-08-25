@@ -2075,3 +2075,34 @@ func TestClearPollIgnoresASingle404(t *testing.T) {
 		t.Errorf("the poll did not reach the finished job:\n%s", data)
 	}
 }
+
+// TestClearPollNeedsThe404sBackToBack keeps "twice" meaning consecutive. A 404,
+// something else, then another 404 is an unstable edge, not the server
+// answering — and calling off an irreversible operation on that pattern reports
+// a clear stopped when it is still running.
+func TestClearPollNeedsThe404sBackToBack(t *testing.T) {
+	noClearSleep(t)
+	polls := 0
+	m := newAPIMock(t, map[string]mockReply{})
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		polls++
+		switch polls {
+		case 1, 3:
+			writeJSON(w, 404, json.RawMessage(`{"error":{"code":"not_found","message":"nope"}}`))
+		case 2:
+			writeJSON(w, 500, json.RawMessage(`{"error":{"code":"internal","message":"boom"}}`))
+		default:
+			writeJSON(w, 200, json.RawMessage(
+				`{"data":{"clear_job_id":"c1","status":"completed","started_at":1,"finished_at":2}}`))
+		}
+	}
+
+	data, err := accountPollClear(testClientFor(m), time.Millisecond, 5*time.Second)
+
+	if err != nil {
+		t.Fatalf("two 404s with a different failure between them called off a running clear: %v", err)
+	}
+	if !strings.Contains(string(data), `"completed"`) {
+		t.Errorf("the poll did not reach the finished job:\n%s", data)
+	}
+}

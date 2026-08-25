@@ -899,26 +899,28 @@ func accountPollClear(c *client.Client, interval, timeout time.Duration) ([]byte
 	missing := 0
 	for {
 		data, err := c.GetAccountClear()
-		if err != nil {
-			// The one failure that is an ANSWER: the server says there is no clear
-			// job. A POST created one moments ago, so waiting fifteen minutes to
-			// report a clear "still running" would be telling the user something
-			// untrue.
-			//
-			// TWICE, though. A 404 from a proxy or a load balancer mid-deploy
-			// decodes to the same code as the server's own answer, and a blip does
-			// not repeat two seconds later — so one is not enough to call an
-			// irreversible operation off.
-			var apiErr *client.APIError
-			if errors.As(err, &apiErr) && apiErr.Code == "not_found" {
-				missing++
-				if missing >= 2 {
-					return last, errors.New("the server has no record of this clear — nothing is running; check the account with 'harbor account clear-status' and run the clear again if it is still full")
-				}
+
+		// The one failure that is an ANSWER: the server says there is no clear
+		// job. A POST created one moments ago, so waiting fifteen minutes to
+		// report a clear "still running" would be telling the user something
+		// untrue.
+		//
+		// BACK TO BACK, though. A 404 from a proxy or a load balancer mid-deploy
+		// decodes to the same code as the server's own answer, and a blip does not
+		// repeat two seconds later — so one is not enough to call an irreversible
+		// operation off. Anything else in between, a 500 included, means the run
+		// of 404s was not one: an unstable edge is not the server answering.
+		var apiErr *client.APIError
+		if err != nil && errors.As(err, &apiErr) && apiErr.Code == "not_found" {
+			missing++
+			if missing >= 2 {
+				return last, errors.New("the server has no record of this clear — nothing is running; check the account with 'harbor account clear-status' and run the clear again if it is still full")
 			}
-		}
-		if err == nil {
+		} else {
 			missing = 0
+		}
+
+		if err == nil {
 			last = data
 			job := parseJSON(client.UnwrapData(data))
 			status := str(job, "status")
