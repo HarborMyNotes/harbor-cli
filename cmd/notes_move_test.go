@@ -72,6 +72,10 @@ type moveMock struct {
 	// rows exist, but the count is not in the response.
 	historyCursorPaged bool
 
+	// historyOmitUSN drops usn_at_snapshot from the row, so the count has nothing
+	// to compare the note's own usn against.
+	historyOmitUSN bool
+
 	// historyStatus, when non-zero, fails every history read with that status:
 	// the "could not establish whether there is anything to destroy" case.
 	historyStatus int
@@ -214,13 +218,17 @@ func (mm *moveMock) writeHistory(w http.ResponseWriter, noteID string) {
 		total++
 	}
 	if total > 0 {
-		rows = append(rows, map[string]any{
+		row := map[string]any{
 			"id":              "v0000000-0000-4000-8000-000000000000",
 			"usn_at_snapshot": newest,
 			"is_encrypted":    false,
 			"content_hash":    "deadbeefdeadbeef",
 			"created_at":      float64(1750000000000),
-		})
+		}
+		if mm.historyOmitUSN {
+			delete(row, "usn_at_snapshot")
+		}
+		rows = append(rows, row)
 	}
 	if mm.historyCursorPaged {
 		writeJSON(w, 200, map[string]any{
@@ -1974,6 +1982,37 @@ func TestSealedMoveRefusesInJSONMode(t *testing.T) {
 	}
 	if len(*asked) != 0 {
 		t.Errorf("--json prompted, which would corrupt the JSON on stdout: %v", *asked)
+	}
+	if got := patchesTo(mm, moveNoteID); got != 0 {
+		t.Errorf("the refusal still wrote %d times", got)
+	}
+}
+
+// TestAMissingUSNOnBothSidesDoesNotDiscountAVersion pins the comparison against
+// its own zero value.
+//
+// A missing key reads as zero, so a note with no usn and a snapshot with no
+// usn_at_snapshot compare EQUAL — and equal is what discounts a version as
+// "the one being kept". The note here has exactly one stored version and it is
+// genuinely older, so discounting it would take the count to zero and seal in
+// silence, which is the failure this whole confirmation exists to prevent.
+func TestAMissingUSNOnBothSidesDoesNotDiscountAVersion(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	note := movePlaintextNote()
+	delete(note, "usn")
+	mm := newMoveMock(t, moveNotebooks(), note)
+	mm.historyOmitUSN = true
+	// "no", so a prompt that never came leaves the move to succeed and fail the
+	// assertions rather than passing unnoticed.
+	asked := answerPrompt(t, "no")
+
+	_, err := runCLI(t, mm.m, "notes", "update", moveNoteID, "--notebook", nbLocked)
+
+	if len(*asked) != 1 {
+		t.Fatalf("the move asked %d times, want one — an unknown usn was read as a match and discounted the only version there was", len(*asked))
+	}
+	if err == nil {
+		t.Fatal("answering no still moved the note")
 	}
 	if got := patchesTo(mm, moveNoteID); got != 0 {
 		t.Errorf("the refusal still wrote %d times", got)

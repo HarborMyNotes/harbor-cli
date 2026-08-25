@@ -263,7 +263,7 @@ func TestEveryIrreversibleCommandAsksFirst(t *testing.T) {
 	// survive that: help text has no call parens, and an identifier that is not a
 	// package-level function reaches nothing.
 	bodies := packageFuncBodies(t)
-	reaches := irreversibleCallClosure(packageCallableBodies(t, bodies))
+	reaches := irreversibleReach(t)
 
 	for _, block := range cobraCommandBlocks(t) {
 		called := []string{}
@@ -306,6 +306,16 @@ func TestEveryIrreversibleCommandAsksFirst(t *testing.T) {
 // the walks below run it over every function body in the package, and compiling
 // it per frame would dominate their cost.
 var callName = regexp.MustCompile(`\b(\w+)\(`)
+
+// irreversibleReach is the reachability map the guard below asks its questions
+// of, built in one place so a test can assert what went into it. Methods are
+// part of the input, and that is the whole reason this is not inlined: wiring
+// the closure back to functions alone would silently reopen the blind spot the
+// method scan exists to close.
+func irreversibleReach(t *testing.T) map[string]map[string]bool {
+	t.Helper()
+	return irreversibleCallClosure(packageCallableBodies(t, packageFuncBodies(t)))
+}
 
 // irreversibleCallClosure maps every package function to the irreversible client
 // calls it can reach — its own body's, plus everything its callees can reach,
@@ -385,10 +395,6 @@ func reachesConfirmDestructive(name string, bodies map[string]string, seen map[s
 	return false
 }
 
-// packageFuncBodies returns every package-level function in the command sources,
-// keyed by name. It ends each body at the next top-level declaration for the same
-// reason cobraCommandBlocks does — brace counting walks straight off the end of a
-// function containing a raw string with braces in it.
 // packageCallableBodies is packageFuncBodies plus every METHOD body, keyed by
 // method name, for the destructive-call closure to walk.
 //
@@ -447,6 +453,10 @@ func packageMethodBodies(t *testing.T) map[string]string {
 	return out
 }
 
+// packageFuncBodies returns every package-level function in the command sources,
+// keyed by name. It ends each body at the next top-level declaration for the same
+// reason cobraCommandBlocks does — brace counting walks straight off the end of a
+// function containing a raw string with braces in it.
 func packageFuncBodies(t *testing.T) map[string]string {
 	t.Helper()
 	files, err := filepath.Glob("*.go")
@@ -612,5 +622,60 @@ func TestEveryConfirmationRefusesAWrongAnswer(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestTheClosureSeesMethods pins the half of the scan that has no destructive
+// call to exercise it today.
+//
+// Nothing in cmd/ currently reaches an irreversible client call through a
+// method, so the edge the closure walks is real but unexercised — and if the
+// method scan or its wiring regressed, TestEveryIrreversibleCommandAsksFirst
+// would keep passing while a call moved behind a receiver became invisible to
+// it. The split is asserted in both directions, because it is deliberate: the
+// gate half must NOT see methods, where an unresolvable name is what makes an
+// ungated command fail.
+func TestTheClosureSeesMethods(t *testing.T) {
+	funcs := packageFuncBodies(t)
+	callable := packageCallableBodies(t, funcs)
+
+	// The map the guard actually consults, not just the scan behind it — wiring
+	// it back to functions alone is the cheapest way to undo this.
+	if _, ok := irreversibleReach(t)["announce"]; !ok {
+		t.Error("the guard's reachability map has no methods in it, so a destructive call behind a receiver reaches nothing")
+	}
+
+	// A method that exists for its side effects on the sealed-move path, so it is
+	// the natural one to notice going missing.
+	const method, marker = "announce", "printHistoryCaveat("
+
+	if body, ok := funcs[method]; ok && strings.Contains(body, marker) {
+		t.Errorf("packageFuncBodies has started indexing methods; the gate half relies on an unresolvable name failing closed")
+	}
+	body, ok := callable[method]
+	if !ok {
+		t.Fatalf("the method scan found no %q; a destructive call behind a receiver would be invisible to the guard", method)
+	}
+	if !strings.Contains(body, marker) {
+		t.Errorf("%q was indexed but its body did not come with it, so the closure walks nothing", method)
+	}
+}
+
+// TestTheClosurePropagatesThroughHelpers pins the fixed point itself on a graph
+// small enough to reason about: three frames and a cycle, none of which name a
+// destructive call except the last.
+func TestTheClosurePropagatesThroughHelpers(t *testing.T) {
+	reaches := irreversibleCallClosure(map[string]string{
+		"outer":     "middle(",
+		"middle":    "inner( outer(",
+		"inner":     "c.EmptyTrash(",
+		"unrelated": "printResult(",
+	})
+
+	if !reaches["outer"]["c.EmptyTrash("] {
+		t.Error("the closure stops before the third frame, so a destructive call two helpers deep is invisible")
+	}
+	if reaches["unrelated"]["c.EmptyTrash("] {
+		t.Error("the closure reports a call that is not reachable, which would demand confirmations of harmless commands")
 	}
 }
