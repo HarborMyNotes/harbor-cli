@@ -153,6 +153,7 @@ Run `harbor <command> --help` for full flags and examples on any command.
 | `harbor notes links <id>` | Outgoing links. |
 | `harbor notes backlinks <id>` | Incoming links. |
 | `harbor notes audit <id>` | Per-note change audit log. |
+| `harbor notes export <id>` | Export one note to a file: Markdown, or a ZIP when it has attachments (`--output`, `--zip`). |
 
 ### Tags
 | Command | Description |
@@ -212,7 +213,7 @@ See `harbor search --help`.
 | `harbor usage` | Usage against your plan's limits (notes, notebooks, tags, files, tasks; `∞` = unlimited). |
 | `harbor plan` / `harbor plan list` | Your current plan, and the plans on offer. Upgrading happens in the web app. |
 | `harbor support` | Contact Harbor support (category, subject, message, attachments). |
-| `harbor account export/exports/export-status/export-delete` | Data export: ENEX or HTML, whole account or one notebook, with `--wait` and `--download`. |
+| `harbor account export/exports/export-status/export-delete` | Data export: ENEX, HTML or Markdown, whole account or one notebook, with `--wait` and `--download`. |
 | `harbor account delete/cancel-delete` | Schedule (and cancel) account deletion. |
 | `harbor import enex <file>` / `harbor export enex` | Evernote ENEX interchange. The import uploads straight to storage in chunks (any size), then waits for the import to finish — `--no-wait` returns as soon as it is queued. |
 | `harbor status` | Server health (liveness, readiness, version). |

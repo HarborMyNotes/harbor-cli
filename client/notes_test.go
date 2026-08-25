@@ -5,6 +5,11 @@ package client
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -141,5 +146,75 @@ func TestConvertNoteToPlaintext(t *testing.T) {
 	}
 	if body["content_format"] != "html" {
 		t.Errorf("content_format = %v, want html", body["content_format"])
+	}
+}
+
+// TestExportNoteMarkdown pins the request the per-note export makes: the
+// endpoint carries the format in its own path, and zip is a query flag rather
+// than a second endpoint.
+func TestExportNoteMarkdown(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 200, "---\ntitle: \"Plan\"\n---\n\n# Plan\n")
+	defer srv.Close()
+
+	resp, err := testClient(srv.URL).ExportNoteMarkdown("n1", false)
+	if err != nil {
+		t.Fatalf("ExportNoteMarkdown error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if rec.Method != "GET" || rec.Path != "/notes/n1/export.md" {
+		t.Errorf("%s %s", rec.Method, rec.Path)
+	}
+	if rec.Query != "" {
+		t.Errorf("query = %q, want none — zip must not be sent unless asked for", rec.Query)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(raw), "# Plan") {
+		t.Errorf("raw body = %q", raw)
+	}
+}
+
+// TestExportNoteMarkdownZip pins the archive form, and that the caller can read
+// the headers that say which of the two shapes came back.
+func TestExportNoteMarkdownZip(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("zip"); got != "1" {
+			t.Errorf("zip = %q, want 1", got)
+		}
+		w.Header().Set("Content-Type", "application/zip")
+		w.Header().Set("Content-Disposition", `attachment; filename="Plan.zip"`)
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("PK\x03\x04"))
+	}))
+	defer srv.Close()
+
+	resp, err := testClient(srv.URL).ExportNoteMarkdown("n1", true)
+	if err != nil {
+		t.Fatalf("ExportNoteMarkdown error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// The header has to be readable BEFORE the body is drained — it is the only
+	// thing that says whether this is a .md or a .zip.
+	if got := resp.Header.Get("Content-Disposition"); got != `attachment; filename="Plan.zip"` {
+		t.Errorf("Content-Disposition = %q", got)
+	}
+}
+
+// TestExportNoteMarkdownEncrypted keeps the refusal a typed API error rather
+// than a body the caller has to sniff.
+func TestExportNoteMarkdownEncrypted(t *testing.T) {
+	srv := newTestServer(t, nil, 422, `{"error":{"code":"encrypted_not_exportable","message":"nope"}}`)
+	defer srv.Close()
+
+	resp, err := testClient(srv.URL).ExportNoteMarkdown("n1", false)
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("an encrypted note exported without complaint")
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "encrypted_not_exportable" {
+		t.Errorf("err = %v, want an APIError with code encrypted_not_exportable", err)
 	}
 }

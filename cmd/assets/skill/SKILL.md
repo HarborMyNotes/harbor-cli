@@ -157,6 +157,29 @@ harbor notes get "$NOTE_ID" --format html --json | jq -r '.content'
 harbor notes get "$NOTE_ID"
 ```
 
+### Save a note to a file
+
+`notes export` is the one that writes a **document**, and it is not the same job
+as reading a body:
+
+```bash
+harbor notes export "$NOTE_ID" --output note.md   # no attachments -> a .md
+harbor notes export "$NOTE_ID" --output .         # server names it; .md OR .zip
+harbor notes export "$NOTE_ID" --zip --output .   # always the archive
+harbor notes export "$NOTE_ID" --output -         # stream to stdout
+```
+
+The same command returns `text/markdown` for a note with no attachments and
+`application/zip` (the `.md` plus a `files/` directory) for one with them, so
+prefer `--output .` and let the server name the file rather than guessing an
+extension. It renders server-side, so it needs a network connection, and
+encrypted notes are refused.
+
+> **Do not use this to fetch a body to edit.** The exported file carries YAML
+> front matter and the title as a heading; writing it back with `notes update`
+> would put all of that INTO the note. Use `notes get --format markdown` for the
+> read-modify-write loop below.
+
 ### Edit an existing note — the read-modify-write pattern ⭐
 
 This is the single most important workflow. `notes update` **replaces** the whole
@@ -482,6 +505,7 @@ has copy-paste recipes and the full allowlist.
 |---|---|
 | Create a note | `harbor notes create --title … --stdin` |
 | Read a note | `harbor notes get <id> --format markdown --json` |
+| Save a note to a file | `harbor notes export <id> --output .` |
 | Edit a note (targeted) | read-modify-write → `harbor notes update <id> --file …` |
 | Add to the end | `harbor notes append <id> --content …` |
 | List / filter notes | `harbor notes list [--notebook …] [--tag …] --json` |

@@ -18,7 +18,7 @@ import (
 var notesCmd = &cobra.Command{
 	Use:     "notes",
 	Aliases: []string{"note", "n"},
-	Short:   "Manage notes (list, get, create, update, delete, append)",
+	Short:   "Manage notes (list, get, create, update, delete, append, export)",
 	GroupID: groupContent,
 	Long: `Create and manage notes. Bodies accept Markdown (default) or HTML via
 --format, supplied with --content, --file, or piped via --stdin — convenient
@@ -361,6 +361,96 @@ func notesConfirmPermanentDelete(yes bool) error {
 	return confirmDestructive(notesDeletePermanentConfirmation, jsonOutput, stdinIsInteractive(), yes, askLine)
 }
 
+// notesExportFormats are the per-note export kinds. Markdown is the only one
+// the endpoint renders today; the flag exists so adding another is a value here
+// rather than a new flag users have to learn.
+var notesExportFormats = []string{"markdown"}
+
+// notesExportFormat reads and validates --format against that list.
+func notesExportFormat(cmd *cobra.Command) (string, error) {
+	format := strings.ToLower(strings.TrimSpace(stringFlag(cmd, "format")))
+	if format == "" {
+		return "markdown", nil
+	}
+	for _, valid := range notesExportFormats {
+		if format == valid {
+			return format, nil
+		}
+	}
+	if len(notesExportFormats) == 1 {
+		return "", fmt.Errorf("--format must be %s", notesExportFormats[0])
+	}
+	return "", fmt.Errorf("--format must be one of %s", strings.Join(notesExportFormats, "|"))
+}
+
+// notesExportCmd writes one note to a file.
+//
+// This is the EXPORT, and `notes get --format markdown` is the read. They are
+// different jobs and neither replaces the other: get returns the note's body,
+// which is what a read-modify-write edit needs, while this returns a document —
+// YAML front matter, the title as a heading, and the attachments — which is
+// what a human wants on disk and would corrupt the note if written back.
+var notesExportCmd = &cobra.Command{
+	Use:   "export <id>",
+	Short: "Export one note to a Markdown file (or a ZIP, if it has attachments)",
+	Args:  cobra.ExactArgs(1),
+	Long: `Write one note to disk as Markdown.
+
+WHAT COMES BACK DEPENDS ON THE NOTE. A note with no attachments exports as a
+single .md file; a note with them exports as a .zip holding the .md plus a
+files/ directory, so the images still resolve when you open it. --zip forces the
+archive form either way, which is what a script wants when it would rather
+handle one shape than two. The name comes from the server, so --output . writes
+whichever it turned out to be, correctly named, into the current directory.
+
+The Markdown is rendered on the server, so this needs a network connection even
+for a note you have already read. There is one Markdown renderer in Harbor and
+it lives there; a second one in each client is how five clients end up
+disagreeing about the same note.
+
+Encrypted notes cannot be exported: the server stores only ciphertext for them
+and cannot render what it cannot read.
+
+This is not the way to fetch a body to edit. The file carries YAML front matter
+and the title as a heading, so writing it back with 'notes update' would put all
+of that INTO the note. Use 'harbor notes get <id> --format markdown' for that.`,
+	Example: `  harbor notes export 9c2e... --output note.md
+  harbor notes export 9c2e... --output .          # server's own filename, here
+  harbor notes export 9c2e... --zip --output bundle.zip
+  harbor notes export 9c2e... --output -          # stream to stdout`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		c, _, err := loadClientFromConfig()
+		if err != nil {
+			return err
+		}
+		if _, err := notesExportFormat(cmd); err != nil {
+			return err
+		}
+		out := stringFlag(cmd, "output")
+		if out == "" {
+			return errors.New("--output is required (use - for stdout, or a directory to take the server's filename)")
+		}
+
+		resp, err := c.ExportNoteMarkdown(args[0], boolFlag(cmd, "zip"))
+		if err != nil {
+			return mapNoteError(err)
+		}
+		defer resp.Body.Close()
+
+		// Read the header BEFORE draining the body: the same endpoint answers
+		// .md or .zip, and the response is the only thing that knows which.
+		path := accountExportOutputPath(out, filenameFromContentDisposition(resp.Header.Get("Content-Disposition")))
+		n, err := writeOutput(path, resp.Body)
+		if err != nil {
+			return err
+		}
+		if path != "-" {
+			fmt.Printf("Wrote %s to %s\n", bytesHuman(float64(n)), path)
+		}
+		return nil
+	},
+}
+
 // mapNoteError gives friendly messages for note-specific codes.
 func mapNoteError(err error) error {
 	var apiErr *client.APIError
@@ -372,6 +462,8 @@ func mapNoteError(err error) error {
 			return errors.New("the note body is too large (max 5 MiB)")
 		case "append_not_supported_encrypted":
 			return errors.New("cannot append to an encrypted note")
+		case "encrypted_not_exportable":
+			return errors.New("encrypted notes cannot be exported as Markdown — the server stores only ciphertext for them, so it cannot render one. Decrypt the note first ('harbor notes decrypt <id>') if you want a file of it")
 		case "cannot_move_plaintext_into_encrypted":
 			// The server's own backstop on this CLI's move guard. Nothing was written
 			// and no usn was spent, so re-running is always the fix — but WHY the local
@@ -525,6 +617,10 @@ func init() {
 	notesDeleteCmd.Flags().Bool("permanent", false, "Expunge permanently instead of trashing")
 	notesDeleteCmd.Flags().Bool("yes", false, "Skip the --permanent confirmation prompt (required in --json/non-interactive use)")
 
-	notesCmd.AddCommand(notesListCmd, notesGetCmd, notesCreateCmd, notesUpdateCmd, notesAppendCmd, notesDeleteCmd)
+	notesExportCmd.Flags().StringP("output", "o", "", "Where to write it: a path, a directory to take the server's filename, or - for stdout (required)")
+	notesExportCmd.Flags().String("format", "markdown", "Export format")
+	notesExportCmd.Flags().Bool("zip", false, "Always produce a ZIP, even when the note has no attachments")
+
+	notesCmd.AddCommand(notesListCmd, notesGetCmd, notesCreateCmd, notesUpdateCmd, notesAppendCmd, notesDeleteCmd, notesExportCmd)
 	rootCmd.AddCommand(notesCmd)
 }

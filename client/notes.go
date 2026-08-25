@@ -3,6 +3,8 @@
 
 package client
 
+import "net/http"
+
 // ListNotes returns the user's notes (collection envelope). Accepts limit,
 // offset, order, notebook_id, tag, updated_since, deleted, and fields params.
 func (c *Client) ListNotes(params map[string]string) ([]byte, error) {
@@ -73,4 +75,29 @@ func (c *Client) DeleteNote(id string, permanent bool) ([]byte, error) {
 		params["permanent"] = "true"
 	}
 	return c.doDelete("/notes/"+id, params)
+}
+
+// ExportNoteMarkdown streams one note as a Markdown export.
+//
+// TWO CONTENT TYPES COME BACK FROM THE ONE ENDPOINT, by design: text/markdown
+// for a note with no attachments, application/zip for one that has them (the
+// .md plus a files/ directory). zip forces the archive form for a caller that
+// would rather handle one shape than two. So it returns the live *http.Response
+// — the caller MUST close the body, and must take the filename from
+// Content-Disposition rather than inferring an extension from the request.
+//
+// The Markdown itself is rendered on the SERVER. There is deliberately no
+// client-side HTML-to-Markdown converter anywhere in Harbor: a second renderer
+// is a second set of answers about the same note, and the clients would drift
+// apart within a year. The cost is that this needs a network connection even
+// where a note is already held locally.
+//
+// An encrypted note is refused with encrypted_not_exportable. The server holds
+// only ciphertext for it and cannot render what it cannot read.
+func (c *Client) ExportNoteMarkdown(id string, zip bool) (*http.Response, error) {
+	params := map[string]string{}
+	if zip {
+		params["zip"] = "1"
+	}
+	return c.doGetRaw("/notes/"+id+"/export.md", params)
 }

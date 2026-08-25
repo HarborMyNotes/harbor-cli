@@ -4,6 +4,9 @@
 package cmd
 
 import (
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -191,5 +194,151 @@ func TestNotesDeleteWithoutPermanentNeverAsks(t *testing.T) {
 	}
 	if got := m.queryOf(t, route).Get("permanent"); got == "true" {
 		t.Errorf("a plain delete must not send permanent=true")
+	}
+}
+
+// ===========================================================================
+// notes export — one note to a file
+// ===========================================================================
+
+// noteExportMock serves the per-note export endpoint the way the real one does:
+// the SAME url answers with two different content types, and only the
+// Content-Disposition header says which.
+func noteExportMock(t *testing.T, filename, contentType, body string) *apiMock {
+	t.Helper()
+	m := newAPIMock(t, map[string]mockReply{})
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(body))
+	}
+	return m
+}
+
+// TestNotesExportWritesTheFile is the ordinary case: a note with no
+// attachments lands as one .md at the path asked for.
+func TestNotesExportWritesTheFile(t *testing.T) {
+	m := noteExportMock(t, "Plan.md", "text/markdown; charset=utf-8", "---\ntitle: \"Plan\"\n---\n\n# Plan\n")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "note.md")
+
+	out, err := runCLI(t, m, "notes", "export", "n1", "--output", path)
+	if err != nil {
+		t.Fatalf("notes export: %v", err)
+	}
+
+	got, rerr := os.ReadFile(path)
+	if rerr != nil {
+		t.Fatalf("nothing was written: %v", rerr)
+	}
+	if !strings.Contains(string(got), "# Plan") {
+		t.Errorf("the file does not hold the export: %q", got)
+	}
+	if !strings.Contains(out, "Wrote") || !strings.Contains(out, path) {
+		t.Errorf("the command never said where it put the file:\n%s", out)
+	}
+}
+
+// TestNotesExportIntoADirectoryTakesTheServersName is the reason the header is
+// read before the body. The same command can produce a .md or a .zip, so the
+// caller cannot name the file and the server's own name is the only correct one.
+func TestNotesExportIntoADirectoryTakesTheServersName(t *testing.T) {
+	m := noteExportMock(t, "Quarterly plan.zip", "application/zip", "PK\x03\x04")
+	dir := t.TempDir()
+
+	if _, err := runCLI(t, m, "notes", "export", "n1", "--output", dir); err != nil {
+		t.Fatalf("notes export: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, "Quarterly plan.zip")); err != nil {
+		entries, _ := os.ReadDir(dir)
+		names := []string{}
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("the archive was not written under the server's name; the directory holds %v", names)
+	}
+}
+
+// TestNotesExportToStdoutWritesOnlyTheDocument keeps -o - pipeable. A "Wrote …"
+// line on stdout would land inside the file the user is redirecting.
+func TestNotesExportToStdoutWritesOnlyTheDocument(t *testing.T) {
+	const doc = "---\ntitle: \"Plan\"\n---\n\n# Plan\n"
+	m := noteExportMock(t, "Plan.md", "text/markdown; charset=utf-8", doc)
+
+	out, err := runCLI(t, m, "notes", "export", "n1", "--output", "-")
+	if err != nil {
+		t.Fatalf("notes export -o -: %v", err)
+	}
+
+	if out != doc {
+		t.Errorf("stdout carried something other than the document verbatim:\n%q", out)
+	}
+}
+
+// TestNotesExportRequiresAnOutput refuses rather than guessing. The two shapes
+// this command can return have different extensions, so a default filename
+// would be wrong half the time.
+func TestNotesExportRequiresAnOutput(t *testing.T) {
+	m := noteExportMock(t, "Plan.md", "text/markdown; charset=utf-8", "# Plan\n")
+
+	_, err := runCLI(t, m, "notes", "export", "n1")
+
+	if err == nil {
+		t.Fatal("notes export ran with nowhere to put the result")
+	}
+	if !strings.Contains(err.Error(), "--output") {
+		t.Errorf("the refusal never names the missing flag:\n%s", err)
+	}
+}
+
+// TestNotesExportZipIsAskedForOnTheWire pins --zip to the query parameter, not
+// to anything the CLI decides for itself.
+func TestNotesExportZipIsAskedForOnTheWire(t *testing.T) {
+	m := noteExportMock(t, "Plan.zip", "application/zip", "PK\x03\x04")
+	dir := t.TempDir()
+
+	if _, err := runCLI(t, m, "notes", "export", "n1", "--zip", "--output", dir); err != nil {
+		t.Fatalf("notes export --zip: %v", err)
+	}
+
+	if got := m.queryOf(t, "GET /api/v1/notes/n1/export.md").Get("zip"); got != "1" {
+		t.Errorf("zip = %q on the wire, want 1", got)
+	}
+}
+
+// TestNotesExportFormatIsValidatedLocally spends no round trip on a value the
+// endpoint does not have.
+func TestNotesExportFormatIsValidatedLocally(t *testing.T) {
+	m := noteExportMock(t, "Plan.md", "text/markdown; charset=utf-8", "# Plan\n")
+
+	_, err := runCLI(t, m, "notes", "export", "n1", "--format", "pdf", "--output", "-")
+
+	if err == nil {
+		t.Fatal("an unsupported --format was sent to the server")
+	}
+	if !strings.Contains(err.Error(), "markdown") {
+		t.Errorf("the refusal never says what is supported:\n%s", err)
+	}
+	for _, r := range m.requests {
+		if r.Method == http.MethodGet {
+			t.Errorf("a rejected --format still cost a request: %s %s", r.Method, r.Path)
+		}
+	}
+}
+
+// TestEncryptedNoteExportSaysWhy turns the API code into the sentence a person
+// can act on, and names the way through.
+func TestEncryptedNoteExportSaysWhy(t *testing.T) {
+	err := mapNoteError(apiErr("encrypted_not_exportable"))
+
+	if err == nil {
+		t.Fatal("the encrypted refusal was passed through as a raw API code")
+	}
+	for _, want := range []string{"encrypted", "notes decrypt"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the message never mentions %q:\n%s", want, err)
+		}
 	}
 }

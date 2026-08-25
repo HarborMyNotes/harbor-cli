@@ -31,17 +31,18 @@ var accountCmd = &cobra.Command{
 	GroupID: groupAccount,
 	Long: `Whole-account operations.
 
-  export        start an export job (ENEX or HTML, whole account or one notebook)
+  export        start an export job (ENEX, HTML or Markdown, whole account or one notebook)
   exports       show what this account's export slots hold right now
   export-status poll an export job and download the ZIP when it completes
   export-delete delete an export's archive, freeing that format's slot
   delete        schedule account deletion after a grace period (destructive)
   cancel-delete cancel a pending deletion within the grace window
 
-You hold at most one live export PER FORMAT — one ENEX and one HTML — and
-scoping an export to a single notebook does not create a third slot. Exports run
-one at a time server-wide, so a new one may sit "queued" (waiting its turn)
-before it starts. A finished archive is kept for 72 hours, then deleted.
+You hold at most one live export PER FORMAT — one ENEX, one HTML and one
+Markdown — and scoping an export to a single notebook does not create a slot of
+its own. Exports run one at a time server-wide, so a new one may sit "queued"
+(waiting its turn) before it starts. A finished archive is kept for 72 hours,
+then deleted.
 
 Deletion is a soft-delete: a confirmed request records a purge date and revokes
 your other sessions, but destroys nothing until the grace window elapses — you
@@ -53,7 +54,7 @@ can cancel until then.`,
 // instead of starting a second one; a completed, unexpired one is refused.
 var accountExportCmd = &cobra.Command{
 	Use:   "export",
-	Short: "Start a data export (ENEX or HTML, whole account or one notebook)",
+	Short: "Start a data export (ENEX, HTML or Markdown, whole account or one notebook)",
 	Args:  cobra.NoArgs,
 	Long: `Start an asynchronous export job.
 
@@ -61,13 +62,22 @@ var accountExportCmd = &cobra.Command{
                   every attachment's original bytes, and a manifest.json
   --format html   a ZIP holding a self-contained, browsable offline website —
                   unzip it and open index.html, no server and no internet
+  --format markdown
+                  a ZIP holding one .md file per note, in folders matching your
+                  notebooks, with your attachments alongside — opens in
+                  Obsidian, Bear, iA Writer or any plain-text editor, and Harbor
+                  can import it back
+
+All three include your attachments and an index of everything inside, and all
+three skip encrypted notes: the server holds only ciphertext for those, so it
+cannot render them. The count is reported with the finished export.
 
 With --notebook the export covers a single notebook instead of the whole
-account, for either format. It is still an ordinary export job, so it gets the
+account, for any format. It is still an ordinary export job, so it gets the
 same progress, ready email, 72-hour retention, delete action and export slot.
 
 You hold one export per format. Starting a second of the SAME format while one
-is ready is refused — delete it or wait for it to expire; the other format is
+is ready is refused — delete it or wait for it to expire; the other formats are
 unaffected. Because exports run one at a time server-wide, a new job may report
 "queued" (waiting its turn) for a while before it starts building.
 
@@ -79,6 +89,7 @@ Poll it with 'harbor account export-status <id>', or pass --wait to poll here
 until it finishes. --download implies --wait and saves the ZIP straight to disk.`,
 	Example: `  harbor account export
   harbor account export --format html
+  harbor account export --format markdown
   harbor account export --format enex --notebook 5b1f2c9a
   harbor account export --wait --download harbor-export.zip
   harbor account export --json`,
@@ -359,7 +370,7 @@ const accountExportQueueSlipNote = "Another export moved ahead of yours — the 
 // accountExportFormats are the archive kinds the server accepts. The CLI checks
 // the value itself so a typo costs a round-trip and a validation error rather
 // than an export of the wrong thing.
-var accountExportFormats = []string{"enex", "html"}
+var accountExportFormats = []string{"enex", "html", "markdown"}
 
 // accountExportTerminalStates are the statuses an export never moves out of.
 // completed/failed are the job's own outcomes; expired/deleted are terminal
@@ -1009,19 +1020,30 @@ func accountExportFormatLabel(format string) string {
 		return "HTML"
 	case "enex", "":
 		return "ENEX"
+	case "markdown":
+		return "Markdown"
 	default:
 		return format
 	}
 }
 
-// accountArticle picks "a" or "an" for a format label. The labels are acronyms,
-// so what decides it is the sound of the first LETTER'S NAME — "an HTML" (aitch),
-// "an ENEX" (ee) — not merely whether that letter is a vowel.
+// accountArticle picks "a" or "an" for a format label.
+//
+// Which rule applies depends on how the label is READ. An acronym is spelled
+// out, so the sound of the first LETTER'S NAME decides it — "an HTML" (aitch),
+// "an ENEX" (ee) — and that is not the same question as whether the letter is a
+// vowel. A label that is an ordinary word is read as a word, where it is: "a
+// Markdown". Applying the acronym rule to a word yields "an Markdown", so the
+// two are told apart by whether the label is all capitals.
 func accountArticle(label string) string {
 	if label == "" {
 		return "a"
 	}
-	if strings.ContainsRune("AEFHILMNORSX", rune(strings.ToUpper(label)[0])) {
+	upper := strings.ToUpper(label)
+	if label == upper && strings.ContainsRune("AEFHILMNORSX", rune(upper[0])) {
+		return "an"
+	}
+	if label != upper && strings.ContainsRune("AEIOU", rune(upper[0])) {
 		return "an"
 	}
 	return "a"
