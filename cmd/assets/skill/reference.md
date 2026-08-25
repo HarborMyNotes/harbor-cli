@@ -208,13 +208,35 @@ Reusable note starting points. Built-in (system) templates are read-only.
 |---|---|---|
 | `harbor templates list` | List | `--include-system` (default true), `--include-deleted`, paging |
 | `harbor templates get <id>` | One template | `--include-deleted` |
-| `harbor templates create` | Create | `--name` (req), `--content/--file/--stdin`, `--format` |
-| `harbor templates update <id>` | Update (user templates only) | `--name`, content flags |
+| `harbor templates create` | Create | `--name` (req), `--content/--file/--stdin`, `--format`, `--notebook`, `--tags id1,id2` |
+| `harbor templates update <id>` | Update (user templates only) | `--name`, content flags, `--notebook`, `--tags` |
 | `harbor templates delete <id>` | Delete (user templates only) | |
 | `harbor templates apply <id>` | New note from template | `--title`, `--notebook`, `--tags id1,id2` |
 
-Content is copied verbatim (no token expansion). Applying into an
-encrypt-by-default notebook is rejected.
+A template can carry a **default notebook** (`--notebook`) and a **set of tags**
+(`--tags`), which a note made from it inherits. On `update`, both follow the
+partial-update rule: omit the flag to preserve the stored value, pass an empty
+string to clear it. The notebook must be a live, non-encrypt-by-default notebook
+— a plaintext template can never be materialized into an encrypted notebook.
+
+`--tags` on **apply REPLACES** the template's tags rather than adding to them:
+omit it and the note inherits the template's (stale ids are skipped for you),
+pass a list and the note gets exactly that list, pass an empty string for none.
+A sent list is validated strictly, so never echo a template's stored `tag_ids`
+back without first filtering them against `harbor tags list` — one deleted tag
+fails the whole apply.
+
+`{{date}}`-style variables in a template are expanded **server-side at apply
+time**, so `harbor templates apply` returns a note that is already filled in.
+The CLI does no expansion of its own. Full token list: `docs/template-variables.md`
+in `app.harbor.my`.
+
+`harbor templates get` prints the default notebook and tags as **ids**; `--json`
+carries `notebook_id` and `tag_ids` verbatim. Apply's response also carries a
+`notice` — server-owned wording, printed verbatim — which says the template's
+notebook was gone or encrypted so the note was filed in your default instead.
+
+Applying into an encrypt-by-default notebook is rejected.
 
 ---
 
