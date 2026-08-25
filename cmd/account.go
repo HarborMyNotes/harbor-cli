@@ -970,11 +970,10 @@ and only then reports success. Pass --no-wait to be handed the job instead.`,
 			fmt.Fprintln(os.Stderr, dim("could not remove the cached keystore: "+cerr.Error()))
 		}
 
-		if status := str(parseJSON(client.UnwrapData(data)), "status"); status == "failed" {
-			printResult(data, displayClearJob)
+		printResult(data, displayClearJob)
+		if str(parseJSON(client.UnwrapData(data)), "status") == "failed" {
 			return errClearFailed
 		}
-		printResult(data, displayClearJob)
 		return nil
 	},
 }
