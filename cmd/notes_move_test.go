@@ -68,6 +68,10 @@ type moveMock struct {
 	// ones — a note whose latest write was never snapshotted.
 	historyNoCurrentSnapshot bool
 
+	// historyCursorPaged answers with a paging block that carries no total —
+	// rows exist, but the count is not in the response.
+	historyCursorPaged bool
+
 	// historyStatus, when non-zero, fails every history read with that status:
 	// the "could not establish whether there is anything to destroy" case.
 	historyStatus int
@@ -217,6 +221,15 @@ func (mm *moveMock) writeHistory(w http.ResponseWriter, noteID string) {
 			"content_hash":    "deadbeefdeadbeef",
 			"created_at":      float64(1750000000000),
 		})
+	}
+	if mm.historyCursorPaged {
+		writeJSON(w, 200, map[string]any{
+			"data": rows,
+			"paging": map[string]any{
+				"limit": 1, "next_cursor": "c2", "has_more": true,
+			},
+		})
+		return
 	}
 	writeJSON(w, 200, map[string]any{
 		"data": rows,
@@ -1917,5 +1930,52 @@ func TestOnlySealingMovesReadHistory(t *testing.T) {
 				t.Errorf("spent %d history reads on a move that destroys nothing", got)
 			}
 		})
+	}
+}
+
+// TestAHistoryWithNoTotalIsNotAnEmptyHistory guards the one answer this count
+// must never give by default. A paging block without a total is a paging MODE
+// this code cannot read, not a note with nothing to lose, and reading it as zero
+// would seal silently over a history of any size.
+func TestAHistoryWithNoTotalIsNotAnEmptyHistory(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	mm := newMoveMock(t, moveNotebooks(), movePlaintextNote())
+	mm.historyCursorPaged = true
+	pipedStdin(t)
+
+	_, err := runCLI(t, mm.m, "notes", "update", moveNoteID, "--notebook", nbLocked)
+
+	if err == nil {
+		t.Fatal("a history whose size could not be read was treated as an empty one, and the move destroyed it unasked")
+	}
+	if got := patchesTo(mm, moveNoteID); got != 0 {
+		t.Errorf("the refusal still wrote %d times", got)
+	}
+}
+
+// TestSealedMoveRefusesInJSONMode covers the other unattended shape. --json is
+// not the same condition as a piped stdin — a person can run it at a terminal —
+// and it must refuse there too, because a prompt would corrupt the document on
+// stdout that the flag exists to produce.
+func TestSealedMoveRefusesInJSONMode(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	mm := newMoveMock(t, moveNotebooks(), movePlaintextNote())
+	mm.historyEarlier = 3
+	// A live terminal, so only --json can be what refuses.
+	asked := answerPrompt(t, "yes")
+
+	_, err := runCLI(t, mm.m, "notes", "update", moveNoteID, "--notebook", nbLocked, "--json")
+
+	if err == nil {
+		t.Fatal("--json destroyed the note's version history without asking")
+	}
+	if !strings.Contains(err.Error(), "--yes") {
+		t.Errorf("the refusal never names the flag that would have worked:\n%s", err)
+	}
+	if len(*asked) != 0 {
+		t.Errorf("--json prompted, which would corrupt the JSON on stdout: %v", *asked)
+	}
+	if got := patchesTo(mm, moveNoteID); got != 0 {
+		t.Errorf("the refusal still wrote %d times", got)
 	}
 }

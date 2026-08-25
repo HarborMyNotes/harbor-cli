@@ -202,12 +202,12 @@ func mergeSealIntoUpdate(body, seal map[string]any) {
 // Asking before the history goes
 // ===========================================================================
 //
-// Sealing a note hard-deletes every earlier version of it, and `notes encrypt`
-// asks before it does that. This path destroys the same rows without asking, and
-// it is the WORSE of the two to leave silent: the user ran a command to move a
-// note. The encryption is a property of the destination notebook and the history
-// deletion is a consequence of the encryption, so nothing they typed mentions
-// versions at all. `notes encrypt` at least announces its own subject.
+// Sealing a note hard-deletes every earlier version of it, so this path asks
+// before it seals — the same question `notes encrypt` asks, about the same rows.
+// It matters more here than there: the user ran a command to MOVE a note. The
+// encryption is a property of the destination notebook and the history deletion
+// is a consequence of the encryption, so nothing they typed mentions versions at
+// all. `notes encrypt` at least announces its own subject.
 //
 // So it asks — but ONLY when there is history to lose. That qualifier is the
 // whole design. A prompt on every move into an encrypting notebook would fire
@@ -275,6 +275,14 @@ func sealedMoveHistoryCount(c *client.Client, noteID string, currentUSN float64)
 	}
 	total := int(p.Total)
 	if total == 0 {
+		// A collection that still offers more rows is not an empty history; it is
+		// a paging mode with no total in it (cursor mode carries next_cursor and
+		// has_more instead). Reading that as zero would seal silently over a
+		// history of any size, which is the one answer this function must never
+		// give by default.
+		if p.HasMore || p.NextCursor != "" {
+			return 0, false
+		}
 		return 0, true
 	}
 	items := client.CollectionItems(data)
@@ -283,7 +291,9 @@ func sealedMoveHistoryCount(c *client.Client, noteID string, currentUSN float64)
 		// current state, so count them all and let the user decide.
 		return total, true
 	}
-	if num(parseJSON(items[0]), "usn_at_snapshot") == currentUSN {
+	// currentUSN > 0 because a missing key reads as zero on both sides, and two
+	// absent usns comparing equal would discount a version that is really there.
+	if currentUSN > 0 && num(parseJSON(items[0]), "usn_at_snapshot") == currentUSN {
 		return total - 1, true
 	}
 	return total, true

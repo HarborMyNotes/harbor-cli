@@ -263,7 +263,7 @@ func TestEveryIrreversibleCommandAsksFirst(t *testing.T) {
 	// survive that: help text has no call parens, and an identifier that is not a
 	// package-level function reaches nothing.
 	bodies := packageFuncBodies(t)
-	reaches := irreversibleCallClosure(bodies)
+	reaches := irreversibleCallClosure(packageCallableBodies(t, bodies))
 
 	for _, block := range cobraCommandBlocks(t) {
 		called := []string{}
@@ -303,9 +303,8 @@ func TestEveryIrreversibleCommandAsksFirst(t *testing.T) {
 }
 
 // callName matches an identifier in call position. It is package-level because
-// the walks below run it over the transitive closure of every command's RunE,
-// and recompiling it per frame made this file's guard the slowest test in the
-// package by an order of magnitude.
+// the walks below run it over every function body in the package, and compiling
+// it per frame would dominate their cost.
 var callName = regexp.MustCompile(`\b(\w+)\(`)
 
 // irreversibleCallClosure maps every package function to the irreversible client
@@ -315,10 +314,18 @@ var callName = regexp.MustCompile(`\b(\w+)\(`)
 // destructive call hidden in a helper is exactly as invisible to a literal text
 // scan as a confirmation hidden in one.
 //
-// It is computed once, as a fixed point over the call graph, rather than by
-// re-walking the graph per function per target. The re-walking version answered
-// the same question and took twenty times as long, which on a check that runs in
-// every CI job is worth avoiding.
+// It is a single fixed point over the whole call graph because the question is
+// asked for every command against every destructive call: resolving each pair by
+// its own walk repeats the same traversals O(commands x calls) times, and this
+// check runs in every CI job.
+//
+// METHODS COUNT HERE, and they do not for the gate. An unresolvable name reaches
+// no confirmation, which makes a command look ungated and fails the test — safe.
+// The same blind spot on this side makes a command look harmless, so a
+// destructive call moved into a method would leave the gate deletable with
+// nothing failing. Both are indexed by bare name, and a name shared by a
+// function and a method merges their bodies: an over-approximation, which on
+// this side means asking too often rather than missing a destroyed history.
 func irreversibleCallClosure(bodies map[string]string) map[string]map[string]bool {
 	callees := map[string][]string{}
 	reaches := map[string]map[string]bool{}
@@ -382,6 +389,64 @@ func reachesConfirmDestructive(name string, bodies map[string]string, seen map[s
 // keyed by name. It ends each body at the next top-level declaration for the same
 // reason cobraCommandBlocks does — brace counting walks straight off the end of a
 // function containing a raw string with braces in it.
+// packageCallableBodies is packageFuncBodies plus every METHOD body, keyed by
+// method name, for the destructive-call closure to walk.
+//
+// Bodies are concatenated rather than replaced when a method and a function
+// share a name. The closure only ever asks "can this reach a destructive call",
+// so blending two bodies can over-report and never under-report — and
+// over-reporting here means a command is asked to prove it confirms, which is
+// the answer this check should default to.
+func packageCallableBodies(t *testing.T, funcs map[string]string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for name, body := range funcs {
+		out[name] = body
+	}
+	for name, body := range packageMethodBodies(t) {
+		out[name] += "\n" + body
+	}
+	return out
+}
+
+// packageMethodBodies collects method bodies keyed by the method's own name,
+// receiver discarded.
+func packageMethodBodies(t *testing.T) map[string]string {
+	t.Helper()
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := regexp.MustCompile(`(?m)^func \([^)]+\) (\w+)\(`)
+	nextDecl := regexp.MustCompile(`(?m)^(var|func) `)
+
+	out := map[string]string{}
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(src)
+		for _, m := range marker.FindAllStringSubmatchIndex(text, -1) {
+			rest := text[m[1]:]
+			end := len(rest)
+			if next := nextDecl.FindStringIndex(rest); next != nil {
+				end = next[0]
+			}
+			out[text[m[2]:m[3]]] += "\n" + rest[:end]
+		}
+	}
+	// The package is written in free functions, so this is a handful, not a
+	// census. It is a tripwire for the scan regressing to zero, nothing more.
+	if len(out) < 3 {
+		t.Fatalf("only found %d methods in the sources; the scan is broken, so the closure below proves less than it claims", len(out))
+	}
+	return out
+}
+
 func packageFuncBodies(t *testing.T) map[string]string {
 	t.Helper()
 	files, err := filepath.Glob("*.go")
