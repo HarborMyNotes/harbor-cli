@@ -75,6 +75,10 @@ func TestFilenameFromContentDisposition(t *testing.T) {
 		`attachment; filename*=UTF-8''Caf%C3%A9.md`:    "Café.md",
 		`attachment; filename="Plan.zip"; size=42`:     "Plan.zip",
 		`attachment`: "",
+		// Headers a strict parser rejects outright. The scan behind it still
+		// recovers a usable name, which is the whole reason it is kept.
+		`attachment; filename="Plan.md"; badparam`:     "Plan.md",
+		`attachment; filename="a.md"; filename="b.md"`: "a.md",
 	}
 	for in, want := range cases {
 		if got := filenameFromContentDisposition(in); got != want {
