@@ -105,6 +105,40 @@ func TestBytesHuman(t *testing.T) {
 	}
 }
 
+// TestLimitBytesHuman pins the upload-limit formatter apart from bytesHuman:
+// base-1024 with no trailing ".0", and an offending size that always rounds UP
+// so it can never print as the cap it broke.
+func TestLimitBytesHuman(t *testing.T) {
+	nearest := map[int64]string{
+		0:         "0 B",
+		512:       "512 B",
+		1024:      "1 KB",
+		1536:      "1.5 KB",
+		1048576:   "1 MB",
+		104857600: "100 MB",
+		115343360: "110 MB",
+	}
+	for in, want := range nearest {
+		if got := limitBytesHuman(in, false); got != want {
+			t.Errorf("limitBytesHuman(%d, false) = %q, want %q", in, got, want)
+		}
+	}
+
+	// One byte over a 100 MB cap must not render as "100 MB", or the refusal
+	// contradicts itself.
+	if got := limitBytesHuman(104857601, true); got != "100.1 MB" {
+		t.Errorf("limitBytesHuman(104857601, true) = %q, want %q", got, "100.1 MB")
+	}
+	// An exact multiple gains nothing from rounding up.
+	if got := limitBytesHuman(115343360, true); got != "110 MB" {
+		t.Errorf("limitBytesHuman(115343360, true) = %q, want %q", got, "110 MB")
+	}
+	// bytesHuman still keeps its decimal for table columns.
+	if got := bytesHuman(104857600); got != "100.0 MB" {
+		t.Errorf("bytesHuman must keep its .0 for tables, got %q", got)
+	}
+}
+
 func TestCommaNum(t *testing.T) {
 	cases := map[int64]string{
 		0:       "0",

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strings"
@@ -317,6 +318,38 @@ func bytesHuman(n float64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", n/div, "KMGTPE"[exp])
+}
+
+// limitBytesHuman renders a byte count for an upload-limit message: base-1024
+// units with the familiar KB/MB/GB labels, and no trailing ".0" so the
+// 104857600-byte cap reads as the round "100 MB" an operator actually
+// configured. Both numbers in a refusal share this basis, so the comparison is
+// coherent, and every Harbor client renders them the same way.
+//
+// It is deliberately separate from bytesHuman, which keeps its ".0" because it
+// fills table columns that read better aligned.
+//
+// roundUp forces the value up to the next tenth. The offending file's size uses
+// it and the cap does not: at one decimal place a file a single byte over a
+// 100 MB cap rounds back onto it and the refusal reads "is 100 MB — the
+// per-file limit is 100 MB", a sentence that contradicts itself. The cap is an
+// exact figure and must render as the number the operator set.
+func limitBytesHuman(n int64, roundUp bool) string {
+	const unit = 1024
+	f := float64(n)
+	if f < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := float64(unit), 0
+	for x := f / unit; x >= unit && exp < 5; x /= unit {
+		div *= unit
+		exp++
+	}
+	v := f / div
+	if roundUp {
+		v = math.Ceil(v*10) / 10
+	}
+	return strings.TrimSuffix(fmt.Sprintf("%.1f", v), ".0") + fmt.Sprintf(" %cB", "KMGTPE"[exp])
 }
 
 // truncate shortens s to at most n runes, appending an ellipsis when cut. It
