@@ -1842,3 +1842,80 @@ func TestTheCountExcludesTheVersionBeingKept(t *testing.T) {
 		t.Errorf("the count is wrong or reads as a plural:\n%s", out)
 	}
 }
+
+// TestTheHistoryReadAsksForTheNewestRowFirst pins the request, not just the
+// answer. The whole count rests on the row it inspects being the highest-usn
+// one: the server's default order is by created_at, which its own code notes is
+// ambiguous when two snapshots share a millisecond, and a note with coalesced
+// editing sessions can have several. Drop either parameter and the count goes
+// quietly wrong on exactly the notes that have the most to lose — so the
+// parameters are asserted rather than assumed.
+func TestTheHistoryReadAsksForTheNewestRowFirst(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	mm := newMoveMock(t, moveNotebooks(), movePlaintextNote())
+	mm.historyEarlier = 2
+	answerPrompt(t, "yes")
+
+	if _, err := runCLI(t, mm.m, "notes", "update", moveNoteID, "--notebook", nbLocked); err != nil {
+		t.Fatalf("notes update --notebook: %v", err)
+	}
+
+	var got *mockRequest
+	for i, r := range mm.m.requests {
+		if r.Method == http.MethodGet && strings.HasSuffix(r.Path, "/history") {
+			got = &mm.m.requests[i]
+		}
+	}
+	if got == nil {
+		t.Fatal("the sealed move never read the note's history")
+	}
+	if q := got.Query.Get("order"); q != "-usn_at_snapshot" {
+		t.Errorf("order = %q, want -usn_at_snapshot — created_at ties would pick the wrong row", q)
+	}
+	if q := got.Query.Get("limit"); q != "1" {
+		t.Errorf("limit = %q, want 1 — only the newest row is read, the rest is paging.total", q)
+	}
+}
+
+// TestOnlySealingMovesReadHistory keeps the new request on the one path that
+// needs it. Every other shape of --notebook destroys nothing, so asking the
+// server about versions would buy a round trip for a question never asked — and
+// on the move-out it would ask about a note that stays encrypted either way.
+func TestOnlySealingMovesReadHistory(t *testing.T) {
+	key := newMasterKey(t)
+
+	cases := []struct {
+		name string
+		note func() map[string]any
+		dest string
+	}{
+		{
+			// Out of an encrypting notebook: nothing is re-keyed and nothing is
+			// decrypted, so no history goes.
+			name: "move out of an encrypting notebook",
+			note: func() map[string]any { return moveEncryptedNote(t, key, nbLocked) },
+			dest: nbPlain,
+		},
+		{
+			// The note's own notebook_id echoed back. Not a move at all.
+			name: "no-op echo of the note's own notebook",
+			note: func() map[string]any { return movePlaintextNote() },
+			dest: nbPlain,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			unlockedSession(t, key)
+			mm := newMoveMock(t, moveNotebooks(), tc.note())
+			mm.historyEarlier = 4
+
+			if _, err := runCLI(t, mm.m, "notes", "update", moveNoteID, "--notebook", tc.dest); err != nil {
+				t.Fatalf("notes update --notebook: %v", err)
+			}
+			if got := historyReads(mm); got != 0 {
+				t.Errorf("spent %d history reads on a move that destroys nothing", got)
+			}
+		})
+	}
+}

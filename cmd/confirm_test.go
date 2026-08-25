@@ -262,12 +262,12 @@ func TestEveryIrreversibleCommandAsksFirst(t *testing.T) {
 	// "confirm", and then resolved against real package functions. Prose cannot
 	// survive that: help text has no call parens, and an identifier that is not a
 	// package-level function reaches nothing.
-	anyCall := regexp.MustCompile(`\b(\w+)\(`)
 	bodies := packageFuncBodies(t)
+	reaches := irreversibleCallClosure(bodies)
 
 	for _, block := range cobraCommandBlocks(t) {
 		called := []string{}
-		for _, m := range anyCall.FindAllStringSubmatch(block.runE, -1) {
+		for _, m := range callName.FindAllStringSubmatch(block.runE, -1) {
 			called = append(called, m[1])
 		}
 
@@ -278,7 +278,7 @@ func TestEveryIrreversibleCommandAsksFirst(t *testing.T) {
 				if found {
 					break
 				}
-				found = reachesClientCall(name, c, bodies, map[string]bool{})
+				found = reaches[name][c]
 			}
 			if found {
 				call = strings.TrimSuffix(c, "(")
@@ -302,30 +302,55 @@ func TestEveryIrreversibleCommandAsksFirst(t *testing.T) {
 	}
 }
 
-// reachesClientCall reports whether calling name eventually issues the client
-// call target — directly, or through however many package-level helpers sit in
-// between. It is the mirror image of reachesConfirmDestructive, and exists
-// because a destructive call hidden in a helper is exactly as invisible to a
-// literal text scan as a confirmation hidden in one.
+// callName matches an identifier in call position. It is package-level because
+// the walks below run it over the transitive closure of every command's RunE,
+// and recompiling it per frame made this file's guard the slowest test in the
+// package by an order of magnitude.
+var callName = regexp.MustCompile(`\b(\w+)\(`)
 
-func reachesClientCall(name, target string, bodies map[string]string, seen map[string]bool) bool {
-	if seen[name] {
-		return false // a cycle; going round again reaches nothing new
-	}
-	seen[name] = true
-	body, ok := bodies[name]
-	if !ok {
-		return false
-	}
-	if strings.Contains(body, target) {
-		return true
-	}
-	for _, m := range regexp.MustCompile(`\b(\w+)\(`).FindAllStringSubmatch(body, -1) {
-		if reachesClientCall(m[1], target, bodies, seen) {
-			return true
+// irreversibleCallClosure maps every package function to the irreversible client
+// calls it can reach — its own body's, plus everything its callees can reach,
+// however many helpers deep. It is the mirror image of what
+// reachesConfirmDestructive does for the gate, and exists for the same reason: a
+// destructive call hidden in a helper is exactly as invisible to a literal text
+// scan as a confirmation hidden in one.
+//
+// It is computed once, as a fixed point over the call graph, rather than by
+// re-walking the graph per function per target. The re-walking version answered
+// the same question and took twenty times as long, which on a check that runs in
+// every CI job is worth avoiding.
+func irreversibleCallClosure(bodies map[string]string) map[string]map[string]bool {
+	callees := map[string][]string{}
+	reaches := map[string]map[string]bool{}
+
+	for name, body := range bodies {
+		reaches[name] = map[string]bool{}
+		for _, c := range irreversibleClientCalls {
+			if strings.Contains(body, c) {
+				reaches[name][c] = true
+			}
+		}
+		for _, m := range callName.FindAllStringSubmatch(body, -1) {
+			callees[name] = append(callees[name], m[1])
 		}
 	}
-	return false
+
+	// Propagate along call edges until nothing new appears. Cycles terminate on
+	// their own: a round that adds nothing is the last one.
+	for changed := true; changed; {
+		changed = false
+		for name, called := range callees {
+			for _, callee := range called {
+				for c := range reaches[callee] {
+					if !reaches[name][c] {
+						reaches[name][c] = true
+						changed = true
+					}
+				}
+			}
+		}
+	}
+	return reaches
 }
 
 // reachesConfirmDestructive reports whether calling name eventually reaches the
@@ -345,7 +370,7 @@ func reachesConfirmDestructive(name string, bodies map[string]string, seen map[s
 	if !ok {
 		return false
 	}
-	for _, m := range regexp.MustCompile(`\b(\w+)\(`).FindAllStringSubmatch(body, -1) {
+	for _, m := range callName.FindAllStringSubmatch(body, -1) {
 		if reachesConfirmDestructive(m[1], bodies, seen) {
 			return true
 		}
