@@ -626,11 +626,18 @@ func accountExportNotReadyReason(status, id string) string {
 	}
 }
 
-// accountExportOutputPath resolves where an archive is written. "-" is stdout;
-// an existing directory is joined with the server's own filename (which names
-// the format and scope, e.g. harbor-export-recipes-2026-07-31.zip) so a download
-// into ~/Downloads does not have to be named by hand; anything else is used
-// verbatim.
+// accountExportOutputPath resolves where a downloaded file is written. "-" is
+// stdout; an existing directory is joined with the server's own filename (which
+// names the format and scope, e.g. harbor-export-recipes-2026-07-31.zip) so a
+// download into ~/Downloads does not have to be named by hand; anything else is
+// used verbatim.
+//
+// ONLY THE BASE OF THE SERVER'S FILENAME IS USED. The user's own path is theirs
+// to choose and is honoured as typed, but the filename half arrives over the
+// network, and joining a directory with something containing ".." resolves back
+// out of it — "harbor notes export <id> -o ." would write wherever the response
+// header said. Taking the base leaves every legitimate name untouched and gives
+// the directory the user named the final say.
 func accountExportOutputPath(out, filename string) string {
 	if out == "-" || filename == "" {
 		return out
@@ -639,7 +646,7 @@ func accountExportOutputPath(out, filename string) string {
 	if err != nil || !info.IsDir() {
 		return out
 	}
-	return filepath.Join(out, filename)
+	return filepath.Join(out, filepath.Base(filename))
 }
 
 // accountExportDeleteConfirmation is what `harbor account export-delete` asks

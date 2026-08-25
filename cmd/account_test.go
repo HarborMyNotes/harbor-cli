@@ -1543,3 +1543,37 @@ func TestAccountExportRejectionNamesAllThree(t *testing.T) {
 		}
 	}
 }
+
+// TestExportOutputPathKeepsTheServerInsideTheChosenDirectory pins the one half
+// of the path that is not the user's to choose.
+//
+// The filename comes off a response header, and joining a directory with
+// something holding ".." resolves back out of it — so `-o .` would write
+// wherever the server said, which is not what naming a directory means.
+func TestExportOutputPathKeepsTheServerInsideTheChosenDirectory(t *testing.T) {
+	dir := t.TempDir()
+
+	for _, hostile := range []string{
+		"../../etc/passwd",
+		"..\\..\\windows\\system32\\drivers\\etc\\hosts",
+		"/etc/passwd",
+		"sub/dir/escape.zip",
+	} {
+		got := accountExportOutputPath(dir, hostile)
+		if filepath.Dir(got) != dir {
+			t.Errorf("filename %q landed at %q, outside the directory the user named (%q)", hostile, got, dir)
+		}
+	}
+
+	// An ordinary name is untouched, which is the whole point of using the
+	// server's filename in the first place.
+	if got, want := accountExportOutputPath(dir, "harbor-markdown-export-2026-08-25.zip"),
+		filepath.Join(dir, "harbor-markdown-export-2026-08-25.zip"); got != want {
+		t.Errorf("accountExportOutputPath = %q, want %q", got, want)
+	}
+
+	// A path the USER typed is theirs, including one that walks upward.
+	if got := accountExportOutputPath("../elsewhere.zip", "server.zip"); got != "../elsewhere.zip" {
+		t.Errorf("the user's own path was rewritten to %q", got)
+	}
+}
