@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
+	"github.com/HarborMyNotes/harbor-cli/config"
 	"github.com/spf13/cobra"
 )
 
@@ -50,7 +52,7 @@ func TestAccountDeleteGuard(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := accountDeleteGuard(tc.jsonMode, tc.interactive, tc.confirm, tc.yes)
+			got, err := accountConfirmGuard(phrase, "delete", tc.jsonMode, tc.interactive, tc.confirm, tc.yes)
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("err = %v, want substring %q", err, tc.wantErr)
@@ -71,7 +73,7 @@ func TestAccountDeleteGuard(t *testing.T) {
 // not case-folded or trimmed.
 func TestAccountDeleteGuardRejectsCaseFold(t *testing.T) {
 	for _, bad := range []string{"delete my account", " DELETE MY ACCOUNT", "DELETE MY ACCOUNT "} {
-		if _, err := accountDeleteGuard(true, true, bad, true); err == nil {
+		if _, err := accountConfirmGuard(accountDeleteConfirmPhrase, "delete", true, true, bad, true); err == nil {
 			t.Errorf("guard accepted non-verbatim phrase %q", bad)
 		}
 	}
@@ -579,7 +581,7 @@ func TestAccountExportDeleteRunEProceedsOnTypedYes(t *testing.T) {
 }
 
 // TestAccountResolveConfirmRejectsAMistypedPhrase pins the most expensive
-// wrong-answer branch in the CLI. accountDeleteGuard is already covered, but the
+// wrong-answer branch in the CLI. accountConfirmGuard is already covered, but the
 // INTERACTIVE path does its own verbatim check afterwards, and until the prompt
 // became injectable nothing proved a near-miss stopped the deletion.
 func TestAccountResolveConfirmRejectsAMistypedPhrase(t *testing.T) {
@@ -595,7 +597,9 @@ func TestAccountResolveConfirmRejectsAMistypedPhrase(t *testing.T) {
 		t.Run(typed, func(t *testing.T) {
 			answerPrompt(t, typed)
 			var err error
-			captureStdout(t, func() { _, err = accountResolveConfirm(newCmd()) })
+			captureStdout(t, func() {
+				_, err = accountResolveConfirm(newCmd(), accountDeleteGate)
+			})
 			if err == nil {
 				t.Fatalf("typing %q scheduled an account deletion", typed)
 			}
@@ -608,7 +612,9 @@ func TestAccountResolveConfirmRejectsAMistypedPhrase(t *testing.T) {
 	answerPrompt(t, accountDeleteConfirmPhrase)
 	var phrase string
 	var err error
-	captureStdout(t, func() { phrase, err = accountResolveConfirm(newCmd()) })
+	captureStdout(t, func() {
+		phrase, err = accountResolveConfirm(newCmd(), accountDeleteGate)
+	})
 	if err != nil || phrase != accountDeleteConfirmPhrase {
 		t.Errorf("the exact phrase must proceed: (%q, %v)", phrase, err)
 	}
@@ -1575,5 +1581,594 @@ func TestExportOutputPathKeepsTheServerInsideTheChosenDirectory(t *testing.T) {
 	// A path the USER typed is theirs, including one that walks upward.
 	if got := accountExportOutputPath("../elsewhere.zip", "server.zip"); got != "../elsewhere.zip" {
 		t.Errorf("the user's own path was rewritten to %q", got)
+	}
+}
+
+// ===========================================================================
+// Clearing an account
+// ===========================================================================
+
+// TestNeitherPhraseSatisfiesTheOtherCommand is the safety property this whole
+// feature turns on.
+//
+// `clear` and `delete` are one word apart on the command line, both
+// irreversible, and opposite in what they leave behind — clear keeps the
+// account and destroys its contents now; delete keeps the contents and destroys
+// the account later. Someone who reaches for the wrong one and types the phrase
+// they remember must be refused, in BOTH directions.
+func TestNeitherPhraseSatisfiesTheOtherCommand(t *testing.T) {
+	cases := []struct {
+		name   string
+		phrase string
+		verb   string
+		typed  string
+	}{
+		{"delete's phrase must not clear", accountClearConfirmPhrase, "clear", accountDeleteConfirmPhrase},
+		{"clear's phrase must not delete", accountDeleteConfirmPhrase, "delete", accountClearConfirmPhrase},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Non-interactive, with --yes: the path a script takes.
+			if _, err := accountConfirmGuard(tc.phrase, tc.verb, false, false, tc.typed, true); err == nil {
+				t.Errorf("--confirm %q was accepted by %s", tc.typed, tc.verb)
+			}
+			// Interactive, pre-supplied: the path a person takes.
+			if _, err := accountConfirmGuard(tc.phrase, tc.verb, false, true, tc.typed, false); err == nil {
+				t.Errorf("--confirm %q was accepted by %s at a terminal", tc.typed, tc.verb)
+			}
+		})
+	}
+}
+
+// TestClearPhraseIsMatchedVerbatim pins that the phrase is compared byte for
+// byte. The server does the same, so trimming or upper-casing here would turn a
+// phrase it rejects into one it accepts — and the mismatch error the user then
+// gets back would be about something they did not type.
+func TestClearPhraseIsMatchedVerbatim(t *testing.T) {
+	for _, near := range []string{
+		"clear my account",
+		"Clear My Account",
+		" CLEAR MY ACCOUNT",
+		"CLEAR MY ACCOUNT ",
+		"CLEAR  MY ACCOUNT",
+		"CLEAR MY ACCOUNT.",
+		"",
+	} {
+		if _, err := accountConfirmGuard(accountClearConfirmPhrase, "clear", true, true, near, true); err == nil {
+			t.Errorf("--confirm %q was accepted", near)
+		}
+	}
+	if got, err := accountConfirmGuard(accountClearConfirmPhrase, "clear", true, true, accountClearConfirmPhrase, true); err != nil || got != accountClearConfirmPhrase {
+		t.Errorf("the exact phrase must proceed: (%q, %v)", got, err)
+	}
+}
+
+// TestAccountClearIsTerminal pins which statuses stop the poll. An unknown one
+// must NOT: a future status this binary has never heard of is a reason to keep
+// asking, not to tell someone their account is empty on a guess.
+func TestAccountClearIsTerminal(t *testing.T) {
+	cases := map[string]bool{
+		"completed": true, "failed": true,
+		"queued": false, "running": false, "": false, "reticulating": false,
+	}
+	for status, want := range cases {
+		if got := accountClearIsTerminal(status); got != want {
+			t.Errorf("accountClearIsTerminal(%q) = %v, want %v", status, got, want)
+		}
+	}
+}
+
+// TestClearErrorsAreMapped keeps the codes this command can raise from reaching
+// the user as raw API codes.
+func TestClearErrorsAreMapped(t *testing.T) {
+	cases := map[string]string{
+		"clear_in_progress":      "already running",
+		"social_reauth_required": "no password",
+		"reauth_required":        "incorrect current password",
+		"confirmation_mismatch":  "did not match",
+	}
+	for code, want := range cases {
+		err := mapAccountError(apiErr(code))
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("mapAccountError(%s) = %v, want it to mention %q", code, err, want)
+		}
+	}
+}
+
+// clearMock answers the clear endpoints, walking the job through a scripted
+// sequence of statuses so a test can prove the command POLLED rather than
+// believing the 202.
+func clearMock(t *testing.T, statuses ...string) *apiMock {
+	t.Helper()
+	m := newAPIMock(t, map[string]mockReply{})
+	i := 0
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		status := statuses[len(statuses)-1]
+		if i < len(statuses) {
+			status = statuses[i]
+		}
+		if r.Method == http.MethodGet {
+			i++
+		}
+		code := http.StatusOK
+		if r.Method == http.MethodPost {
+			code = http.StatusAccepted
+		}
+		finished := ""
+		if status == "completed" || status == "failed" {
+			finished = `,"finished_at":1750000004000`
+		}
+		writeJSON(w, code, json.RawMessage(
+			`{"data":{"clear_job_id":"c1","status":"`+status+`","started_at":1750000000000`+finished+`}}`))
+	}
+	return m
+}
+
+// testClientFor points a client at a stub API, for the few tests that drive a
+// helper directly rather than through the command tree.
+func testClientFor(m *apiMock) *client.Client {
+	return client.NewClient(m.baseURL(), "hbp_test-token-not-a-real-credential")
+}
+
+// pipedPassword supplies the re-auth proof the way a script does. promptPassword
+// takes its non-TTY branch under `go test`, so this is the seam that branch
+// reads from.
+func pipedPassword(t *testing.T, pw string) {
+	t.Helper()
+	orig := sharedStdin
+	t.Cleanup(func() { sharedStdin = orig })
+	sharedStdin = bufio.NewReader(strings.NewReader(pw + "\n"))
+}
+
+// noClearSleep makes the poll loop spin without spending real seconds in it.
+func noClearSleep(t *testing.T) {
+	t.Helper()
+	orig := accountClearSleep
+	t.Cleanup(func() { accountClearSleep = orig })
+	accountClearSleep = func(time.Duration) {}
+}
+
+// TestClearWaitsForTheJobToFinish is the bug this command exists not to have.
+// The 202 means QUEUED, so a command that reports success off it tells someone
+// their notes are gone while the server still has them.
+func TestClearWaitsForTheJobToFinish(t *testing.T) {
+	noClearSleep(t)
+	pipedPassword(t, "correct-horse")
+	m := clearMock(t, "queued", "queued", "running", "completed")
+
+	out, err := runCLI(t, m, "account", "clear", "--confirm", accountClearConfirmPhrase, "--yes", "--json")
+	if err != nil {
+		t.Fatalf("account clear: %v", err)
+	}
+
+	gets := 0
+	for _, r := range m.requests {
+		if r.Method == http.MethodGet {
+			gets++
+		}
+	}
+	if gets == 0 {
+		t.Error("the command believed the 202 and never polled")
+	}
+	if !strings.Contains(out, `"completed"`) {
+		t.Errorf("the reported job is not the finished one:\n%s", out)
+	}
+}
+
+// TestClearReportsAFailedJob keeps a failure from exiting zero. The request was
+// accepted and the work did not finish, so the account may be half-emptied —
+// the one outcome that must not look like success.
+func TestClearReportsAFailedJob(t *testing.T) {
+	noClearSleep(t)
+	pipedPassword(t, "correct-horse")
+	m := clearMock(t, "queued", "failed")
+
+	_, err := runCLI(t, m, "account", "clear", "--confirm", accountClearConfirmPhrase, "--yes", "--json")
+
+	if err == nil {
+		t.Fatal("a failed clear exited zero")
+	}
+	if !strings.Contains(err.Error(), "failed") {
+		t.Errorf("the error does not say the clear failed:\n%s", err)
+	}
+}
+
+// TestClearNoWaitDoesNotPoll pins the escape hatch for a caller that wants the
+// job rather than the wait.
+func TestClearNoWaitDoesNotPoll(t *testing.T) {
+	noClearSleep(t)
+	pipedPassword(t, "correct-horse")
+	m := clearMock(t, "queued", "completed")
+
+	if _, err := runCLI(t, m, "account", "clear", "--confirm", accountClearConfirmPhrase, "--yes", "--json", "--no-wait"); err != nil {
+		t.Fatalf("account clear --no-wait: %v", err)
+	}
+
+	for _, r := range m.requests {
+		if r.Method == http.MethodGet {
+			t.Errorf("--no-wait still polled: %s %s", r.Method, r.Path)
+		}
+	}
+}
+
+// TestClearSendsThePhraseAndPassword proves both halves of the proof reach the
+// wire under the names the API expects.
+func TestClearSendsThePhraseAndPassword(t *testing.T) {
+	noClearSleep(t)
+	pipedPassword(t, "correct-horse")
+	m := clearMock(t, "completed")
+
+	if _, err := runCLI(t, m, "account", "clear", "--confirm", accountClearConfirmPhrase, "--yes", "--json"); err != nil {
+		t.Fatalf("account clear: %v", err)
+	}
+
+	body := m.bodyOf(t, "POST /api/v1/account/clear")
+	if body["confirm"] != accountClearConfirmPhrase {
+		t.Errorf("confirm = %v on the wire", body["confirm"])
+	}
+	if _, ok := body["current_password"]; !ok {
+		t.Error("the re-auth proof never reached the wire")
+	}
+}
+
+// TestClearRemovesTheCachedKeystore is the local half of the clear. The server
+// destroyed the keystore with everything else, so a cached copy left behind
+// describes a master key for data that no longer exists.
+func TestClearRemovesTheCachedKeystore(t *testing.T) {
+	noClearSleep(t)
+	pipedPassword(t, "correct-horse")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := config.SaveKeystoreBlob("HRBK1-stale-blob"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := config.LoadKeystoreBlob(); err != nil || got == "" {
+		t.Fatalf("fixture did not take: %q %v", got, err)
+	}
+
+	m := clearMock(t, "completed")
+	if _, err := runCLIInHome(t, home, m, "account", "clear", "--confirm", accountClearConfirmPhrase, "--yes", "--json"); err != nil {
+		t.Fatalf("account clear: %v", err)
+	}
+
+	if got, _ := config.LoadKeystoreBlob(); got != "" {
+		t.Errorf("the stale keystore survived the clear: %q", got)
+	}
+}
+
+// TestClearStatusSaysWhenThereHasNeverBeenOne keeps the 404 an ANSWER. Routed
+// through mapAccountError it would come back as "no such export job", which is
+// a different domain entirely.
+func TestClearStatusSaysWhenThereHasNeverBeenOne(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/account/clear": {Status: 404, Body: `{"error":{"code":"not_found","message":"nope"}}`},
+	})
+
+	out, err := runCLI(t, m, "account", "clear-status")
+
+	if err != nil {
+		t.Fatalf("a never-cleared account is not an error: %v", err)
+	}
+	if !strings.Contains(out, "never been cleared") {
+		t.Errorf("the answer does not say what it means:\n%s", out)
+	}
+	if strings.Contains(out, "export") {
+		t.Errorf("the export domain's not_found message leaked in:\n%s", out)
+	}
+}
+
+// TestClearPollSurvivesATransientBlip keeps a dropped request from being read
+// as a dropped clear. The job runs server-side whatever this process can reach,
+// so a failed poll means "ask again" — reporting an error would tell someone
+// their account may not be empty while the deletion proceeds regardless.
+func TestClearPollSurvivesATransientBlip(t *testing.T) {
+	noClearSleep(t)
+	polls := 0
+	m := newAPIMock(t, map[string]mockReply{})
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			polls++
+			if polls <= 2 {
+				writeJSON(w, 500, json.RawMessage(`{"error":{"code":"internal","message":"boom"}}`))
+				return
+			}
+			writeJSON(w, 200, json.RawMessage(
+				`{"data":{"clear_job_id":"c1","status":"completed","started_at":1,"finished_at":2}}`))
+			return
+		}
+		writeJSON(w, 202, json.RawMessage(`{"data":{"clear_job_id":"c1","status":"queued","started_at":1}}`))
+	}
+
+	data, err := accountPollClear(testClientFor(m), time.Millisecond, 5*time.Second)
+
+	if err != nil {
+		t.Fatalf("two failed polls ended the wait: %v", err)
+	}
+	if !strings.Contains(string(data), `"completed"`) {
+		t.Errorf("the poll did not reach the finished job:\n%s", data)
+	}
+	if polls < 3 {
+		t.Errorf("the poll gave up after %d attempts", polls)
+	}
+}
+
+// TestClearPollGivesUpAtTheCeiling keeps the wait bounded without claiming the
+// clear went wrong — the server carries on regardless, so the message has to
+// say so and point at the way to check.
+func TestClearPollGivesUpAtTheCeiling(t *testing.T) {
+	noClearSleep(t)
+	m := newAPIMock(t, map[string]mockReply{})
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, json.RawMessage(`{"data":{"clear_job_id":"c1","status":"running","started_at":1}}`))
+	}
+
+	_, err := accountPollClear(testClientFor(m), time.Millisecond, time.Millisecond)
+
+	if err == nil {
+		t.Fatal("the poll waited past its ceiling")
+	}
+	for _, want := range []string{"gave up", "still running", "clear-status"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the message never says %q:\n%s", want, err)
+		}
+	}
+}
+
+// TestClearKeepsTheCredentials pins the other half of what a clear does
+// locally, and the half that has no visible symptom if it breaks.
+//
+// A clear deliberately does not sign the device out: a signed-out device cannot
+// sync, so it would sit holding a full offline copy of the account its owner
+// believes they emptied. A refactor that reused the delete command's teardown
+// would take the credentials with it and nothing else would notice.
+func TestClearKeepsTheCredentials(t *testing.T) {
+	noClearSleep(t)
+	pipedPassword(t, "correct-horse")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	creds := &config.Credentials{
+		Email:       "you@example.com",
+		AccessToken: "hbp_test-token-not-a-real-credential",
+	}
+	if err := config.Save(creds); err != nil {
+		t.Fatal(err)
+	}
+
+	m := clearMock(t, "completed")
+	if _, err := runCLIInHome(t, home, m, "account", "clear", "--confirm", accountClearConfirmPhrase, "--yes", "--json"); err != nil {
+		t.Fatalf("account clear: %v", err)
+	}
+
+	got, err := config.Load()
+	if err != nil || got == nil || got.Email != "you@example.com" {
+		t.Errorf("the clear signed the device out (%v, %v) — it can no longer sync away the deletions", got, err)
+	}
+}
+
+// TestClearDropsTheKeystoreEvenWhenItGivesUpWaiting closes the gap between the
+// two things a timeout means. Giving up on the WAIT is not giving up on the
+// clear: the server carries on and takes the keystore with it, so returning
+// early would leave the stale cache behind exactly when the account is most
+// certainly being emptied.
+func TestClearDropsTheKeystoreEvenWhenItGivesUpWaiting(t *testing.T) {
+	noClearSleep(t)
+	pipedPassword(t, "correct-horse")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := config.SaveKeystoreBlob("HRBK1-stale-blob"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Never terminal, so the wait can only end at the ceiling.
+	m := clearMock(t, "running")
+	orig := accountClearPollTimeoutVar
+	t.Cleanup(func() { accountClearPollTimeoutVar = orig })
+	accountClearPollTimeoutVar = time.Nanosecond
+
+	_, err := runCLIInHome(t, home, m, "account", "clear", "--confirm", accountClearConfirmPhrase, "--yes", "--json")
+
+	if err == nil {
+		t.Fatal("the wait never gave up")
+	}
+	if got, _ := config.LoadKeystoreBlob(); got != "" {
+		t.Errorf("giving up on the wait kept a keystore the server is destroying: %q", got)
+	}
+}
+
+// TestEachGateAsksForThePhraseItSends is the property the accountGate struct
+// exists to hold.
+//
+// A gate whose prompt and payload disagree asks the user to type one phrase and
+// sends the other — the exact crossover the two phrases exist to prevent, and
+// invisible to a compiler. This asserts each bundle agrees with itself.
+func TestEachGateAsksForThePhraseItSends(t *testing.T) {
+	if len(accountGates) < 2 {
+		t.Fatalf("only %d gates registered; the scan is broken, so this proves nothing", len(accountGates))
+	}
+	for _, g := range accountGates {
+		if g.gate.Affirmative != g.phrase {
+			t.Errorf("the %s gate asks for %q and sends %q", g.verb, g.gate.Affirmative, g.phrase)
+		}
+		if !strings.Contains(g.gate.Prompt, g.phrase) {
+			t.Errorf("the %s prompt does not name the phrase it accepts: %q", g.verb, g.gate.Prompt)
+		}
+		if !strings.Contains(g.gate.Unattended, g.verb) {
+			t.Errorf("the %s refusal does not name the action: %q", g.verb, g.gate.Unattended)
+		}
+	}
+	if accountClearGate.phrase == accountDeleteGate.phrase {
+		t.Fatal("clear and delete share a phrase, so either can be confirmed by the other's")
+	}
+}
+
+// TestClearPollStopsWhenTheServerHasNoJob keeps one failure apart from the rest.
+// A 404 is the server saying there is nothing running — waiting the full ceiling
+// and then reporting a clear "still running" would state something untrue.
+func TestClearPollStopsWhenTheServerHasNoJob(t *testing.T) {
+	noClearSleep(t)
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/account/clear": {Status: 404, Body: `{"error":{"code":"not_found","message":"nope"}}`},
+	})
+
+	// Enough ceiling for the second 404 to arrive, little enough that a
+	// regression here fails in seconds instead of spinning for the real one.
+	_, err := accountPollClear(testClientFor(m), time.Millisecond, 5*time.Second)
+
+	if err == nil {
+		t.Fatal("a server with no clear job was waited on anyway")
+	}
+	if strings.Contains(err.Error(), "still running") {
+		t.Errorf("the message claims a job the server says does not exist:\n%s", err)
+	}
+	if !strings.Contains(err.Error(), "no record") {
+		t.Errorf("the message does not say what happened:\n%s", err)
+	}
+}
+
+// TestClearJSONStaysADocument keeps the wait's progress off stdout. The poll can
+// print several lines before the job finishes, and a caller piping this into jq
+// receives whatever lands there — so the progress belongs on stderr and the
+// document has to survive a run that actually waited.
+func TestClearJSONStaysADocument(t *testing.T) {
+	noClearSleep(t)
+	pipedPassword(t, "correct-horse")
+	m := clearMock(t, "queued", "running", "completed")
+
+	out, err := runCLI(t, m, "account", "clear", "--confirm", accountClearConfirmPhrase, "--yes", "--json")
+	if err != nil {
+		t.Fatalf("account clear --json: %v", err)
+	}
+
+	var doc map[string]any
+	if jerr := json.Unmarshal([]byte(out), &doc); jerr != nil {
+		t.Fatalf("stdout is not a JSON document (%v):\n%s", jerr, out)
+	}
+	if _, ok := doc["data"]; !ok {
+		t.Errorf("the document is not the job envelope:\n%s", out)
+	}
+	if strings.Contains(out, "clearing —") || strings.Contains(out, "Ctrl-C") {
+		t.Errorf("poll progress leaked onto stdout:\n%s", out)
+	}
+}
+
+// TestClearPollIgnoresASingle404 keeps a proxy from calling off an irreversible
+// operation. A 404 synthesized by a load balancer mid-deploy decodes to the same
+// code as the server's own "no such job", and only the server's answer repeats.
+func TestClearPollIgnoresASingle404(t *testing.T) {
+	noClearSleep(t)
+	polls := 0
+	m := newAPIMock(t, map[string]mockReply{})
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		polls++
+		if polls == 1 {
+			writeJSON(w, 404, json.RawMessage(`{"error":{"code":"not_found","message":"nope"}}`))
+			return
+		}
+		writeJSON(w, 200, json.RawMessage(
+			`{"data":{"clear_job_id":"c1","status":"completed","started_at":1,"finished_at":2}}`))
+	}
+
+	data, err := accountPollClear(testClientFor(m), time.Millisecond, time.Minute)
+
+	if err != nil {
+		t.Fatalf("one 404 called off a clear that was running: %v", err)
+	}
+	if !strings.Contains(string(data), `"completed"`) {
+		t.Errorf("the poll did not reach the finished job:\n%s", data)
+	}
+}
+
+// TestClearPollNeedsThe404sBackToBack keeps "twice" meaning consecutive. A 404,
+// something else, then another 404 is an unstable edge, not the server
+// answering — and calling off an irreversible operation on that pattern reports
+// a clear stopped when it is still running.
+func TestClearPollNeedsThe404sBackToBack(t *testing.T) {
+	noClearSleep(t)
+	polls := 0
+	m := newAPIMock(t, map[string]mockReply{})
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		polls++
+		switch polls {
+		case 1, 3:
+			writeJSON(w, 404, json.RawMessage(`{"error":{"code":"not_found","message":"nope"}}`))
+		case 2:
+			writeJSON(w, 500, json.RawMessage(`{"error":{"code":"internal","message":"boom"}}`))
+		default:
+			writeJSON(w, 200, json.RawMessage(
+				`{"data":{"clear_job_id":"c1","status":"completed","started_at":1,"finished_at":2}}`))
+		}
+	}
+
+	data, err := accountPollClear(testClientFor(m), time.Millisecond, 5*time.Second)
+
+	if err != nil {
+		t.Fatalf("two 404s with a different failure between them called off a running clear: %v", err)
+	}
+	if !strings.Contains(string(data), `"completed"`) {
+		t.Errorf("the poll did not reach the finished job:\n%s", data)
+	}
+}
+
+// TestClearProgressStaysOffStdout keeps the human run's stdout to what the
+// command produced. The poll can print several lines before the job finishes,
+// and stdout is the table — anything else there is output nobody asked for in
+// the middle of a document.
+func TestClearProgressStaysOffStdout(t *testing.T) {
+	noClearSleep(t)
+	pipedPassword(t, "correct-horse")
+	m := clearMock(t, "queued", "running", "completed")
+
+	out, err := runCLI(t, m, "account", "clear", "--confirm", accountClearConfirmPhrase, "--yes")
+	if err != nil {
+		t.Fatalf("account clear: %v", err)
+	}
+
+	for _, leaked := range []string{"clearing —", "Ctrl-C"} {
+		if strings.Contains(out, leaked) {
+			t.Errorf("poll progress reached stdout (%q):\n%s", leaked, out)
+		}
+	}
+	if !strings.Contains(out, "Job ID") {
+		t.Errorf("stdout lost the thing it is for:\n%s", out)
+	}
+}
+
+// TestClearDropsTheKeystoreBeforeItWaits is the Ctrl-C case. The wait is not a
+// reliable moment to drop the cache: Ctrl-C ends the wait and not the clear, and
+// the progress line says so — so a cache dropped only afterwards survives on a
+// server that is destroying the keystore it describes.
+func TestClearDropsTheKeystoreBeforeItWaits(t *testing.T) {
+	pipedPassword(t, "correct-horse")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := config.SaveKeystoreBlob("HRBK1-stale-blob"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The poll blocks until the test has looked, standing in for a person who
+	// hits Ctrl-C while it runs.
+	looked := make(chan struct{})
+	orig := accountClearSleep
+	t.Cleanup(func() { accountClearSleep = orig })
+	accountClearSleep = func(time.Duration) {
+		select {
+		case <-looked:
+		default:
+			if got, _ := config.LoadKeystoreBlob(); got != "" {
+				t.Errorf("the stale keystore is still there while the wait runs: %q", got)
+			}
+			close(looked)
+		}
+	}
+
+	m := clearMock(t, "queued", "completed")
+	if _, err := runCLIInHome(t, home, m, "account", "clear", "--confirm", accountClearConfirmPhrase, "--yes", "--json"); err != nil {
+		t.Fatalf("account clear: %v", err)
+	}
+	select {
+	case <-looked:
+	default:
+		t.Fatal("the command never waited, so this proved nothing")
 	}
 }

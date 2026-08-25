@@ -230,6 +230,7 @@ var irreversibleClientCalls = []string{
 	"c.RequestAccountDeletion(", // the whole account, after a grace window
 	"c.ConvertNoteToPlaintext(", // a note's contents, published to the server
 	"c.ConvertNoteToEncrypted(", // the note's whole version history, hard-deleted
+	"c.RequestAccountClear(",    // every note, notebook, tag and file in the account, now
 }
 
 // TestEveryIrreversibleCommandAsksFirst is the check that would have caught the

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
+	"github.com/HarborMyNotes/harbor-cli/config"
 	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/spf13/cobra"
 )
@@ -23,11 +24,68 @@ import (
 // server's ACCOUNT_DELETE_CONFIRM_PHRASE default.
 const accountDeleteConfirmPhrase = "DELETE MY ACCOUNT"
 
+// accountClearConfirmPhrase is the phrase for emptying an account, mirroring the
+// server's ACCOUNT_CLEAR_CONFIRM_PHRASE default.
+//
+// It is a DIFFERENT phrase from deletion's, and the difference is the safety.
+// The two commands are one word apart, both irreversible, and opposite in what
+// they leave behind, so neither phrase may satisfy the other.
+const accountClearConfirmPhrase = "CLEAR MY ACCOUNT"
+
+// accountGate is everything one irreversible whole-account command asks: the
+// phrase, the verb its refusals are worded with, and the registered wording of
+// its prompt.
+//
+// They travel as ONE VALUE because passing them separately is enough to get
+// wrong. Handing clear's phrase to delete's prompt compiles, type-checks, and
+// asks the user to type "DELETE MY ACCOUNT" before sending "CLEAR MY ACCOUNT" —
+// exactly the crossover the two phrases exist to prevent. Declared together
+// once, there is nothing at a call site left to mis-pair.
+type accountGate struct {
+	phrase string
+	verb   string
+	gate   confirmation
+}
+
+// newAccountGate builds one from the confirmation alone.
+//
+// The phrase is TAKEN from the wording rather than passed alongside it, so the
+// words a user is asked to type and the words sent to the server have one
+// source. The fields stay writable from inside this package, so this is the
+// shape to copy rather than a rule the compiler enforces — what enforces it is
+// TestEachGateAsksForThePhraseItSends, over every gate this file registers.
+func newAccountGate(verb string, c confirmation) accountGate {
+	g := accountGate{phrase: c.Affirmative, verb: verb, gate: c}
+	accountGates = append(accountGates, g)
+	return g
+}
+
+// accountGates is every gate declared above, built as they are declared rather
+// than listed by hand — the same reason destructiveConfirmations is. A list
+// somebody has to remember to append to only stays complete while they do, and
+// the test that walks this one is what holds each gate to asking for the phrase
+// it sends.
+var accountGates []accountGate
+
+const (
+	// accountClearPollInterval is how often the clear job is asked whether it has
+	// finished. The other Harbor clients use the same two seconds, so a user
+	// watching a phone and a terminal sees them agree.
+	accountClearPollInterval = 2 * time.Second
+)
+
+// accountClearPollTimeoutVar is when this command stops waiting. It is a ceiling
+// on the WAIT, not on the job: the server carries on regardless, so giving up
+// here says so rather than reporting a failure.
+//
+// A variable so a test can reach the give-up path without spending the ceiling.
+var accountClearPollTimeoutVar = 15 * time.Minute
+
 // accountCmd is the parent for destructive, whole-account operations: the GDPR
 // data export and the grace-period account deletion (issue #27).
 var accountCmd = &cobra.Command{
 	Use:     "account",
-	Short:   "Export or delete your entire account",
+	Short:   "Export, empty, or delete your entire account",
 	GroupID: groupAccount,
 	Long: `Whole-account operations.
 
@@ -35,6 +93,8 @@ var accountCmd = &cobra.Command{
   exports       show what this account's export slots hold right now
   export-status poll an export job and download the ZIP when it completes
   export-delete delete an export's archive, freeing that format's slot
+  clear         destroy everything IN the account, keeping the account (destructive)
+  clear-status  show the account's current or last clear
   delete        schedule account deletion after a grace period (destructive)
   cancel-delete cancel a pending deletion within the grace window
 
@@ -46,7 +106,12 @@ then deleted.
 
 Deletion is a soft-delete: a confirmed request records a purge date and revokes
 your other sessions, but destroys nothing until the grace window elapses — you
-can cancel until then.`,
+can cancel until then.
+
+CLEAR IS THE OTHER SHAPE. It destroys the account's CONTENTS immediately and
+keeps the account: no grace period, nothing to cancel, still signed in, same
+plan. The two take different confirmation phrases so neither can be typed by
+mistake for the other.`,
 }
 
 // accountExportCmd starts an export job for one format, optionally scoped to a
@@ -263,7 +328,7 @@ both --confirm %q and --yes (your password is still read from stdin).`,
 
 		// Resolve the confirmation phrase: typed interactively, or pre-supplied
 		// via --confirm under the non-interactive guard.
-		confirm, err := accountResolveConfirm(cmd)
+		confirm, err := accountResolveConfirm(cmd, accountDeleteGate)
 		if err != nil {
 			return err
 		}
@@ -683,61 +748,75 @@ var accountDeleteConfirmation = registerConfirmation("harbor account delete", co
 	Aborted:     "aborted — the phrase did not match, so nothing was deleted",
 })
 
-// accountResolveConfirm decides how the destructive delete confirmation phrase
-// is obtained. In interactive mode (a TTY, not --json) it prompts the user to
-// type the phrase. Otherwise it enforces the non-interactive guard: the caller
-// MUST have passed both --confirm (matching the phrase verbatim) and --yes.
-func accountResolveConfirm(cmd *cobra.Command) (string, error) {
+// accountDeleteGate is what `account delete` asks, as one value.
+var accountDeleteGate = newAccountGate("delete", accountDeleteConfirmation)
+
+// accountResolveConfirm decides how an irreversible command's confirmation
+// phrase is obtained. In interactive mode (a TTY, not --json) it prompts the
+// user to type the phrase. Otherwise it enforces the non-interactive guard: the
+// caller MUST have passed both --confirm (matching the phrase verbatim) and
+// --yes.
+//
+// The phrase, its verb and its registered wording arrive as ONE value, so a
+// command cannot be gated by another one's question — there are no separate
+// arguments left to pair up wrongly.
+func accountResolveConfirm(cmd *cobra.Command, g accountGate) (string, error) {
 	supplied := ""
 	if cmd.Flags().Changed("confirm") {
 		supplied = stringFlag(cmd, "confirm")
 	}
-	phrase, err := accountDeleteGuard(jsonOutput, accountIsInteractive(), supplied, boolFlag(cmd, "yes"))
+	resolved, err := accountConfirmGuard(g.phrase, g.verb, jsonOutput, accountIsInteractive(), supplied, boolFlag(cmd, "yes"))
 	if err != nil {
 		return "", err
 	}
-	if phrase != "" {
+	if resolved != "" {
 		// Phrase was pre-supplied and validated by the guard.
-		return phrase, nil
+		return resolved, nil
 	}
 	// Interactive path: ask through the shared gate. The affirmative here is a
 	// whole phrase rather than "yes", which is the only way this confirmation
 	// differs from the others — the branches, the wording rules and the
 	// wrong-answer handling are deliberately the same, so it is a registered
 	// confirmation like the rest rather than a second hand-rolled prompt.
-	if err := confirmDestructive(accountDeleteConfirmation, jsonOutput, accountIsInteractive(), false, askLine); err != nil {
+	if err := confirmDestructive(g.gate, jsonOutput, accountIsInteractive(), false, askLine); err != nil {
 		return "", err
 	}
-	return accountDeleteConfirmPhrase, nil
+	return g.phrase, nil
 }
 
-// accountDeleteGuard enforces the destructive-delete confirmation policy and is
-// kept free of I/O so it can be unit-tested. It returns the confirmation phrase
-// to send when the caller pre-supplied it (non-interactive / --json path), or an
-// empty string when the command should fall through to an interactive prompt.
+// accountConfirmGuard enforces the confirmation policy for an irreversible
+// whole-account command and is kept free of I/O so it can be unit-tested. It
+// returns the confirmation phrase to send when the caller pre-supplied it
+// (non-interactive / --json path), or an empty string when the command should
+// fall through to an interactive prompt.
+//
+// The phrase and the verb are ARGUMENTS. Two commands use this — delete and
+// clear — and each has a phrase of its own precisely so that neither can be
+// confirmed by the other's. Reading a constant here instead would make that a
+// property of whoever wrote the call site.
 //
 // Rules:
 //   - When NOT interactive (or --json is set), the caller MUST pass both a
 //     --confirm value matching the phrase verbatim AND --yes; anything else is
-//     refused so a script can never delete an account by accident.
+//     refused so a script can never destroy an account by accident.
 //   - When interactive, a pre-supplied --confirm must still match verbatim if
 //     present (a typo should fail fast); an empty --confirm defers to the prompt.
-func accountDeleteGuard(jsonMode, interactive bool, suppliedConfirm string, yes bool) (string, error) {
+func accountConfirmGuard(phrase, verb string, jsonMode, interactive bool, suppliedConfirm string, yes bool) (string, error) {
 	nonInteractive := jsonMode || !interactive
 	if nonInteractive {
 		if !yes {
-			return "", errors.New("refusing to delete in non-interactive/--json mode without --yes")
+			return "", fmt.Errorf("refusing to %s in non-interactive/--json mode without --yes", verb)
 		}
-		if suppliedConfirm != accountDeleteConfirmPhrase {
-			return "", fmt.Errorf("refusing to delete: pass --confirm %q exactly", accountDeleteConfirmPhrase)
+		if suppliedConfirm != phrase {
+			return "", fmt.Errorf("refusing to %s: pass --confirm %q exactly", verb, phrase)
 		}
 		return suppliedConfirm, nil
 	}
 	// Interactive: a wrong pre-supplied phrase is a hard error; an empty one
 	// means "ask me".
 	if suppliedConfirm != "" {
-		if suppliedConfirm != accountDeleteConfirmPhrase {
-			return "", fmt.Errorf("--confirm did not match; type %q exactly", accountDeleteConfirmPhrase)
+		if suppliedConfirm != phrase {
+			return "", fmt.Errorf("--confirm did not match; type %q exactly", phrase)
 		}
 		return suppliedConfirm, nil
 	}
@@ -756,6 +835,302 @@ func accountIsInteractive() bool {
 // Error mapping
 // ===========================================================================
 
+// ===========================================================================
+// Clearing an account
+// ===========================================================================
+//
+// CLEAR IS NOT DELETE, and the whole design here is keeping them apart. Delete
+// is soft: a grace window, other sessions revoked, nothing destroyed until the
+// window elapses, cancellable the whole time. Clear destroys everything the
+// moment it runs, keeps the account signed in on the same plan, and cannot be
+// called off. They are one word apart on the command line and opposite in what
+// they leave behind, which is why each carries a phrase the other's does not
+// satisfy and why nothing below reads a package-level phrase constant.
+
+// accountClearTerminalStates are the clear-job statuses that mean the work has
+// stopped. An unrecognised status is deliberately NOT terminal: a future state
+// this binary has never heard of is a reason to keep asking, not to declare an
+// account empty on a guess.
+var accountClearTerminalStates = []string{"completed", "failed"}
+
+// accountClearIsTerminal reports whether a clear job has stopped.
+func accountClearIsTerminal(status string) bool {
+	for _, s := range accountClearTerminalStates {
+		if status == s {
+			return true
+		}
+	}
+	return false
+}
+
+// accountClearConfirmation is the phrase gate for emptying an account.
+//
+// The wording leads with what SURVIVES, because that is the part someone
+// reaching for this command may have wrong: they are one word away from
+// 'account delete', and the difference between the two is not the destruction —
+// it is that this one leaves them holding the account.
+var accountClearConfirmation = registerConfirmation("harbor account clear", confirmation{
+	Warning: "This DESTROYS every note, notebook, tag, task and file in this account, immediately\n" +
+		"and permanently. There is no grace period and nothing to cancel — 'cancel-delete'\n" +
+		"does not apply to it. The account itself, your login and your plan are KEPT: you\n" +
+		"end up signed in to the same account, empty, as if you had just signed up.\n" +
+		"Any export still sitting on the server is a copy of these notes, so it goes too.",
+	Prompt:      fmt.Sprintf("This is destructive. Type %q to confirm: ", accountClearConfirmPhrase),
+	Affirmative: accountClearConfirmPhrase,
+	Unattended:  "refusing to clear in non-interactive/--json mode without --yes",
+	Aborted:     "aborted — the phrase did not match, so nothing was cleared",
+})
+
+// accountClearGate is what `account clear` asks, as one value.
+var accountClearGate = newAccountGate("clear", accountClearConfirmation)
+
+// accountPollClear polls a clear until it stops, returning the last status body.
+//
+// A FAILED POLL IS NOT A FAILED CLEAR. The job runs server-side and keeps
+// running whatever this process can reach, so a dropped request means "ask
+// again", not "give up" — reporting an error there would tell someone their
+// account may not be empty when the deletion is proceeding regardless.
+//
+// Two things end the wait early: a terminal status, and the server saying twice
+// that no clear job exists. Everything else waits for the ceiling, which says
+// the job is still running rather than implying it went wrong.
+//
+// Progress is suppressed entirely under --json, and goes to stderr otherwise:
+// the flag's output is a document, and a human's is not the place for it either.
+func accountPollClear(c *client.Client, interval, timeout time.Duration) ([]byte, error) {
+	if interval <= 0 {
+		interval = accountClearPollInterval
+	}
+	deadline := time.Time{}
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+
+	last := []byte(nil)
+	lastStatus := ""
+	missing := 0
+	for {
+		data, err := c.GetAccountClear()
+
+		// The one failure that is an ANSWER: the server says there is no clear
+		// job. A POST created one moments ago, so waiting fifteen minutes to
+		// report a clear "still running" would be telling the user something
+		// untrue.
+		//
+		// BACK TO BACK, though. A 404 from a proxy or a load balancer mid-deploy
+		// decodes to the same code as the server's own answer, and a blip does not
+		// repeat two seconds later — so one is not enough to call an irreversible
+		// operation off. Anything else in between, a 500 included, means the run
+		// of 404s was not one: an unstable edge is not the server answering.
+		var apiErr *client.APIError
+		if err != nil && errors.As(err, &apiErr) && apiErr.Code == "not_found" {
+			missing++
+			if missing >= 2 {
+				return last, errors.New("the server has no record of this clear — nothing is running; check the account with 'harbor account clear-status' and run the clear again if it is still full")
+			}
+		} else {
+			missing = 0
+		}
+
+		if err == nil {
+			last = data
+			job := parseJSON(client.UnwrapData(data))
+			status := str(job, "status")
+			if accountClearIsTerminal(status) {
+				return data, nil
+			}
+			if status != lastStatus && !jsonOutput {
+				fmt.Fprintln(os.Stderr, dim("clearing — "+status+"; large accounts take a few minutes while attachments are deleted"))
+				if lastStatus == "" {
+					// The person most likely to reach for Ctrl-C is the one watching
+					// an irreversible operation they cannot call off. Say which of
+					// the two things it stops.
+					fmt.Fprintln(os.Stderr, dim("Ctrl-C stops the waiting, not the clear — it finishes on its own."))
+				}
+				lastStatus = status
+			}
+		}
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			return last, fmt.Errorf("gave up waiting after %s — the clear is still running on the server and will finish on its own; check it with 'harbor account clear-status'", timeout)
+		}
+		accountClearSleep(interval)
+	}
+}
+
+// accountClearSleep is the poll loop's wait, as a variable so a test can drive
+// the loop without spending real seconds in it.
+var accountClearSleep = time.Sleep
+
+// accountClearCmd empties the account, keeping the account.
+var accountClearCmd = &cobra.Command{
+	Use:   "clear",
+	Short: "Delete everything in your account, keeping the account itself (destructive)",
+	Args:  cobra.NoArgs,
+	Long: fmt.Sprintf(`Empty your account without deleting it.
+
+Every note, notebook, tag, task, shortcut, template, saved search and uploaded
+file is destroyed, along with your note history and your encryption keystore.
+This happens IMMEDIATELY. There is no grace period, nothing is recoverable, and
+'harbor account cancel-delete' has nothing to do with it.
+
+WHAT SURVIVES is the point of this command, and the difference from
+'harbor account delete': the account, your email and password, your sessions and
+tokens, and your plan. You stay signed in, on the same plan, looking at an empty
+account — the state a brand-new signup is in. A fresh default notebook is created
+for you.
+
+Your other devices are deliberately NOT signed out. They need to stay connected
+to receive the deletions; signing them out would leave them holding a full copy
+of an account you believe you emptied.
+
+An export still sitting on the server is a complete copy of the notes being
+destroyed, so it is destroyed too. Download it first if you want it.
+
+You must confirm by typing the phrase %q exactly and entering your current
+password. In --json or non-interactive mode the command refuses unless you pass
+both --confirm %q and --yes (your password is still read from stdin).
+
+The server answers as soon as the job is QUEUED, not when it is done — a large
+account spends minutes deleting attachments. So this waits for the job to finish
+and only then reports success. Pass --no-wait to be handed the job instead.`,
+		accountClearConfirmPhrase, accountClearConfirmPhrase),
+	Example: `  harbor account clear
+  printf 'my-password\n' | harbor account clear --confirm "CLEAR MY ACCOUNT" --yes --json
+  harbor account clear --no-wait`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		c, _, err := loadClientFromConfig()
+		if err != nil {
+			return err
+		}
+
+		confirm, err := accountResolveConfirm(cmd, accountClearGate)
+		if err != nil {
+			return err
+		}
+
+		// Re-auth proof. promptPassword reads piped stdin non-interactively, so
+		// scripts and agents can supply the password without a TTY.
+		pw, err := promptPassword("Current password: ")
+		if err != nil {
+			return err
+		}
+
+		data, err := c.RequestAccountClear(pw, confirm)
+		if err != nil {
+			return mapAccountError(err)
+		}
+
+		// AS SOON AS THE SERVER ACCEPTS THE JOB, not after the wait. The keystore
+		// goes with everything else, so the cached copy is about to describe a
+		// master key for data that no longer exists — and ensureKeystoreBlob
+		// PREFERS the cache, so the next encrypted write would seal against a
+		// keystore the server has never heard of.
+		//
+		// The wait is not a reliable moment to do it: Ctrl-C ends the wait, not
+		// the clear, and the line below invites exactly that. Dropping a cache
+		// early costs one sync fetch, which re-caches; dropping it late can cost
+		// a note nobody can open.
+		if cerr := config.ClearKeystoreBlob(); cerr != nil {
+			fmt.Fprintln(os.Stderr, dim("could not remove the cached keystore: "+cerr.Error()))
+		}
+
+		job := parseJSON(client.UnwrapData(data))
+		var waitErr error
+		if !boolFlag(cmd, "no-wait") && !accountClearIsTerminal(str(job, "status")) {
+			polled, perr := accountPollClear(c, accountClearPollInterval, accountClearPollTimeoutVar)
+			if polled != nil {
+				data = polled
+			}
+			waitErr = perr
+		}
+
+		// Printed before the wait's own error is returned, so a caller that gave
+		// up waiting still receives the job it was waiting on rather than an
+		// empty stdout.
+		printResult(data, displayClearJob)
+		if waitErr != nil {
+			return waitErr
+		}
+		if str(parseJSON(client.UnwrapData(data)), "status") == "failed" {
+			return errClearFailed
+		}
+		return nil
+	},
+}
+
+// errClearFailed is the non-zero exit for a clear the SERVER reported as failed.
+// It is separate from a refusal because nothing the user can retype fixes it:
+// the request was accepted and the job did not finish.
+var errClearFailed = errors.New("the clear failed on the server — some of the account may still be there; run 'harbor account clear' again, and contact support if it keeps failing")
+
+// displayClearJob renders a clear job.
+func displayClearJob(data []byte) {
+	d := parseJSON(client.UnwrapData(data))
+	if d == nil {
+		fmt.Println(string(data))
+		return
+	}
+	pairs := [][2]string{
+		{"Job ID", str(d, "clear_job_id")},
+		{"Status", colorizeStatus(str(d, "status"))},
+	}
+	if started := num(d, "started_at"); started > 0 {
+		pairs = append(pairs, [2]string{"Started", epochMS(started)})
+	}
+	if finished := num(d, "finished_at"); finished > 0 {
+		pairs = append(pairs, [2]string{"Finished", epochMS(finished)})
+	}
+	printKV(pairs)
+
+	switch str(d, "status") {
+	case "completed":
+		fmt.Println(dim("Your account is empty. You are still signed in, on the same plan, with a fresh default notebook."))
+		fmt.Println(dim("Other devices empty themselves the next time they sync."))
+	case "failed":
+		// Nothing reassuring to say: the display is not the place to decide
+		// whether the account is usable, and the command returns an error anyway.
+	default:
+		fmt.Println(dim("Still running on the server. It finishes on its own; check it with 'harbor account clear-status'."))
+	}
+}
+
+// accountClearStatusCmd reports the account's last clear.
+var accountClearStatusCmd = &cobra.Command{
+	Use:   "clear-status",
+	Short: "Show the status of this account's last clear",
+	Args:  cobra.NoArgs,
+	Long: `Show the account's current or most recent clear job.
+
+This is how you pick a clear back up after closing the terminal, and how a
+--no-wait run finds out whether it finished. An account that has never been
+cleared is not an error — it just says so.`,
+	Example: `  harbor account clear-status
+  harbor account clear-status --json`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		c, _, err := loadClientFromConfig()
+		if err != nil {
+			return err
+		}
+		data, err := c.GetAccountClear()
+		if err != nil {
+			// 404 here is an ANSWER, not a failure, and it must not go through
+			// mapAccountError — which reads not_found as a missing EXPORT job.
+			var apiErr *client.APIError
+			if errors.As(err, &apiErr) && apiErr.Code == "not_found" {
+				if jsonOutput {
+					fmt.Println("null")
+					return nil
+				}
+				fmt.Println("This account has never been cleared.")
+				return nil
+			}
+			return mapAccountError(err)
+		}
+		printResult(data, displayClearJob)
+		return nil
+	},
+}
+
 // mapAccountError gives friendly messages for the account-domain error codes.
 func mapAccountError(err error) error {
 	var apiErr *client.APIError
@@ -771,6 +1146,10 @@ func mapAccountError(err error) error {
 			return errors.New("the cancellation window has passed; the account is being purged")
 		case "reauth_required":
 			return errors.New("incorrect current password")
+		case "social_reauth_required":
+			return errors.New("this account signs in with Google or Apple and has no password, so this command cannot confirm it — use the web app for this")
+		case "clear_in_progress":
+			return errors.New("a clear is already running on this account — wait for it to finish ('harbor account clear-status')")
 		case "export_exists":
 			return errors.New(accountExportExistsMessage(apiErr.Details))
 		case "export_in_progress":
@@ -1234,7 +1613,12 @@ func init() {
 	accountDeleteCmd.Flags().String("confirm", "", fmt.Sprintf("Confirmation phrase (must equal %q); required with --yes in non-interactive/--json mode", accountDeleteConfirmPhrase))
 	accountDeleteCmd.Flags().Bool("yes", false, "Skip the interactive prompt (required, with --confirm, in non-interactive/--json mode)")
 
+	accountClearCmd.Flags().String("confirm", "", fmt.Sprintf("Confirmation phrase (must equal %q); required with --yes in non-interactive/--json mode", accountClearConfirmPhrase))
+	accountClearCmd.Flags().Bool("yes", false, "Skip the interactive prompt (required, with --confirm, in non-interactive/--json mode)")
+	accountClearCmd.Flags().Bool("no-wait", false, "Return as soon as the job is queued instead of waiting for it to finish")
+
 	accountCmd.AddCommand(accountExportCmd, accountExportsCmd, accountExportStatusCmd,
-		accountExportDeleteCmd, accountDeleteCmd, accountCancelDeleteCmd)
+		accountExportDeleteCmd, accountDeleteCmd, accountCancelDeleteCmd,
+		accountClearCmd, accountClearStatusCmd)
 	rootCmd.AddCommand(accountCmd)
 }
