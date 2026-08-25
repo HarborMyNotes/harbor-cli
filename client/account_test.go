@@ -4,6 +4,8 @@
 package client
 
 import (
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -171,5 +173,74 @@ func TestCancelAccountDeletion(t *testing.T) {
 	body := string(rec.Body)
 	if !strings.Contains(body, "hunter2") || strings.Contains(body, "confirm") {
 		t.Errorf("cancel body should carry only current_password: %s", body)
+	}
+}
+
+// TestRequestAccountClear pins the endpoint and the two fields the server reads.
+func TestRequestAccountClear(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 202, `{"data":{"clear_job_id":"c1","status":"queued","started_at":1750000000000}}`)
+	defer srv.Close()
+
+	if _, err := testClient(srv.URL).RequestAccountClear("pw", "CLEAR MY ACCOUNT"); err != nil {
+		t.Fatalf("RequestAccountClear error: %v", err)
+	}
+
+	if rec.Method != "POST" || rec.Path != "/account/clear" {
+		t.Errorf("%s %s", rec.Method, rec.Path)
+	}
+	var body map[string]any
+	_ = json.Unmarshal(rec.Body, &body)
+	if body["current_password"] != "pw" {
+		t.Errorf("current_password = %v", body["current_password"])
+	}
+	if body["confirm"] != "CLEAR MY ACCOUNT" {
+		t.Errorf("confirm = %v", body["confirm"])
+	}
+}
+
+// TestRequestAccountClearSendsThePhraseUntouched keeps the client out of the
+// comparison. The server matches byte for byte, so normalising here would turn
+// a phrase it rejects into one it accepts — and the user would be told a phrase
+// they never typed did not match.
+func TestRequestAccountClearSendsThePhraseUntouched(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 202, `{"data":{}}`)
+	defer srv.Close()
+
+	const typed = "  clear my account  "
+	if _, err := testClient(srv.URL).RequestAccountClear("pw", typed); err != nil {
+		t.Fatalf("RequestAccountClear error: %v", err)
+	}
+
+	var body map[string]any
+	_ = json.Unmarshal(rec.Body, &body)
+	if body["confirm"] != typed {
+		t.Errorf("confirm = %q, want it sent exactly as typed", body["confirm"])
+	}
+}
+
+// TestGetAccountClear pins the polling endpoint, and that a never-cleared
+// account's 404 arrives as a typed error the caller can recognise rather than
+// something it has to sniff out of a message.
+func TestGetAccountClear(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 200, `{"data":{"clear_job_id":"c1","status":"completed","started_at":1,"finished_at":2}}`)
+	defer srv.Close()
+
+	if _, err := testClient(srv.URL).GetAccountClear(); err != nil {
+		t.Fatalf("GetAccountClear error: %v", err)
+	}
+	if rec.Method != "GET" || rec.Path != "/account/clear" {
+		t.Errorf("%s %s", rec.Method, rec.Path)
+	}
+
+	missing := newTestServer(t, nil, 404, `{"error":{"code":"not_found","message":"nope"}}`)
+	defer missing.Close()
+
+	_, err := testClient(missing.URL).GetAccountClear()
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "not_found" {
+		t.Errorf("err = %v, want an APIError with code not_found", err)
 	}
 }

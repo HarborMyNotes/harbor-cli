@@ -214,6 +214,7 @@ See `harbor search --help`.
 | `harbor plan` / `harbor plan list` | Your current plan, and the plans on offer. Upgrading happens in the web app. |
 | `harbor support` | Contact Harbor support (category, subject, message, attachments). |
 | `harbor account export/exports/export-status/export-delete` | Data export: ENEX, HTML or Markdown, whole account or one notebook, with `--wait` and `--download`. |
+| `harbor account clear/clear-status` | Destroy everything IN the account, keeping the account, its login and its plan. Immediate and irreversible; waits for the job to finish. |
 | `harbor account delete/cancel-delete` | Schedule (and cancel) account deletion. |
 | `harbor import enex <file>` / `harbor export enex` | Evernote ENEX interchange. The import uploads straight to storage in chunks (any size), then waits for the import to finish — `--no-wait` returns as soon as it is queued. |
 | `harbor status` | Server health (liveness, readiness, version). |

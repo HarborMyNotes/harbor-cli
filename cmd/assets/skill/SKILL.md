@@ -484,9 +484,14 @@ has copy-paste recipes and the full allowlist.
 - **`notes update` replaces the whole body.** Read-modify-write (above) for
   partial edits; `notes append` for end-only additions.
 - **`--content` does not interpret `\n`.** Use `--stdin`/`--file` for multi-line.
-- **Permanent deletes (`--permanent`), `trash empty`, `account delete`,
-  `share publish` are consequential** — confirm with the user. `trash empty` and
-  `account delete` require `--yes` (and a confirm phrase) in non-interactive use.
+- **Permanent deletes (`--permanent`), `trash empty`, `account clear`,
+  `account delete`, `share publish` are consequential** — confirm with the user.
+  `trash empty`, `account clear` and `account delete` require `--yes` (and a
+  confirm phrase) in non-interactive use.
+- **`account clear` is not `account delete`.** Clear destroys everything IN the
+  account immediately and keeps the account; delete keeps the contents and
+  removes the account after a grace window. Their confirmation phrases differ on
+  purpose and neither satisfies the other — never substitute one for the other.
 - **Encrypted notes** (`is_encrypted: true`) hold only ciphertext server-side:
   they can't be searched, appended to, shared, or converted — leave them alone
   unless the user has a client that handles encryption.

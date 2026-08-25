@@ -82,3 +82,36 @@ func (c *Client) CancelAccountDeletion(currentPassword string) ([]byte, error) {
 		"current_password": currentPassword,
 	})
 }
+
+// RequestAccountClear empties the account without deleting it: every note,
+// notebook, tag, task, file and the encryption keystore go, and the account,
+// its plan, its sessions and its tokens stay. Returns the data-wrapped job
+// ({clear_job_id, status, started_at, finished_at}) with status 202 Accepted.
+//
+// IT IS NOT DELETE. There is no grace period and nothing to cancel — the work
+// starts immediately, which is why the server demands both a re-auth proof and
+// a confirmation phrase of its own. The phrase is compared byte for byte, so
+// send exactly what the user typed rather than a trimmed or upper-cased copy;
+// normalising it here would turn a phrase the server rejects into one it
+// accepts.
+//
+// The 202 is the job being QUEUED, not the account being empty. A large account
+// spends minutes deleting attachment blobs, so a caller that reports success
+// off this response tells the user their notes are gone while the server still
+// has them. Poll GetAccountClear.
+func (c *Client) RequestAccountClear(currentPassword, confirm string) ([]byte, error) {
+	return c.doPost("/account/clear", map[string]any{
+		"current_password": currentPassword,
+		"confirm":          confirm,
+	})
+}
+
+// GetAccountClear returns the account's current (or last) clear job, in the same
+// shape RequestAccountClear returns.
+//
+// An account that has never been cleared answers 404 not_found. That is an
+// ANSWER, not a failure — the caller decides what it means, because the same
+// code means "no such export job" elsewhere in this domain.
+func (c *Client) GetAccountClear() ([]byte, error) {
+	return c.doGet("/account/clear", nil)
+}

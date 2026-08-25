@@ -419,8 +419,25 @@ output; `reset` is the revocation path.
 | `harbor account exports` | Show the current export per format | |
 | `harbor account export-status <id>` | Poll / download the ZIP | `--download <path>`, `--wait` |
 | `harbor account export-delete <id>` | Delete an export, freeing its slot | `--yes` |
+| `harbor account clear` | **Empty** the account, keeping it | `--confirm "CLEAR MY ACCOUNT"`, `--yes`, `--no-wait` |
+| `harbor account clear-status` | The account's current or last clear | |
 | `harbor account delete` | Schedule deletion (grace period) | `--confirm "DELETE MY ACCOUNT"`, `--yes` |
 | `harbor account cancel-delete` | Cancel within grace window | |
+
+**Clear is not delete.** `clear` destroys every note, notebook, tag, task and
+file **immediately** and keeps the account, the login, the sessions and the plan
+— you end up signed in to an empty account with a fresh default notebook, and
+there is nothing to cancel. `delete` is the opposite: a grace window, other
+sessions revoked, nothing destroyed until it elapses, and `cancel-delete` until
+then. Each takes a confirmation phrase the other does not satisfy, matched byte
+for byte, plus the current password. Non-interactive and `--json` runs need both
+`--confirm "<phrase>"` and `--yes`; the password reads from piped stdin. An
+export still on the server is a copy of the notes, so a clear destroys it too.
+
+The server answers as soon as the job is **queued**, not when it is done, so
+`clear` waits for it and reports only when it has finished (`--no-wait` to be
+handed the job instead). A clear also destroys the server-side encryption
+keystore, and the CLI drops its cached copy to match.
 
 **Exports.** You hold one export per format — one ENEX, one HTML, one Markdown —
 and scoping to a notebook does not create a slot of its own. Starting a second of the same format while
