@@ -182,9 +182,15 @@ func (m *apiMock) rawBodyOf(t *testing.T, methodAndPath string) string {
 // test can tell "printed a notice and exited 0" apart from "failed".
 //
 // HOME is a temp dir so a run can never read or write the real credentials file.
+// A test that has already pointed HOME somewhere of its own keeps it: the
+// commands that read or write config files can only be tested against a config
+// directory the test can also see, and silently replacing it turns those
+// assertions into ones that pass no matter what the command did.
 func runCLI(t *testing.T, m *apiMock, args ...string) (string, error) {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
+	if os.Getenv("HOME") == "" || !strings.HasPrefix(os.Getenv("HOME"), os.TempDir()) {
+		t.Setenv("HOME", t.TempDir())
+	}
 	t.Setenv("HARBOR_API_URL", m.baseURL())
 	t.Setenv("HARBOR_TOKEN", "hbp_test-token-not-a-real-credential")
 	resetCommandState(t)

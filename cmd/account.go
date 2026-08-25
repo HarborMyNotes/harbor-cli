@@ -29,22 +29,37 @@ const accountDeleteConfirmPhrase = "DELETE MY ACCOUNT"
 //
 // It is a DIFFERENT phrase from deletion's, and the difference is the safety.
 // The two commands are one word apart, both irreversible, and opposite in what
-// they leave behind — so neither phrase may satisfy the other. Everything below
-// takes the phrase as an argument rather than reading a package constant, which
-// is what makes that structural instead of remembered.
+// they leave behind, so neither phrase may satisfy the other.
 const accountClearConfirmPhrase = "CLEAR MY ACCOUNT"
+
+// accountGate is everything one irreversible whole-account command asks: the
+// phrase, the verb its refusals are worded with, and the registered wording of
+// its prompt.
+//
+// They travel as ONE VALUE because passing them separately is enough to get
+// wrong. Handing clear's phrase to delete's prompt compiles, type-checks, and
+// asks the user to type "DELETE MY ACCOUNT" before sending "CLEAR MY ACCOUNT" —
+// exactly the crossover the two phrases exist to prevent. Declared together
+// once, there is nothing at a call site left to mis-pair.
+type accountGate struct {
+	phrase string
+	verb   string
+	gate   confirmation
+}
 
 const (
 	// accountClearPollInterval is how often the clear job is asked whether it has
 	// finished. The other Harbor clients use the same two seconds, so a user
 	// watching a phone and a terminal sees them agree.
 	accountClearPollInterval = 2 * time.Second
-
-	// accountClearPollTimeout is when this command stops waiting. It is a ceiling
-	// on the WAIT, not on the job: the server carries on regardless, so giving up
-	// here says so rather than reporting a failure.
-	accountClearPollTimeout = 15 * time.Minute
 )
+
+// accountClearPollTimeoutVar is when this command stops waiting. It is a ceiling
+// on the WAIT, not on the job: the server carries on regardless, so giving up
+// here says so rather than reporting a failure.
+//
+// A variable so a test can reach the give-up path without spending the ceiling.
+var accountClearPollTimeoutVar = 15 * time.Minute
 
 // accountCmd is the parent for destructive, whole-account operations: the GDPR
 // data export and the grace-period account deletion (issue #27).
@@ -293,7 +308,7 @@ both --confirm %q and --yes (your password is still read from stdin).`,
 
 		// Resolve the confirmation phrase: typed interactively, or pre-supplied
 		// via --confirm under the non-interactive guard.
-		confirm, err := accountResolveConfirm(cmd, accountDeleteConfirmPhrase, "delete", accountDeleteConfirmation)
+		confirm, err := accountResolveConfirm(cmd, accountDeleteGate)
 		if err != nil {
 			return err
 		}
@@ -713,20 +728,28 @@ var accountDeleteConfirmation = registerConfirmation("harbor account delete", co
 	Aborted:     "aborted — the phrase did not match, so nothing was deleted",
 })
 
+// accountDeleteGate is what `account delete` asks, as one value.
+var accountDeleteGate = accountGate{
+	phrase: accountDeleteConfirmPhrase,
+	verb:   "delete",
+	gate:   accountDeleteConfirmation,
+}
+
 // accountResolveConfirm decides how an irreversible command's confirmation
 // phrase is obtained. In interactive mode (a TTY, not --json) it prompts the
 // user to type the phrase. Otherwise it enforces the non-interactive guard: the
 // caller MUST have passed both --confirm (matching the phrase verbatim) and
 // --yes.
 //
-// The phrase, its verb and its registered wording all arrive together, so a
-// command cannot accidentally be gated by another one's question.
-func accountResolveConfirm(cmd *cobra.Command, phrase, verb string, gate confirmation) (string, error) {
+// The phrase, its verb and its registered wording arrive as ONE value, so a
+// command cannot be gated by another one's question — there are no separate
+// arguments left to pair up wrongly.
+func accountResolveConfirm(cmd *cobra.Command, g accountGate) (string, error) {
 	supplied := ""
 	if cmd.Flags().Changed("confirm") {
 		supplied = stringFlag(cmd, "confirm")
 	}
-	resolved, err := accountConfirmGuard(phrase, verb, jsonOutput, accountIsInteractive(), supplied, boolFlag(cmd, "yes"))
+	resolved, err := accountConfirmGuard(g.phrase, g.verb, jsonOutput, accountIsInteractive(), supplied, boolFlag(cmd, "yes"))
 	if err != nil {
 		return "", err
 	}
@@ -739,10 +762,10 @@ func accountResolveConfirm(cmd *cobra.Command, phrase, verb string, gate confirm
 	// differs from the others — the branches, the wording rules and the
 	// wrong-answer handling are deliberately the same, so it is a registered
 	// confirmation like the rest rather than a second hand-rolled prompt.
-	if err := confirmDestructive(gate, jsonOutput, accountIsInteractive(), false, askLine); err != nil {
+	if err := confirmDestructive(g.gate, jsonOutput, accountIsInteractive(), false, askLine); err != nil {
 		return "", err
 	}
-	return phrase, nil
+	return g.phrase, nil
 }
 
 // accountConfirmGuard enforces the confirmation policy for an irreversible
@@ -842,6 +865,13 @@ var accountClearConfirmation = registerConfirmation("harbor account clear", conf
 	Aborted:     "aborted — the phrase did not match, so nothing was cleared",
 })
 
+// accountClearGate is what `account clear` asks, as one value.
+var accountClearGate = accountGate{
+	phrase: accountClearConfirmPhrase,
+	verb:   "clear",
+	gate:   accountClearConfirmation,
+}
+
 // accountPollClear polls a clear until it stops, returning the last status body.
 //
 // A FAILED POLL IS NOT A FAILED CLEAR. The job runs server-side and keeps
@@ -865,6 +895,16 @@ func accountPollClear(c *client.Client, interval, timeout time.Duration) ([]byte
 	lastStatus := ""
 	for {
 		data, err := c.GetAccountClear()
+		if err != nil {
+			// The one failure that is an ANSWER: the server says there is no clear
+			// job. A POST created one moments ago, so this is not a request that
+			// went astray and waiting fifteen minutes to report a clear "still
+			// running" would be telling the user something untrue.
+			var apiErr *client.APIError
+			if errors.As(err, &apiErr) && apiErr.Code == "not_found" {
+				return last, errors.New("the server has no record of this clear — nothing is running; check the account with 'harbor account clear-status' and run the clear again if it is still full")
+			}
+		}
 		if err == nil {
 			last = data
 			job := parseJSON(client.UnwrapData(data))
@@ -930,7 +970,7 @@ and only then reports success. Pass --no-wait to be handed the job instead.`,
 			return err
 		}
 
-		confirm, err := accountResolveConfirm(cmd, accountClearConfirmPhrase, "clear", accountClearConfirmation)
+		confirm, err := accountResolveConfirm(cmd, accountClearGate)
 		if err != nil {
 			return err
 		}
@@ -948,14 +988,13 @@ and only then reports success. Pass --no-wait to be handed the job instead.`,
 		}
 
 		job := parseJSON(client.UnwrapData(data))
+		var waitErr error
 		if !boolFlag(cmd, "no-wait") && !accountClearIsTerminal(str(job, "status")) {
-			polled, perr := accountPollClear(c, accountClearPollInterval, accountClearPollTimeout)
+			polled, perr := accountPollClear(c, accountClearPollInterval, accountClearPollTimeoutVar)
 			if polled != nil {
 				data = polled
 			}
-			if perr != nil {
-				return perr
-			}
+			waitErr = perr
 		}
 
 		// The server destroyed the keystore with everything else, so the cached
@@ -963,11 +1002,18 @@ and only then reports success. Pass --no-wait to be handed the job instead.`,
 		// behind, the next encryption operation would work against a keystore the
 		// server has never heard of.
 		//
-		// It is cleared on a FAILED job too: a clear that got far enough to fail
-		// may still have taken the keystore with it, and a stale cache is the
-		// worse of the two errors to be left holding.
+		// It is cleared on a failed job, and on a wait this command gave up on,
+		// for the same reason: either may still have taken the keystore, and a
+		// stale cache is the worse of the two things to be left holding.
 		if cerr := config.ClearKeystoreBlob(); cerr != nil {
 			fmt.Fprintln(os.Stderr, dim("could not remove the cached keystore: "+cerr.Error()))
+		}
+		// Only now, because giving up on the WAIT is not giving up on the clear:
+		// the server carries on and takes the keystore with it, so returning
+		// before the line above would leave the stale cache behind precisely
+		// when the account is most certainly being emptied.
+		if waitErr != nil {
+			return waitErr
 		}
 
 		printResult(data, displayClearJob)

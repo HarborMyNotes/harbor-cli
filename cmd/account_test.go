@@ -598,7 +598,7 @@ func TestAccountResolveConfirmRejectsAMistypedPhrase(t *testing.T) {
 			answerPrompt(t, typed)
 			var err error
 			captureStdout(t, func() {
-				_, err = accountResolveConfirm(newCmd(), accountDeleteConfirmPhrase, "delete", accountDeleteConfirmation)
+				_, err = accountResolveConfirm(newCmd(), accountDeleteGate)
 			})
 			if err == nil {
 				t.Fatalf("typing %q scheduled an account deletion", typed)
@@ -613,7 +613,7 @@ func TestAccountResolveConfirmRejectsAMistypedPhrase(t *testing.T) {
 	var phrase string
 	var err error
 	captureStdout(t, func() {
-		phrase, err = accountResolveConfirm(newCmd(), accountDeleteConfirmPhrase, "delete", accountDeleteConfirmation)
+		phrase, err = accountResolveConfirm(newCmd(), accountDeleteGate)
 	})
 	if err != nil || phrase != accountDeleteConfirmPhrase {
 		t.Errorf("the exact phrase must proceed: (%q, %v)", phrase, err)
@@ -1912,5 +1912,113 @@ func TestClearPollGivesUpAtTheCeiling(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the message never says %q:\n%s", want, err)
 		}
+	}
+}
+
+// TestClearKeepsTheCredentials pins the other half of what a clear does
+// locally, and the half that has no visible symptom if it breaks.
+//
+// A clear deliberately does not sign the device out: a signed-out device cannot
+// sync, so it would sit holding a full offline copy of the account its owner
+// believes they emptied. A refactor that reused the delete command's teardown
+// would take the credentials with it and nothing else would notice.
+func TestClearKeepsTheCredentials(t *testing.T) {
+	noClearSleep(t)
+	pipedPassword(t, "correct-horse")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	creds := &config.Credentials{
+		Email:       "you@example.com",
+		AccessToken: "hbp_test-token-not-a-real-credential",
+	}
+	if err := config.Save(creds); err != nil {
+		t.Fatal(err)
+	}
+
+	m := clearMock(t, "completed")
+	if _, err := runCLI(t, m, "account", "clear", "--confirm", accountClearConfirmPhrase, "--yes", "--json"); err != nil {
+		t.Fatalf("account clear: %v", err)
+	}
+
+	got, err := config.Load()
+	if err != nil || got == nil || got.Email != "you@example.com" {
+		t.Errorf("the clear signed the device out (%v, %v) — it can no longer sync away the deletions", got, err)
+	}
+}
+
+// TestClearDropsTheKeystoreEvenWhenItGivesUpWaiting closes the gap between the
+// two things a timeout means. Giving up on the WAIT is not giving up on the
+// clear: the server carries on and takes the keystore with it, so returning
+// early would leave the stale cache behind exactly when the account is most
+// certainly being emptied.
+func TestClearDropsTheKeystoreEvenWhenItGivesUpWaiting(t *testing.T) {
+	noClearSleep(t)
+	pipedPassword(t, "correct-horse")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := config.SaveKeystoreBlob("HRBK1-stale-blob"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Never terminal, so the wait can only end at the ceiling.
+	m := clearMock(t, "running")
+	orig := accountClearPollTimeoutVar
+	t.Cleanup(func() { accountClearPollTimeoutVar = orig })
+	accountClearPollTimeoutVar = time.Nanosecond
+
+	_, err := runCLI(t, m, "account", "clear", "--confirm", accountClearConfirmPhrase, "--yes", "--json")
+
+	if err == nil {
+		t.Fatal("the wait never gave up")
+	}
+	if got, _ := config.LoadKeystoreBlob(); got != "" {
+		t.Errorf("giving up on the wait kept a keystore the server is destroying: %q", got)
+	}
+}
+
+// TestEachGateAsksForThePhraseItSends is the property the accountGate struct
+// exists to hold.
+//
+// Passing the phrase and the prompt separately was enough to get wrong: handing
+// clear's phrase to delete's prompt compiled and type-checked, and asked the
+// user to type "DELETE MY ACCOUNT" before sending "CLEAR MY ACCOUNT" — the exact
+// crossover the two phrases exist to prevent. Bundled, there is nothing left at
+// a call site to mis-pair, and this asserts the bundles themselves agree.
+func TestEachGateAsksForThePhraseItSends(t *testing.T) {
+	for _, g := range []accountGate{accountClearGate, accountDeleteGate} {
+		if g.gate.Affirmative != g.phrase {
+			t.Errorf("the %s gate asks for %q and sends %q", g.verb, g.gate.Affirmative, g.phrase)
+		}
+		if !strings.Contains(g.gate.Prompt, g.phrase) {
+			t.Errorf("the %s prompt does not name the phrase it accepts: %q", g.verb, g.gate.Prompt)
+		}
+		if !strings.Contains(g.gate.Unattended, g.verb) {
+			t.Errorf("the %s refusal does not name the action: %q", g.verb, g.gate.Unattended)
+		}
+	}
+	if accountClearGate.phrase == accountDeleteGate.phrase {
+		t.Fatal("clear and delete share a phrase, so either can be confirmed by the other's")
+	}
+}
+
+// TestClearPollStopsWhenTheServerHasNoJob keeps one failure apart from the rest.
+// A 404 is the server saying there is nothing running — waiting the full ceiling
+// and then reporting a clear "still running" would state something untrue.
+func TestClearPollStopsWhenTheServerHasNoJob(t *testing.T) {
+	noClearSleep(t)
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/account/clear": {Status: 404, Body: `{"error":{"code":"not_found","message":"nope"}}`},
+	})
+
+	_, err := accountPollClear(testClientFor(m), time.Millisecond, time.Minute)
+
+	if err == nil {
+		t.Fatal("a server with no clear job was waited on anyway")
+	}
+	if strings.Contains(err.Error(), "still running") {
+		t.Errorf("the message claims a job the server says does not exist:\n%s", err)
+	}
+	if !strings.Contains(err.Error(), "no record") {
+		t.Errorf("the message does not say what happened:\n%s", err)
 	}
 }
