@@ -47,6 +47,15 @@ type accountGate struct {
 	gate   confirmation
 }
 
+// newAccountGate builds one from the confirmation alone.
+//
+// The phrase is TAKEN from the wording rather than passed alongside it, so the
+// words a user is asked to type and the words sent to the server are one value
+// with one source. A bundle whose prompt and payload disagree cannot be written.
+func newAccountGate(verb string, c confirmation) accountGate {
+	return accountGate{phrase: c.Affirmative, verb: verb, gate: c}
+}
+
 const (
 	// accountClearPollInterval is how often the clear job is asked whether it has
 	// finished. The other Harbor clients use the same two seconds, so a user
@@ -729,11 +738,7 @@ var accountDeleteConfirmation = registerConfirmation("harbor account delete", co
 })
 
 // accountDeleteGate is what `account delete` asks, as one value.
-var accountDeleteGate = accountGate{
-	phrase: accountDeleteConfirmPhrase,
-	verb:   "delete",
-	gate:   accountDeleteConfirmation,
-}
+var accountDeleteGate = newAccountGate("delete", accountDeleteConfirmation)
 
 // accountResolveConfirm decides how an irreversible command's confirmation
 // phrase is obtained. In interactive mode (a TTY, not --json) it prompts the
@@ -866,20 +871,18 @@ var accountClearConfirmation = registerConfirmation("harbor account clear", conf
 })
 
 // accountClearGate is what `account clear` asks, as one value.
-var accountClearGate = accountGate{
-	phrase: accountClearConfirmPhrase,
-	verb:   "clear",
-	gate:   accountClearConfirmation,
-}
+var accountClearGate = newAccountGate("clear", accountClearConfirmation)
 
 // accountPollClear polls a clear until it stops, returning the last status body.
 //
 // A FAILED POLL IS NOT A FAILED CLEAR. The job runs server-side and keeps
 // running whatever this process can reach, so a dropped request means "ask
 // again", not "give up" — reporting an error there would tell someone their
-// account may not be empty when the deletion is proceeding regardless. Only the
-// ceiling stops the loop, and it says the job is still running rather than
-// implying it went wrong.
+// account may not be empty when the deletion is proceeding regardless.
+//
+// Two things end the wait early: a terminal status, and the server saying twice
+// that no clear job exists. Everything else waits for the ceiling, which says
+// the job is still running rather than implying it went wrong.
 //
 // Progress goes to stderr so '--json' stays a document.
 func accountPollClear(c *client.Client, interval, timeout time.Duration) ([]byte, error) {
@@ -893,19 +896,29 @@ func accountPollClear(c *client.Client, interval, timeout time.Duration) ([]byte
 
 	last := []byte(nil)
 	lastStatus := ""
+	missing := 0
 	for {
 		data, err := c.GetAccountClear()
 		if err != nil {
 			// The one failure that is an ANSWER: the server says there is no clear
-			// job. A POST created one moments ago, so this is not a request that
-			// went astray and waiting fifteen minutes to report a clear "still
-			// running" would be telling the user something untrue.
+			// job. A POST created one moments ago, so waiting fifteen minutes to
+			// report a clear "still running" would be telling the user something
+			// untrue.
+			//
+			// TWICE, though. A 404 from a proxy or a load balancer mid-deploy
+			// decodes to the same code as the server's own answer, and a blip does
+			// not repeat two seconds later — so one is not enough to call an
+			// irreversible operation off.
 			var apiErr *client.APIError
 			if errors.As(err, &apiErr) && apiErr.Code == "not_found" {
-				return last, errors.New("the server has no record of this clear — nothing is running; check the account with 'harbor account clear-status' and run the clear again if it is still full")
+				missing++
+				if missing >= 2 {
+					return last, errors.New("the server has no record of this clear — nothing is running; check the account with 'harbor account clear-status' and run the clear again if it is still full")
+				}
 			}
 		}
 		if err == nil {
+			missing = 0
 			last = data
 			job := parseJSON(client.UnwrapData(data))
 			status := str(job, "status")
@@ -914,6 +927,12 @@ func accountPollClear(c *client.Client, interval, timeout time.Duration) ([]byte
 			}
 			if status != lastStatus && !jsonOutput {
 				fmt.Fprintln(os.Stderr, dim("clearing — "+status+"; large accounts take a few minutes while attachments are deleted"))
+				if lastStatus == "" {
+					// The person most likely to reach for Ctrl-C is the one watching
+					// an irreversible operation they cannot call off. Say which of
+					// the two things it stops.
+					fmt.Fprintln(os.Stderr, dim("Ctrl-C stops the waiting, not the clear — it finishes on its own."))
+				}
 				lastStatus = status
 			}
 		}
@@ -1008,15 +1027,14 @@ and only then reports success. Pass --no-wait to be handed the job instead.`,
 		if cerr := config.ClearKeystoreBlob(); cerr != nil {
 			fmt.Fprintln(os.Stderr, dim("could not remove the cached keystore: "+cerr.Error()))
 		}
-		// Only now, because giving up on the WAIT is not giving up on the clear:
-		// the server carries on and takes the keystore with it, so returning
-		// before the line above would leave the stale cache behind precisely
-		// when the account is most certainly being emptied.
+
+		// Printed before the wait's own error is returned, so a caller that gave
+		// up waiting still receives the job it was waiting on rather than an
+		// empty stdout.
+		printResult(data, displayClearJob)
 		if waitErr != nil {
 			return waitErr
 		}
-
-		printResult(data, displayClearJob)
 		if str(parseJSON(client.UnwrapData(data)), "status") == "failed" {
 			return errClearFailed
 		}

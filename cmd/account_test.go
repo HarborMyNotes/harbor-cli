@@ -1979,11 +1979,9 @@ func TestClearDropsTheKeystoreEvenWhenItGivesUpWaiting(t *testing.T) {
 // TestEachGateAsksForThePhraseItSends is the property the accountGate struct
 // exists to hold.
 //
-// Passing the phrase and the prompt separately was enough to get wrong: handing
-// clear's phrase to delete's prompt compiled and type-checked, and asked the
-// user to type "DELETE MY ACCOUNT" before sending "CLEAR MY ACCOUNT" — the exact
-// crossover the two phrases exist to prevent. Bundled, there is nothing left at
-// a call site to mis-pair, and this asserts the bundles themselves agree.
+// A gate whose prompt and payload disagree asks the user to type one phrase and
+// sends the other — the exact crossover the two phrases exist to prevent, and
+// invisible to a compiler. This asserts each bundle agrees with itself.
 func TestEachGateAsksForThePhraseItSends(t *testing.T) {
 	for _, g := range []accountGate{accountClearGate, accountDeleteGate} {
 		if g.gate.Affirmative != g.phrase {
@@ -2010,7 +2008,9 @@ func TestClearPollStopsWhenTheServerHasNoJob(t *testing.T) {
 		"GET /api/v1/account/clear": {Status: 404, Body: `{"error":{"code":"not_found","message":"nope"}}`},
 	})
 
-	_, err := accountPollClear(testClientFor(m), time.Millisecond, time.Minute)
+	// Enough ceiling for the second 404 to arrive, little enough that a
+	// regression here fails in seconds instead of spinning for the real one.
+	_, err := accountPollClear(testClientFor(m), time.Millisecond, 5*time.Second)
 
 	if err == nil {
 		t.Fatal("a server with no clear job was waited on anyway")
@@ -2020,5 +2020,58 @@ func TestClearPollStopsWhenTheServerHasNoJob(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no record") {
 		t.Errorf("the message does not say what happened:\n%s", err)
+	}
+}
+
+// TestClearJSONStaysADocument keeps the wait's progress off stdout. The poll can
+// print several lines before the job finishes, and a caller piping this into jq
+// receives whatever lands there — so the progress belongs on stderr and the
+// document has to survive a run that actually waited.
+func TestClearJSONStaysADocument(t *testing.T) {
+	noClearSleep(t)
+	pipedPassword(t, "correct-horse")
+	m := clearMock(t, "queued", "running", "completed")
+
+	out, err := runCLI(t, m, "account", "clear", "--confirm", accountClearConfirmPhrase, "--yes", "--json")
+	if err != nil {
+		t.Fatalf("account clear --json: %v", err)
+	}
+
+	var doc map[string]any
+	if jerr := json.Unmarshal([]byte(out), &doc); jerr != nil {
+		t.Fatalf("stdout is not a JSON document (%v):\n%s", jerr, out)
+	}
+	if _, ok := doc["data"]; !ok {
+		t.Errorf("the document is not the job envelope:\n%s", out)
+	}
+	if strings.Contains(out, "clearing —") || strings.Contains(out, "Ctrl-C") {
+		t.Errorf("poll progress leaked onto stdout:\n%s", out)
+	}
+}
+
+// TestClearPollIgnoresASingle404 keeps a proxy from calling off an irreversible
+// operation. A 404 synthesized by a load balancer mid-deploy decodes to the same
+// code as the server's own "no such job", and only the server's answer repeats.
+func TestClearPollIgnoresASingle404(t *testing.T) {
+	noClearSleep(t)
+	polls := 0
+	m := newAPIMock(t, map[string]mockReply{})
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		polls++
+		if polls == 1 {
+			writeJSON(w, 404, json.RawMessage(`{"error":{"code":"not_found","message":"nope"}}`))
+			return
+		}
+		writeJSON(w, 200, json.RawMessage(
+			`{"data":{"clear_job_id":"c1","status":"completed","started_at":1,"finished_at":2}}`))
+	}
+
+	data, err := accountPollClear(testClientFor(m), time.Millisecond, time.Minute)
+
+	if err != nil {
+		t.Fatalf("one 404 called off a clear that was running: %v", err)
+	}
+	if !strings.Contains(string(data), `"completed"`) {
+		t.Errorf("the poll did not reach the finished job:\n%s", data)
 	}
 }
