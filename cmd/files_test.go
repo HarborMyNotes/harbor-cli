@@ -420,6 +420,13 @@ func TestFilesUploadRefusesOverCapBeforeStreaming(t *testing.T) {
 			t.Errorf("refused upload still sent %s (calls: %v)", call, m.calls())
 		}
 	}
+
+	// The probe is built as its own tokenless client because /client-flags is
+	// public. The session's token is set for this run, so an inherited client
+	// would carry it here.
+	if auth := m.authOf(t, "GET /client-flags"); auth != "" {
+		t.Errorf("policy probe sent %q, want no Authorization on a public endpoint", auth)
+	}
 }
 
 // Fail open means the cap is UNKNOWN, not a guess. Asserting the exact zero is
@@ -465,17 +472,27 @@ func TestUploadSizeCapIsZeroWhenUnknown(t *testing.T) {
 
 // A directory can never be uploaded, so it is named as one instead of dying
 // downstream inside the multipart copy.
+//
+// The exact message and the empty call log both matter. Without the guard the
+// failure still mentions "is a directory" and still sends no POST, so a looser
+// assertion passes either way; what actually changes is the wording, the
+// pointless policy probe, and the exit code.
 func TestFilesUploadRefusesADirectory(t *testing.T) {
 	m := uploadMock(t, 200, `{"max_upload_bytes":104857600,"allowed_mime":"*"}`)
-
-	_, err := runCLI(t, m, "files", "upload", t.TempDir())
-	if err == nil || !strings.Contains(err.Error(), "is a directory") {
-		t.Fatalf("error = %v, want a directory refusal", err)
+	dir := filepath.Join(t.TempDir(), "a-folder")
+	if err := os.Mkdir(dir, 0755); err != nil {
+		t.Fatal(err)
 	}
-	for _, call := range m.calls() {
-		if strings.HasPrefix(call, "POST") {
-			t.Errorf("refused directory still sent %s", call)
-		}
+
+	_, err := runCLI(t, m, "files", "upload", dir)
+	if err == nil {
+		t.Fatal("expected a refusal, got nil")
+	}
+	if want := `"a-folder" is a directory`; err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+	if len(m.calls()) != 0 {
+		t.Errorf("a directory is a purely local fact but still hit the network: %v", m.calls())
 	}
 }
 

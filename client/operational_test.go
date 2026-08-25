@@ -132,8 +132,9 @@ func TestOperationalProbesSendNoAuthHeader(t *testing.T) {
 }
 
 // TestClientFlagsHitsOrigin verifies /client-flags is requested at the server
-// ORIGIN (no /api/v1 prefix), anonymously, and that the bare document comes
-// back with the upload policy intact.
+// ORIGIN (no /api/v1 prefix) and that the bare document comes back with the
+// upload policy intact. Whether the request carries a bearer is a property of
+// the caller's client, and the upload probe's own test pins that.
 func TestClientFlagsHitsOrigin(t *testing.T) {
 	var rec recordedRequest
 	srv := newTestServer(t, &rec, 200, `{"offline_priming":true,"max_upload_bytes":104857600,"allowed_mime":"*"}`)
