@@ -334,9 +334,6 @@ note `apply` returns is already filled in — never try to expand them yourself.
 Token list: `docs/template-variables.md` in `app.harbor.my`; flag details in
 `reference.md` → Templates.
 
-(Template content is copied verbatim into the new note; there is no token
-expansion — fill placeholders after applying.)
-
 ### Sharing (public, read-only links)
 
 Publishing makes a note readable by anyone with the link — **confirm with the

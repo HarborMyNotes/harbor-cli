@@ -203,8 +203,11 @@ to the template's default and then to yours, unless overridden.
 the note inherits whatever the template carries, pass a list and the note gets
 exactly that list, or pass an empty value for no tags at all.
 
-Applying into an encrypt-by-default notebook is rejected by the server — fetch
-the template, encrypt locally, and create the note via 'harbor notes create'.`,
+A notebook YOU name with --notebook is rejected if it is encrypt-by-default —
+fetch the template, encrypt locally, and create the note via 'harbor notes
+create'. A notebook the TEMPLATE remembers is tolerated instead: if it has since
+been deleted or turned encrypt-by-default, the note goes to your default
+notebook and the server prints a line saying so.`,
 	Example: `  harbor templates apply 3c4d...
   harbor templates apply 3c4d... --title "Standup 2026-06-22" --notebook 5b1f...
   harbor templates apply 3c4d... --tags 7e1d...,9a2c...
@@ -239,7 +242,7 @@ the template, encrypt locally, and create the note via 'harbor notes create'.`,
 // server-owned wording and is printed verbatim, never parsed or reworded.
 func displayAppliedNote(data []byte) {
 	displayNote(data)
-	if notice := str(parseJSON(data), "notice"); notice != "" {
+	if notice := str(parseJSON(client.UnwrapData(data)), "notice"); notice != "" {
 		fmt.Println()
 		fmt.Println(notice)
 	}
@@ -278,8 +281,13 @@ func mapTemplateError(err error) error {
 			if nb, ok := apiErr.Details["notebook_id"]; ok {
 				return fmt.Errorf("that notebook cannot be used: %v", nb)
 			}
-			if tags, ok := apiErr.Details["tag_ids"]; ok {
-				return fmt.Errorf("those tags cannot be used: %v", tags)
+			// Two spellings on purpose: create and update validate the
+			// template's own list and report "tag_ids", while apply validates
+			// the list sent for the new note and reports "tags".
+			for _, key := range []string{"tag_ids", "tags"} {
+				if tags, ok := apiErr.Details[key]; ok {
+					return fmt.Errorf("those tags cannot be used: %v", tags)
+				}
 			}
 		}
 	}

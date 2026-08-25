@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -86,15 +87,26 @@ func TestMapTemplateError(t *testing.T) {
 // Default notebook and tags
 // ===========================================================================
 
+// The body an apply returns, as the server would send it: {{date}} already
+// expanded, and a token the server does NOT know left exactly as typed. The CLI
+// must reproduce both byte for byte — it does no expansion of its own, and a
+// client-side expander would be a second expansion the contract forbids.
+const (
+	appliedBodyHTML   = "<h1>Standup Aug 25, 2026</h1><p>{{ Unknown_Token }} stays</p>"
+	appliedTitleToken = "Aug 25, 2026"
+	appliedNotice     = "That notebook is no longer available, so this note went to your default notebook."
+)
+
 // templatesMock stubs the create/update/apply routes so a test can drive the
 // real command tree and read back the exact body it sent.
 func templatesMock(t *testing.T) *apiMock {
 	t.Helper()
 	tpl := `{"id":"tpl1","name":"Meeting notes","notebook_id":"nb1","tag_ids":["t1"],"usn":13}`
 	return newAPIMock(t, map[string]mockReply{
-		"POST /api/v1/templates":            {Status: 201, Body: tpl},
-		"PATCH /api/v1/templates/tpl1":      {Status: 200, Body: tpl},
-		"POST /api/v1/templates/tpl1/apply": {Status: 201, Body: `{"note":{"id":"n1","title":"Standup"},"usn":88,"notice":""}`},
+		"POST /api/v1/templates":       {Status: 201, Body: tpl},
+		"PATCH /api/v1/templates/tpl1": {Status: 200, Body: tpl},
+		"POST /api/v1/templates/tpl1/apply": {Status: 201, Body: `{"note":{"id":"n1","title":"Standup ` +
+			appliedTitleToken + `","content":"` + appliedBodyHTML + `"},"usn":88,"notice":"` + appliedNotice + `"}`},
 	})
 }
 
@@ -166,11 +178,17 @@ func TestTemplatesUpdateOmittedPreservesEmptyClears(t *testing.T) {
 func TestTemplatesApplyTagsSentWinsOmittedInherits(t *testing.T) {
 	t.Run("omitted inherits", func(t *testing.T) {
 		m := templatesMock(t)
-		if _, err := runCLI(t, m, "templates", "apply", "tpl1"); err != nil {
+		out, err := runCLI(t, m, "templates", "apply", "tpl1")
+		if err != nil {
 			t.Fatalf("apply failed: %v", err)
 		}
 		if raw := m.rawBodyOf(t, "POST /api/v1/templates/tpl1/apply"); strings.Contains(raw, "tags") {
 			t.Errorf("omitted --tags must not send the key, got %s", raw)
+		}
+		// Driving the real command proves apply is still WIRED to the display
+		// that prints the notice; testing the display function alone does not.
+		if !strings.Contains(out, appliedNotice) {
+			t.Errorf("apply did not print the server's notice:\n%s", out)
 		}
 	})
 
@@ -256,15 +274,21 @@ func TestDisplayAppliedNotePrintsTheNotice(t *testing.T) {
 // wording stays neutral because the same codes arrive from create, update and
 // apply alike.
 func TestMapTemplateErrorSurfacesTagDetails(t *testing.T) {
-	tagErr := &client.APIError{
-		Code:    "validation_failed",
-		Message: "validation failed",
-		Status:  422,
-		Details: map[string]any{"tag_ids": "tag t9 does not exist"},
-	}
-	got := mapTemplateError(tagErr)
-	if !strings.Contains(got.Error(), "t9 does not exist") {
-		t.Errorf("tag detail not surfaced: %q", got.Error())
+	// Both spellings must land: create and update validate the template's own
+	// list and report "tag_ids", while apply validates the list sent for the new
+	// note and reports "tags". Missing the apply spelling would leave the one
+	// path where a stale tag id actually bites with the least helpful message.
+	for _, key := range []string{"tag_ids", "tags"} {
+		tagErr := &client.APIError{
+			Code:    "validation_failed",
+			Message: "validation failed",
+			Status:  422,
+			Details: map[string]any{key: "tag t9 does not exist"},
+		}
+		got := mapTemplateError(tagErr)
+		if !strings.Contains(got.Error(), "t9 does not exist") {
+			t.Errorf("details.%s not surfaced: %q", key, got.Error())
+		}
 	}
 
 	nbErr := &client.APIError{
@@ -276,5 +300,45 @@ func TestMapTemplateErrorSurfacesTagDetails(t *testing.T) {
 	// update, which are not applying anything.
 	if got := mapTemplateError(nbErr); strings.Contains(got.Error(), "apply") {
 		t.Errorf("wording must not assume the operation: %q", got.Error())
+	}
+}
+
+// The server expands a template's {{…}} variables at apply time, so the CLI's
+// only job is to not touch what comes back. This pins that: an expanded date
+// survives, and a token the server left alone survives EXACTLY as typed —
+// casing, inner spacing and braces intact.
+//
+// Without it, a client-side expander could be added and nothing would fail,
+// which is the double expansion the cross-client contract forbids.
+func TestTemplatesApplyPassesTheExpandedBodyThrough(t *testing.T) {
+	m := templatesMock(t)
+	out, err := runCLI(t, m, "templates", "apply", "tpl1", "--json")
+	if err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+
+	var got struct {
+		Note struct {
+			Title   string `json:"title"`
+			Content string `json:"content"`
+		} `json:"note"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("apply --json is not valid JSON: %v\n%s", err, out)
+	}
+	if got.Note.Content != appliedBodyHTML {
+		t.Errorf("body was altered in flight:\n got  %q\n want %q", got.Note.Content, appliedBodyHTML)
+	}
+	if !strings.Contains(got.Note.Title, appliedTitleToken) {
+		t.Errorf("expanded title lost: %q", got.Note.Title)
+	}
+	if !strings.Contains(got.Note.Content, "{{ Unknown_Token }}") {
+		t.Errorf("an unexpanded token must survive verbatim, got %q", got.Note.Content)
+	}
+
+	// The request carries no expansion hint of any kind — expansion is the
+	// server's, and the CLI never asks for it or does it.
+	if raw := m.rawBodyOf(t, "POST /api/v1/templates/tpl1/apply"); strings.Contains(raw, "{{") {
+		t.Errorf("the CLI must not send template tokens back: %s", raw)
 	}
 }

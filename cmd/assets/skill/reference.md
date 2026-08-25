@@ -236,7 +236,11 @@ carries `notebook_id` and `tag_ids` verbatim. Apply's response also carries a
 `notice` — server-owned wording, printed verbatim — which says the template's
 notebook was gone or encrypted so the note was filed in your default instead.
 
-Applying into an encrypt-by-default notebook is rejected.
+A notebook you name with `--notebook` on apply is **rejected** when it is
+encrypt-by-default. A notebook the **template** remembers is **tolerated**: if it
+has been deleted or turned encrypt-by-default since, the note is filed in your
+default notebook and the `notice` says so. Reject what the caller just chose,
+tolerate what a stored record remembers.
 
 ---
 
