@@ -106,6 +106,7 @@ Bodies are Markdown (default) or HTML (`--format`), supplied via `--content`,
 | `harbor notes links <id>` | Outgoing `harbor:note` links | paging |
 | `harbor notes backlinks <id>` | Live notes linking here | paging |
 | `harbor notes audit <id>` | Change log | `--action create\|update\|append\|delete\|restore\|tag\|move\|share`, `--order created_at\|usn`, paging |
+| `harbor notes export <id>` | Write ONE note to a file | `--output` (req; `-` = stdout, a directory takes the server's filename), `--zip`, `--format markdown` |
 
 `--meta` omits bodies for lighter list payloads. List sort fields: `updated_at`,
 `created_at`, `title`, `usn`.
@@ -414,20 +415,42 @@ output; `reset` is the revocation path.
 
 | Command | What it does | Key flags |
 |---|---|---|
-| `harbor account export` | Start an export job | `--format enex\|html`, `--notebook <id>`, `--wait`, `--download <path>` |
+| `harbor account export` | Start an export job | `--format enex\|html\|markdown`, `--notebook <id>`, `--wait`, `--download <path>` |
 | `harbor account exports` | Show the current export per format | |
 | `harbor account export-status <id>` | Poll / download the ZIP | `--download <path>`, `--wait` |
 | `harbor account export-delete <id>` | Delete an export, freeing its slot | `--yes` |
 | `harbor account delete` | Schedule deletion (grace period) | `--confirm "DELETE MY ACCOUNT"`, `--yes` |
 | `harbor account cancel-delete` | Cancel within grace window | |
 
-**Exports.** You hold one export per format — one ENEX, one HTML — and scoping to
-a notebook does not create a third. Starting a second of the same format while
+**Exports.** You hold one export per format — one ENEX, one HTML, one Markdown —
+and scoping to a notebook does not create a slot of its own. Starting a second of the same format while
 one is ready is refused; delete it or wait for it to expire (72 hours). Exports
 run one at a time server-wide, so a new job may sit `queued` (waiting its turn)
 before it starts; progress is counted in **notes**. Lost the job id? `harbor
 account exports` reads it back off the server — export state lives there, not in
 your shell. One-shot: `harbor account export --wait --download ~/Downloads`.
+
+`--format markdown` gives one `.md` per note in folders matching the notebooks,
+attachments alongside — the shape Obsidian, Bear and iA Writer read, and the one
+Harbor can import back. All three formats skip encrypted notes (the server holds
+only ciphertext) and report the count.
+
+**One note to a file** is `harbor notes export <id>`, a different command from
+the account job: it returns the file directly rather than queueing anything.
+
+```bash
+harbor notes export "$NOTE_ID" --output note.md   # a note with no attachments
+harbor notes export "$NOTE_ID" --output .         # server names it; .md or .zip
+harbor notes export "$NOTE_ID" --zip --output .   # always the archive
+```
+
+The SAME command returns `text/markdown` for a note with no attachments and
+`application/zip` (the `.md` plus `files/`) for one with them, so let `--output
+.` take the server's own filename rather than choosing an extension yourself.
+Rendering happens server-side, so this needs a network connection, and encrypted
+notes are refused. **This is an export, not a read:** the file carries YAML front
+matter and the title as a heading, so writing it back with `notes update` would
+put all of that into the note — use `notes get --format markdown` for that.
 
 ---
 

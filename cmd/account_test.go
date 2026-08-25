@@ -172,11 +172,18 @@ func TestAccountDetailEpoch(t *testing.T) {
 	}
 }
 
-// TestAccountArticle keeps the refusal message readable: both format labels are
-// acronyms whose first letter is NAMED with a vowel sound, so both take "an" —
-// "a HTML export" is the kind of wrong that makes a message look machine-made.
+// TestAccountArticle keeps the refusal message readable, and the two rules it
+// has to hold apart are the point.
+//
+// An acronym is spelled out, so its first letter's NAME decides the article —
+// "an HTML", "an ENEX". A label that is an ordinary word is read as a word, and
+// Markdown is one: the acronym rule would make it "an Markdown", which is the
+// kind of wrong that makes a message look machine-made.
 func TestAccountArticle(t *testing.T) {
-	cases := map[string]string{"HTML": "an", "ENEX": "an", "PDF": "a", "zip": "a", "": "a"}
+	cases := map[string]string{
+		"HTML": "an", "ENEX": "an", "PDF": "a", "zip": "a", "": "a",
+		"Markdown": "a", "Evernote": "an", "Obsidian": "an",
+	}
 	for label, want := range cases {
 		if got := accountArticle(label); got != want {
 			t.Errorf("accountArticle(%q) = %q, want %q", label, got, want)
@@ -419,7 +426,7 @@ func TestAccountExportFormatFlag(t *testing.T) {
 	cmd := accountExportCmd
 	defer resetFlags(cmd)
 
-	for _, ok := range []string{"enex", "html", "HTML", " enex "} {
+	for _, ok := range []string{"enex", "html", "markdown", "HTML", "Markdown", " enex "} {
 		_ = cmd.Flags().Set("format", ok)
 		got, err := accountExportFormat(cmd)
 		if err != nil {
@@ -1470,5 +1477,103 @@ func TestAccountExportNextStepLeadsWithTheCommand(t *testing.T) {
 	// The point of the line is that the command does not depend on the mail.
 	if !strings.Contains(accountExportNextStep, "whether or not the email arrives") {
 		t.Errorf("the line must not leave the reader's plan resting on the email: %q", accountExportNextStep)
+	}
+}
+
+// TestAccountExportFormatLabelNamesMarkdown keeps the display name out of the
+// wire value's hands. The refusal reads "you already have a Markdown export",
+// and falling through to the raw code would print it lower-case among two
+// capitalised siblings.
+func TestAccountExportFormatLabelNamesMarkdown(t *testing.T) {
+	if got := accountExportFormatLabel("markdown"); got != "Markdown" {
+		t.Errorf("accountExportFormatLabel(markdown) = %q, want Markdown", got)
+	}
+}
+
+// TestMarkdownExportRefusalReadsCorrectly runs the real 409 for the third
+// format through the message builder — the one place the label and the article
+// meet.
+func TestMarkdownExportRefusalReadsCorrectly(t *testing.T) {
+	msg := accountExportExistsMessage(map[string]any{
+		"export_job_id": "e9",
+		"format":        "markdown",
+		"scope":         "account",
+	})
+
+	if !strings.Contains(msg, "a Markdown export") {
+		t.Errorf("the refusal does not read as English:\n%s", msg)
+	}
+	if strings.Contains(msg, "an Markdown") {
+		t.Errorf("the acronym rule was applied to a word:\n%s", msg)
+	}
+}
+
+// TestAccountExportAcceptsMarkdown drives the real command and checks the third
+// format reaches the wire, since that is the entire change on this half.
+func TestAccountExportAcceptsMarkdown(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"POST /api/v1/account/export": {Status: 202, Body: `{"data":{"export_job_id":"e1","status":"queued","format":"markdown"}}`},
+	})
+
+	if _, err := runCLI(t, m, "account", "export", "--format", "markdown"); err != nil {
+		t.Fatalf("account export --format markdown: %v", err)
+	}
+
+	body := m.bodyOf(t, "POST /api/v1/account/export")
+	if body["format"] != "markdown" {
+		t.Errorf("format = %v on the wire, want markdown", body["format"])
+	}
+}
+
+// TestAccountExportRejectionNamesAllThree keeps the error current with the list.
+// A user who mistypes is being told what IS available, so a stale sentence there
+// hides the format they wanted.
+func TestAccountExportRejectionNamesAllThree(t *testing.T) {
+	cmd := accountExportCmd
+	defer resetFlags(cmd)
+	_ = cmd.Flags().Set("format", "pdf")
+
+	_, err := accountExportFormat(cmd)
+	if err == nil {
+		t.Fatal("--format pdf was accepted")
+	}
+	for _, want := range []string{"enex", "html", "markdown"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal never offers %q:\n%s", want, err)
+		}
+	}
+}
+
+// TestExportOutputPathKeepsTheServerInsideTheChosenDirectory pins the one half
+// of the path that is not the user's to choose.
+//
+// The filename comes off a response header, and joining a directory with
+// something holding ".." resolves back out of it — so `-o .` would write
+// wherever the server said, which is not what naming a directory means.
+func TestExportOutputPathKeepsTheServerInsideTheChosenDirectory(t *testing.T) {
+	dir := t.TempDir()
+
+	for _, hostile := range []string{
+		"../../etc/passwd",
+		"..\\..\\windows\\system32\\drivers\\etc\\hosts",
+		"/etc/passwd",
+		"sub/dir/escape.zip",
+	} {
+		got := accountExportOutputPath(dir, hostile)
+		if filepath.Dir(got) != dir {
+			t.Errorf("filename %q landed at %q, outside the directory the user named (%q)", hostile, got, dir)
+		}
+	}
+
+	// An ordinary name is untouched, which is the whole point of using the
+	// server's filename in the first place.
+	if got, want := accountExportOutputPath(dir, "harbor-markdown-export-2026-08-25.zip"),
+		filepath.Join(dir, "harbor-markdown-export-2026-08-25.zip"); got != want {
+		t.Errorf("accountExportOutputPath = %q, want %q", got, want)
+	}
+
+	// A path the USER typed is theirs, including one that walks upward.
+	if got := accountExportOutputPath("../elsewhere.zip", "server.zip"); got != "../elsewhere.zip" {
+		t.Errorf("the user's own path was rewritten to %q", got)
 	}
 }

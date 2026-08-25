@@ -57,11 +57,35 @@ func TestWriteOutputToFileAndStdout(t *testing.T) {
 	}
 }
 
+// TestFilenameFromContentDisposition covers the shapes the header actually
+// arrives in.
+//
+// The semicolon rows are the ones that matter. A note title is free text, so
+// semicolons in it are ordinary, and `notes export` names its file from the
+// title — cutting the header at the first ";" turns "Q3 planning; Dana.md" into
+// "Q3 planning": no extension, so nothing opens it, and two such notes exported
+// into one directory overwrite each other.
 func TestFilenameFromContentDisposition(t *testing.T) {
 	cases := map[string]string{
-		`attachment; filename="diagram.png"`: "diagram.png",
-		`attachment; filename=report.pdf`:    "report.pdf",
-		`inline`:                             "",
+		`attachment; filename="diagram.png"`:           "diagram.png",
+		`attachment; filename=report.pdf`:              "report.pdf",
+		`inline`:                                       "",
+		`attachment; filename="Q3 planning; Dana.md"`:  "Q3 planning; Dana.md",
+		`attachment; filename="Café ünïcode probe.md"`: "Café ünïcode probe.md",
+		`attachment; filename*=UTF-8''Caf%C3%A9.md`:    "Café.md",
+		`attachment; filename="Plan.zip"; size=42`:     "Plan.zip",
+		`attachment`: "",
+		// Headers a strict parser rejects outright. The scan behind it still
+		// recovers a usable name, which is the whole reason it is kept.
+		`attachment; filename="Plan.md"; badparam`:     "Plan.md",
+		`attachment; filename="a.md"; filename="b.md"`: "a.md",
+		// Go decodes filename* without checking the result and prefers it over
+		// filename, so a broken one must not beat a good plain name.
+		`attachment; filename="fallback.md"; filename*=UTF-8''%E2%82`: "fallback.md",
+		// Legitimate non-ASCII must survive the validity check that rejects the
+		// row above — note titles are whatever the user typed.
+		`attachment; filename*=UTF-8''%E5%9B%9B%E5%8D%8A%E6%9C%9F.md`: "四半期.md",
+		`attachment; filename="Plan 🚢.md"`:                            "Plan 🚢.md",
 	}
 	for in, want := range cases {
 		if got := filenameFromContentDisposition(in); got != want {
@@ -295,5 +319,40 @@ func TestFilesKeyHappyPath(t *testing.T) {
 	}
 	if !bytes.Equal(got, key) {
 		t.Fatal("filesKey returned a different key")
+	}
+}
+
+// TestRawDownloadKeepsTheServersNameInTheWorkingDirectory pins the other place a
+// filename arrives over the network.
+//
+// With no --output, the server's name IS the output path, so one holding ".."
+// writes outside the directory the command was run in.
+func TestRawDownloadKeepsTheServersNameInTheWorkingDirectory(t *testing.T) {
+	// Run two levels down inside the temp dir so the escape this asserts against
+	// has somewhere to land that the test still owns. Pointing "../.." at the
+	// real filesystem would litter it on the way to failing.
+	root := t.TempDir()
+	dir := filepath.Join(root, "a", "b")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	m := newAPIMock(t, map[string]mockReply{})
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Disposition", `attachment; filename="../../ESCAPED.txt"`)
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("bytes"))
+	}
+
+	if _, err := runCLI(t, m, "files", "download", "abc123", "--raw"); err != nil {
+		t.Fatalf("files download --raw: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, "ESCAPED.txt")); err != nil {
+		t.Errorf("the download did not land in the working directory: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "ESCAPED.txt")); err == nil {
+		t.Error("the server's filename walked out of the working directory")
 	}
 }

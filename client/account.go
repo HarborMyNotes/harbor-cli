@@ -4,15 +4,16 @@
 package client
 
 // StartAccountExport starts an export job. Both arguments are optional: an empty
-// pair starts a whole-account ENEX export (the original behavior). format selects
-// the archive kind — "enex" (the GDPR ZIP: one ENEX per notebook, the attachment
-// bytes, a manifest) or "html" (a self-contained, browsable offline website) —
-// and notebookID scopes the export to a single notebook, for either format.
+// pair starts a whole-account ENEX export. format selects the archive kind —
+// "enex" (the GDPR ZIP: one ENEX per notebook, the attachment bytes, a
+// manifest), "html" (a self-contained, browsable offline website) or "markdown"
+// (one .md per note in folders matching the notebooks, attachments alongside) —
+// and notebookID scopes the export to a single notebook, for any format.
 // Returns the data-wrapped job ({export_job_id, status, format, notebook_id,
 // notebook_name}); the response status is 202 Accepted.
 //
 // An account holds at most one live export PER FORMAT, and scope does not create
-// a third slot. A queued/running export of the same format is handed back rather
+// a slot of its own. A queued/running export of the same format is handed back rather
 // than started twice; a completed, unexpired one is refused with 409
 // export_exists whose details carry export_job_id, format, scope, notebook_id,
 // notebook_name and result_expires_at — everything needed to explain the refusal
@@ -29,7 +30,8 @@ func (c *Client) StartAccountExport(format, notebookID string) ([]byte, error) {
 }
 
 // ListAccountExports returns what this account's export slots hold right now:
-// the most recent export per format (at most two entries — one ENEX, one HTML),
+// the most recent export per format (at most three entries — one ENEX, one HTML,
+// one Markdown),
 // each in exactly the shape GetAccountExport returns, including a freshly minted
 // download_url for a ready one. A format with no export history is simply absent
 // from the array, and an account that has never exported returns an empty one.

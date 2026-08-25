@@ -29,6 +29,11 @@ callouts, alignment), embedding files/images, and linking notes to each other.
     section 4).
   - `html` — the **exact stored HTML** (lossless; use this to round-trip rich
     notes).
+  - Neither is the way to produce a Markdown **file**. `harbor notes export <id>`
+    renders one on the server — higher fidelity than the read-side conversion,
+    and it brings the attachments — but it is a document, not a body: it carries
+    YAML front matter and the title as a heading, so it must not be written back
+    with `notes update`.
 - **Size cap: 5 MiB** per body (`note_too_large` if exceeded).
 - **Encrypted notes** store opaque ciphertext — none of this applies to them.
 
