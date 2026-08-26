@@ -309,7 +309,10 @@ owns its tasks.
 
 ```bash
 harbor templates list --json
-NEW_ID=$(harbor templates apply "$TPL_ID" --title "Standup $(date +%F)" --json | jq -r '.note.id')
+# Read `notice` too — it is how you learn the note was filed somewhere else.
+APPLIED=$(harbor templates apply "$TPL_ID" --json)
+NEW_ID=$(echo "$APPLIED" | jq -r '.note.id')
+echo "$APPLIED" | jq -r 'select(.notice != "") | .notice'
 harbor templates create --name "Meeting notes" --notebook "$NB_ID" --tags "$TAG_A,$TAG_B" --stdin <<'MD'
 # Meeting — {{date}}
 **Attendees:**

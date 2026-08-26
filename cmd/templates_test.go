@@ -5,6 +5,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -214,19 +215,33 @@ func TestTemplatesApplyTagsSentWinsOmittedInherits(t *testing.T) {
 	})
 }
 
-// The list table carries a tag COUNT; ids are too wide for a column and belong
-// in the detail view.
+// TestDisplayTemplatesShowsTagCount verifies the list table carries a tag COUNT
+// — ids are too wide for a column and belong in the detail view.
+//
+// No other number in the fixture may equal a tag count, or the assertion passes
+// on an unrelated cell: an earlier version of this test was satisfied by a USN
+// that happened to be 3.
 func TestDisplayTemplatesShowsTagCount(t *testing.T) {
 	data := []byte(`{"data":[
-		{"id":"tpl1","name":"Meeting notes","is_system":false,"tag_ids":["t1","t2","t3"],"usn":12,"updated_at":1750000000000},
-		{"id":"tpl2","name":"Bare","is_system":false,"tag_ids":[],"usn":3,"updated_at":1750000000000}
+		{"id":"tpl1","name":"Meeting notes","is_system":false,"tag_ids":["t1","t2","t3"],"usn":1200,"updated_at":1750000000000},
+		{"id":"tpl2","name":"Bare","is_system":false,"tag_ids":[],"usn":3400,"updated_at":1750000000000}
 	],"paging":{"limit":100,"offset":0,"total":2,"has_more":false}}`)
 	out := captureStdout(t, func() { displayTemplates(data) })
 	if !strings.Contains(out, "TAGS") {
 		t.Errorf("no TAGS column:\n%s", out)
 	}
-	if !strings.Contains(out, "3") {
-		t.Errorf("tag count missing:\n%s", out)
+	// Scoped to its own row, so the count cannot be satisfied by another cell.
+	var tplRow string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "Meeting notes") {
+			tplRow = line
+		}
+	}
+	if !strings.Contains(tplRow, "3") {
+		t.Errorf("tag count missing from the template's own row:\n%s", out)
+	}
+	if strings.Contains(tplRow, "—") {
+		t.Errorf("a template WITH tags must not show a dash:\n%s", out)
 	}
 	if !strings.Contains(out, "—") {
 		t.Errorf("an empty tag list should read as an em dash, not a blank:\n%s", out)
@@ -289,6 +304,22 @@ func TestMapTemplateErrorSurfacesTagDetails(t *testing.T) {
 		if !strings.Contains(got.Error(), "t9 does not exist") {
 			t.Errorf("details.%s not surfaced: %q", key, got.Error())
 		}
+		// The friendlier prose must not cost the diagnostics: the code line,
+		// the detail bullets and --verbose's http/request_id all come off the
+		// typed value, and --json reports its code rather than cli_error.
+		var typed *client.APIError
+		if !errors.As(got, &typed) {
+			t.Fatalf("details.%s mapping destroyed the *client.APIError (%T)", key, got)
+		}
+		if typed.Code != "validation_failed" || typed.Status != 422 {
+			t.Errorf("diagnostics lost: code=%q status=%d", typed.Code, typed.Status)
+		}
+		if len(typed.DetailLines()) != 1 {
+			t.Errorf("detail bullets lost: %v", typed.DetailLines())
+		}
+		if tagErr.Message != "validation failed" {
+			t.Errorf("the caller's error was mutated: %q", tagErr.Message)
+		}
 	}
 
 	nbErr := &client.APIError{
@@ -340,5 +371,25 @@ func TestTemplatesApplyPassesTheExpandedBodyThrough(t *testing.T) {
 	// server's, and the CLI never asks for it or does it.
 	if raw := m.rawBodyOf(t, "POST /api/v1/templates/tpl1/apply"); strings.Contains(raw, "{{") {
 		t.Errorf("the CLI must not send template tokens back: %s", raw)
+	}
+}
+
+// TestDisplayAppliedNoteReadsTheNoticeThroughTheEnvelope verifies the notice is
+// read through the same unwrapping the note display uses.
+//
+// Apply answers bare today, so this is defensive: the two halves of the same
+// render must not disagree about the envelope, or a server that starts wrapping
+// would keep printing the note while silently dropping the line that explains
+// where it went.
+func TestDisplayAppliedNoteReadsTheNoticeThroughTheEnvelope(t *testing.T) {
+	for _, shape := range []string{
+		`{"note":{"id":"n1","title":"S","usn":88,"updated_at":1750000000000},"usn":88,"notice":%q}`,
+		`{"data":{"note":{"id":"n1","title":"S","usn":88,"updated_at":1750000000000},"usn":88,"notice":%q}}`,
+	} {
+		data := []byte(strings.Replace(shape, "%q", `"`+appliedNotice+`"`, 1))
+		out := captureStdout(t, func() { displayAppliedNote(data) })
+		if !strings.Contains(out, appliedNotice) {
+			t.Errorf("notice lost for shape %s:\n%s", shape, out)
+		}
 	}
 }

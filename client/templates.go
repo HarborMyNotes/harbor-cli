@@ -39,9 +39,15 @@ func (c *Client) DeleteTemplate(id string) ([]byte, error) {
 	return c.doDelete("/templates/"+id, nil)
 }
 
-// ApplyTemplate instantiates a new note from a template and returns the
-// {note, usn} mutation envelope (the same shape as CreateNote). The body fields
-// (notebook_id, title, tags) are all optional overrides.
+// ApplyTemplate instantiates a new note from a template and returns a
+// {note, usn, notice} envelope — CreateNote's shape plus one advisory line.
+//
+// notice is always present and is "" when there is nothing to say. It is
+// populated when the template's own notebook was gone or encrypt-by-default and
+// the note was filed in the account default instead, so it must be surfaced
+// rather than dropped. The body fields (notebook_id, title, tags) are all
+// optional overrides; an omitted tags inherits the template's, a sent one
+// replaces them.
 func (c *Client) ApplyTemplate(id string, body map[string]any) ([]byte, error) {
 	return c.doPost("/templates/"+id+"/apply", body)
 }

@@ -266,32 +266,48 @@ func countOrDash(n int) string {
 	return strconv.Itoa(n)
 }
 
-// mapTemplateError gives friendly messages for the template-specific codes.
+// mapTemplateError gives friendly messages for the template-specific codes while
+// keeping the typed *client.APIError, so the display layer can still render the
+// code line, the detail bullets and --verbose's http/request_id, and --json
+// still reports the code the server sent rather than a generic cli_error.
+//
+// Only the message is swapped; every other field is carried through, and a code
+// this does not recognise passes through untouched — which is what keeps the
+// plan-limit walkthrough and its exit code working here.
 func mapTemplateError(err error) error {
 	var apiErr *client.APIError
-	if errors.As(err, &apiErr) {
-		switch apiErr.Code {
-		case "system_template_readonly":
-			return errors.New("this is a built-in (system) template — it cannot be edited or deleted")
-		case "validation_failed":
-			// A notebook that is missing, foreign, tombstoned or
-			// encrypt-by-default surfaces here on create, update AND apply, so
-			// the wording stays neutral about which one the user ran; the
-			// server explains the rest via details.
-			if nb, ok := apiErr.Details["notebook_id"]; ok {
-				return fmt.Errorf("that notebook cannot be used: %v", nb)
-			}
-			// Two spellings on purpose: create and update validate the
-			// template's own list and report "tag_ids", while apply validates
-			// the list sent for the new note and reports "tags".
-			for _, key := range []string{"tag_ids", "tags"} {
-				if tags, ok := apiErr.Details[key]; ok {
-					return fmt.Errorf("those tags cannot be used: %v", tags)
-				}
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+	var friendly string
+	switch apiErr.Code {
+	case "system_template_readonly":
+		friendly = "this is a built-in (system) template — it cannot be edited or deleted"
+	case "validation_failed":
+		// A notebook that is missing, foreign, tombstoned or encrypt-by-default
+		// surfaces here on create, update AND apply, so the wording stays
+		// neutral about which one the user ran; the server explains the rest
+		// via details.
+		if nb, ok := apiErr.Details["notebook_id"]; ok {
+			friendly = fmt.Sprintf("that notebook cannot be used: %v", nb)
+			break
+		}
+		// Two spellings on purpose: create and update validate the template's
+		// own list and report "tag_ids", while apply validates the list sent
+		// for the new note and reports "tags".
+		for _, key := range []string{"tag_ids", "tags"} {
+			if tags, ok := apiErr.Details[key]; ok {
+				friendly = fmt.Sprintf("those tags cannot be used: %v", tags)
+				break
 			}
 		}
 	}
-	return err
+	if friendly == "" {
+		return err
+	}
+	rewritten := *apiErr
+	rewritten.Message = friendly
+	return &rewritten
 }
 
 // ===========================================================================
