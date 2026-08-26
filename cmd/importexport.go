@@ -64,8 +64,9 @@ status'. Ctrl-C during the upload cancels it cleanly on the server.
 By default the notes land in a new notebook named after the file — use
 --notebook to force them into an existing (non-encrypted) one.
 
-No email is sent unless you ask for one with --notify-email, since this command
-already reports the outcome; it is worth pairing with --no-wait.`,
+A completion email is sent only when you are not waiting for the result: this
+command prints the outcome itself, so --no-wait asks for one and the default
+waiting mode does not. --notify-email=true|false overrides either way.`,
 	Example: `  harbor import enex evernote.enex
   harbor import enex backup.enex --notebook 5b1f2c9a --filename "My Export.enex"
   harbor import enex huge.enex --no-wait`,
@@ -104,7 +105,7 @@ already reports the outcome; it is worth pairing with --no-wait.`,
 		}
 
 		data, err := uploadImportFile(c, importEnexKind, f, info.Size(), filename,
-			stringFlag(cmd, "notebook"), boolFlag(cmd, "notify-email"))
+			stringFlag(cmd, "notebook"), wantsImportEmail(cmd))
 		if err != nil {
 			return mapImportExportError(err)
 		}
@@ -350,18 +351,55 @@ func uploadImportFile(c *client.Client, kind string, f *os.File, size int64, fil
 		if abortErr != nil {
 			// Never silent: the job keeps its staged bytes until a sweeper
 			// reclaims it, and the id is the only handle the user has on it.
-			fmt.Fprintf(os.Stderr, "%s could not abort the upload: %v\n", colorize("warning:", text.FgYellow), abortErr)
-			fmt.Fprintf(os.Stderr, "  the upload is still open — abort it with: harbor import abort %s\n", jobID)
+			// Under --json the same facts ride on the returned error instead,
+			// so stderr stays a single parseable envelope.
+			if !jsonOutput {
+				fmt.Fprintf(os.Stderr, "%s could not abort the upload: %v\n", colorize("warning:", text.FgYellow), abortErr)
+				fmt.Fprintf(os.Stderr, "  the upload is still open — abort it with: harbor import abort %s\n", jobID)
+			}
+			return nil, abortFailedError(jobID, interrupted)
 		}
 		if interrupted {
-			if abortErr != nil {
-				return nil, fmt.Errorf("import canceled, but the upload could NOT be aborted (job %s)", jobID)
-			}
 			return nil, fmt.Errorf("import canceled — the upload was aborted and nothing was imported (job %s)", jobID)
 		}
 		return nil, err
 	}
 	return c.CompleteImportUpload(kind, jobID, parts)
+}
+
+// wantsImportEmail decides whether the server should email when the import
+// finishes.
+//
+// It follows --no-wait unless the user said otherwise: waiting prints the
+// outcome to the terminal you are sitting at, so an email is noise, while
+// --no-wait is the "I am walking away" case where it is the only signal you get.
+// An explicit --notify-email wins over both.
+func wantsImportEmail(cmd *cobra.Command) bool {
+	if cmd.Flags().Changed("notify-email") {
+		return boolFlag(cmd, "notify-email")
+	}
+	return boolFlag(cmd, "no-wait")
+}
+
+// abortFailedError describes an upload whose abort did not go through, carrying
+// the job id and the recovery command as structured details.
+//
+// It is a *client.APIError so --json reports one parseable envelope: the id is
+// the only handle left on a job still holding its staged bytes, and making a
+// script regex it out of a prose sentence would put it out of reach.
+func abortFailedError(jobID string, interrupted bool) error {
+	msg := "the upload could not be aborted and is still open"
+	if interrupted {
+		msg = "import canceled, but the upload could NOT be aborted"
+	}
+	return &client.APIError{
+		Code:    "import_abort_failed",
+		Message: fmt.Sprintf("%s (job %s)", msg, jobID),
+		Details: map[string]any{
+			"job_id":  jobID,
+			"recover": "harbor import abort " + jobID,
+		},
+	}
 }
 
 // uploadImportParts slices the file into the plan's chunks and PUTs each one to
@@ -834,7 +872,7 @@ func init() {
 	importEnexCmd.Flags().Bool("no-wait", false, "Return once the upload is accepted instead of waiting for the import to finish")
 	importEnexCmd.Flags().Duration("poll-interval", 2*time.Second, "How often to poll while waiting")
 	importEnexCmd.Flags().Duration("timeout", 0, "Give up waiting after this long (0 = no limit; the import keeps running)")
-	importEnexCmd.Flags().Bool("notify-email", false, "Email me when the import finishes (worth pairing with --no-wait)")
+	importEnexCmd.Flags().Bool("notify-email", false, "Email me when the import finishes (defaults to on with --no-wait, off when waiting)")
 	importCmd.AddCommand(importEnexCmd, importStatusCmd, importAbortCmd)
 	rootCmd.AddCommand(importCmd)
 
