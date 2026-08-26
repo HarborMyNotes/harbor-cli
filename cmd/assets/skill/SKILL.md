@@ -309,9 +309,12 @@ owns its tasks.
 
 ```bash
 harbor templates list --json
-NEW_ID=$(harbor templates apply "$TPL_ID" --title "Standup $(date +%F)" --json | jq -r '.note.id')
-harbor templates create --name "Meeting notes" --stdin <<'MD'
-# Meeting — {fill in}
+# Read `notice` too — it is how you learn the note was filed somewhere else.
+APPLIED=$(harbor templates apply "$TPL_ID" --json)
+NEW_ID=$(echo "$APPLIED" | jq -r '.note.id')
+echo "$APPLIED" | jq -r 'select(.notice != "") | .notice'
+harbor templates create --name "Meeting notes" --notebook "$NB_ID" --tags "$TAG_A,$TAG_B" --stdin <<'MD'
+# Meeting — {{date}}
 **Attendees:**
 
 ## Agenda
@@ -323,8 +326,16 @@ harbor templates create --name "Meeting notes" --stdin <<'MD'
 MD
 ```
 
-(Template content is copied verbatim into the new note; there is no token
-expansion — fill placeholders after applying.)
+A template can carry a **default notebook** and **tags**, which a note made from
+it inherits — set them with `--notebook` / `--tags` on create and update. On
+update, omitting a flag preserves the stored value and an empty string clears
+it. `--tags` on **apply replaces** the template's tags rather than adding to
+them.
+
+`{{date}}`-style variables are expanded **by the server at apply time**, so the
+note `apply` returns is already filled in — never try to expand them yourself.
+Token list: `docs/template-variables.md` in `app.harbor.my`; flag details in
+`reference.md` → Templates.
 
 ### Sharing (public, read-only links)
 
@@ -522,7 +533,7 @@ has copy-paste recipes and the full allowlist.
 | Tags | `harbor tags list \| create \| update \| delete` |
 | Reminders | `harbor reminders set \| list \| complete \| clear` |
 | Tasks | `harbor tasks create \| list \| update \| done \| undone \| delete` |
-| Templates | `harbor templates list \| apply \| create` |
+| Templates | `harbor templates list \| apply \| create` (a template can carry a default notebook + tags; `{{date}}` vars expand server-side) |
 | Share | `harbor share publish \| unpublish <id>` |
 | Trash / restore | `harbor notes delete <id>` · `harbor trash restore <id>` |
 | History | `harbor history list \| show \| revert <id>` |

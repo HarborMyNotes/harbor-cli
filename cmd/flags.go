@@ -71,6 +71,20 @@ func addStringIfChanged(cmd *cobra.Command, body map[string]any, flag, key strin
 	}
 }
 
+// addCSVIfChanged copies a comma-separated flag into body[key] as a JSON array,
+// but only when the user explicitly set it.
+//
+// An empty value becomes an empty array rather than being skipped, because on a
+// partial update the server reads an omitted list as "leave it alone" and an
+// empty one as "clear it" — collapsing the two would make a list impossible to
+// empty.
+func addCSVIfChanged(cmd *cobra.Command, body map[string]any, flag, key string) {
+	if cmd.Flags().Changed(flag) {
+		v, _ := cmd.Flags().GetString(flag)
+		body[key] = splitCSV(v)
+	}
+}
+
 // addBoolIfChanged copies a bool flag into body[key] only when explicitly set.
 func addBoolIfChanged(cmd *cobra.Command, body map[string]any, flag, key string) {
 	if cmd.Flags().Changed(flag) {
