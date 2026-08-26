@@ -501,8 +501,16 @@ put all of that into the note — use `notes get --format markdown` for that.
 
 | Command | What it does | Key flags |
 |---|---|---|
-| `harbor import enex <file.enex>` | Import an Evernote export (uploads straight to storage in chunks, then waits for the import) | `--notebook`, `--filename`, `--no-wait`, `--poll-interval`, `--timeout` |
+| `harbor import enex <file.enex>` | Import an Evernote export (uploads straight to storage in chunks, then waits for the import) | `--notebook`, `--filename`, `--no-wait`, `--poll-interval`, `--timeout`, `--notify-email` |
 | `harbor import status <job-id>` | Poll an import job | |
+| `harbor import abort <job-id>` | Cancel an import still awaiting its bytes | |
+
+No completion email is sent unless you pass `--notify-email` — the command
+reports the outcome itself, so the email is worth having only with `--no-wait`.
+
+A failed chunk or a Ctrl-C aborts the upload automatically. If that automatic
+abort itself fails the CLI says so and prints the exact `harbor import abort`
+invocation; until it runs, the job holds its staged bytes.
 | `harbor export enex` | Export notes to `.enex` | `--notebook` *or* `--notes id1,id2`, `--include-resources`, `--output` (`-`=stdout) |
 
 `--notebook` here is **deprecated** — use `harbor account export --format enex

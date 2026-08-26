@@ -49,8 +49,13 @@ func importUploadPath(kind, suffix string) string {
 // target notebook and the encrypted-notebook refusal are all decided, before
 // anything is transferred. filename and targetNotebookID are optional; empty
 // values are omitted so the server's own defaults apply.
-func (c *Client) CreateImportUpload(kind string, totalBytes int64, filename, targetNotebookID string) ([]byte, error) {
-	body := map[string]any{"total_bytes": totalBytes}
+//
+// notifyEmail is always sent, never omitted. The server reads an ABSENT
+// notify_email as true — a sensible default for a browser upload the user walks
+// away from, and the wrong one for a command that prints the outcome itself, so
+// the CLI states its choice rather than inheriting one.
+func (c *Client) CreateImportUpload(kind string, totalBytes int64, filename, targetNotebookID string, notifyEmail bool) ([]byte, error) {
+	body := map[string]any{"total_bytes": totalBytes, "notify_email": notifyEmail}
 	if filename != "" {
 		body["filename"] = filename
 	}

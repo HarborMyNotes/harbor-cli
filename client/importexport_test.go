@@ -23,7 +23,7 @@ func TestCreateImportUpload(t *testing.T) {
 		`{"data":{"import_job_id":"j1","status":"awaiting_upload","part_size":8,"part_count":2}}`)
 	defer srv.Close()
 
-	data, err := testClient(srv.URL).CreateImportUpload("enex", 12, "my export.enex", "nb1")
+	data, err := testClient(srv.URL).CreateImportUpload("enex", 12, "my export.enex", "nb1", true)
 	if err != nil {
 		t.Fatalf("CreateImportUpload error: %v", err)
 	}
@@ -43,6 +43,9 @@ func TestCreateImportUpload(t *testing.T) {
 	if body["filename"] != "my export.enex" || body["target_notebook_id"] != "nb1" {
 		t.Errorf("options not forwarded: %v", body)
 	}
+	if body["notify_email"] != true {
+		t.Errorf("notify_email = %v, want true", body["notify_email"])
+	}
 	if !strings.Contains(string(data), "part_count") {
 		t.Errorf("body = %s", data)
 	}
@@ -56,7 +59,7 @@ func TestCreateImportUploadOmitsEmptyOptions(t *testing.T) {
 	srv := newTestServer(t, &rec, 201, `{"data":{"import_job_id":"j1","part_size":8,"part_count":1}}`)
 	defer srv.Close()
 
-	if _, err := testClient(srv.URL).CreateImportUpload("enex", 5, "", ""); err != nil {
+	if _, err := testClient(srv.URL).CreateImportUpload("enex", 5, "", "", false); err != nil {
 		t.Fatalf("CreateImportUpload error: %v", err)
 	}
 	var body map[string]any
@@ -67,6 +70,11 @@ func TestCreateImportUploadOmitsEmptyOptions(t *testing.T) {
 	if _, ok := body["target_notebook_id"]; ok {
 		t.Errorf("target_notebook_id should be omitted when empty: %s", rec.Body)
 	}
+	// notify_email is the exception: an absent one means TRUE to the server, so
+	// omitting it would opt every CLI import into an email it never asked for.
+	if body["notify_email"] != false {
+		t.Errorf("notify_email must be sent explicitly even when false: %s", rec.Body)
+	}
 }
 
 // TestCreateImportUploadTooLarge verifies the size cap is enforced before any
@@ -74,7 +82,7 @@ func TestCreateImportUploadOmitsEmptyOptions(t *testing.T) {
 func TestCreateImportUploadTooLarge(t *testing.T) {
 	srv := newTestServer(t, nil, 422, `{"error":{"code":"enex_too_large","message":"too big"}}`)
 	defer srv.Close()
-	_, err := testClient(srv.URL).CreateImportUpload("enex", 1<<50, "big.enex", "")
+	_, err := testClient(srv.URL).CreateImportUpload("enex", 1<<50, "big.enex", "", false)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -93,7 +101,7 @@ func TestImportUploadCallsAreKindParameterised(t *testing.T) {
 		call func(c *Client) error
 		path string
 	}{
-		{"create", func(c *Client) error { _, e := c.CreateImportUpload("obsidian_zip", 4, "", ""); return e },
+		{"create", func(c *Client) error { _, e := c.CreateImportUpload("obsidian_zip", 4, "", "", false); return e },
 			"/import/obsidian_zip/uploads"},
 		{"parts", func(c *Client) error { _, e := c.PresignImportParts("obsidian_zip", "j1", []int{1}); return e },
 			"/import/obsidian_zip/uploads/j1/parts"},

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
+	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -61,7 +62,10 @@ return as soon as the upload is accepted and poll it later with 'harbor import
 status'. Ctrl-C during the upload cancels it cleanly on the server.
 
 By default the notes land in a new notebook named after the file — use
---notebook to force them into an existing (non-encrypted) one.`,
+--notebook to force them into an existing (non-encrypted) one.
+
+No email is sent unless you ask for one with --notify-email, since this command
+already reports the outcome; it is worth pairing with --no-wait.`,
 	Example: `  harbor import enex evernote.enex
   harbor import enex backup.enex --notebook 5b1f2c9a --filename "My Export.enex"
   harbor import enex huge.enex --no-wait`,
@@ -99,7 +103,8 @@ By default the notes land in a new notebook named after the file — use
 			filename = filepathBase(path)
 		}
 
-		data, err := uploadImportFile(c, importEnexKind, f, info.Size(), filename, stringFlag(cmd, "notebook"))
+		data, err := uploadImportFile(c, importEnexKind, f, info.Size(), filename,
+			stringFlag(cmd, "notebook"), boolFlag(cmd, "notify-email"))
 		if err != nil {
 			return mapImportExportError(err)
 		}
@@ -145,6 +150,40 @@ var importStatusCmd = &cobra.Command{
 			return mapImportExportError(err)
 		}
 		printResult(data, displayImportStatus)
+		return nil
+	},
+}
+
+// importAbortCmd cancels an upload that never finished handing over its bytes.
+//
+// It exists because an upload interrupted in a way the CLI could not clean up
+// after — the abort call itself failed, the machine lost power, the process was
+// killed — leaves a job sitting in awaiting_upload with a half-written multipart
+// object behind it. That is the only state this can act on: once the bytes are
+// staged the import belongs to the server and there is nothing to abort.
+var importAbortCmd = &cobra.Command{
+	Use:   "abort <job-id>",
+	Short: "Abort an import whose upload never finished",
+	Args:  cobra.ExactArgs(1),
+	Long: `Cancel an import job that is still awaiting its bytes and release the
+partial upload behind it.
+
+You need this only when an upload died without cleaning up after itself — the
+CLI aborts automatically on a failed chunk or a Ctrl-C, and tells you this
+command's exact invocation on the rare occasion that automatic abort fails.
+
+A job that already has its bytes is the server's to finish and cannot be
+aborted; poll it with 'harbor import status' instead.`,
+	Example: "  harbor import abort 0f9c2b1e-1a2b-3c4d-5e6f-7a8b9c0d1e2f",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		c, _, err := loadClientFromConfig()
+		if err != nil {
+			return err
+		}
+		if _, err := c.AbortImportUpload(importEnexKind, args[0]); err != nil {
+			return mapImportExportError(err)
+		}
+		fmt.Println("Upload aborted — nothing was imported.")
 		return nil
 	},
 }
@@ -279,8 +318,8 @@ func mapImportExportError(err error) error {
 // Any failure in the upload window — a rejected chunk, a Ctrl-C — aborts the
 // upload server-side. Without that the job sits in awaiting_upload with a
 // half-written multipart object behind it until a sweeper reclaims it.
-func uploadImportFile(c *client.Client, kind string, f *os.File, size int64, filename, notebookID string) ([]byte, error) {
-	created, err := c.CreateImportUpload(kind, size, filename, notebookID)
+func uploadImportFile(c *client.Client, kind string, f *os.File, size int64, filename, notebookID string, notifyEmail bool) ([]byte, error) {
+	created, err := c.CreateImportUpload(kind, size, filename, notebookID, notifyEmail)
 	if err != nil {
 		return nil, err
 	}
@@ -307,10 +346,17 @@ func uploadImportFile(c *client.Client, kind string, f *os.File, size int64, fil
 	stop()
 
 	if err != nil {
-		if _, abortErr := c.AbortImportUpload(kind, jobID); abortErr != nil && verboseFlag {
-			fmt.Fprintf(os.Stderr, "%s could not abort the upload: %v\n", dim("note:"), abortErr)
+		_, abortErr := c.AbortImportUpload(kind, jobID)
+		if abortErr != nil {
+			// Never silent: the job keeps its staged bytes until a sweeper
+			// reclaims it, and the id is the only handle the user has on it.
+			fmt.Fprintf(os.Stderr, "%s could not abort the upload: %v\n", colorize("warning:", text.FgYellow), abortErr)
+			fmt.Fprintf(os.Stderr, "  the upload is still open — abort it with: harbor import abort %s\n", jobID)
 		}
 		if interrupted {
+			if abortErr != nil {
+				return nil, fmt.Errorf("import canceled, but the upload could NOT be aborted (job %s)", jobID)
+			}
 			return nil, fmt.Errorf("import canceled — the upload was aborted and nothing was imported (job %s)", jobID)
 		}
 		return nil, err
@@ -788,7 +834,8 @@ func init() {
 	importEnexCmd.Flags().Bool("no-wait", false, "Return once the upload is accepted instead of waiting for the import to finish")
 	importEnexCmd.Flags().Duration("poll-interval", 2*time.Second, "How often to poll while waiting")
 	importEnexCmd.Flags().Duration("timeout", 0, "Give up waiting after this long (0 = no limit; the import keeps running)")
-	importCmd.AddCommand(importEnexCmd, importStatusCmd)
+	importEnexCmd.Flags().Bool("notify-email", false, "Email me when the import finishes (worth pairing with --no-wait)")
+	importCmd.AddCommand(importEnexCmd, importStatusCmd, importAbortCmd)
 	rootCmd.AddCommand(importCmd)
 
 	exportEnexCmd.Flags().String("notebook", "", "DEPRECATED — use 'harbor account export --format enex --notebook <id>'. Exports this notebook's live notes (the successor also includes trashed ones)")

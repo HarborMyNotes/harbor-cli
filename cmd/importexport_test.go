@@ -284,6 +284,10 @@ type importStub struct {
 	// failPart, when non-zero, makes that part's PUT fail — the trigger for the
 	// abort path.
 	failPart int
+	// failAbort makes the abort call itself fail, which is the case the CLI has
+	// to tell the user about: the job keeps its staged bytes and only the job id
+	// gets them back to it.
+	failAbort bool
 	// statuses is the sequence the poller reports; the last entry repeats.
 	statuses []string
 	polls    int
@@ -345,6 +349,11 @@ func (st *importStub) serve(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"data":{"import_job_id":"job-1","status":"queued"}}`)
 
 	case strings.HasSuffix(r.URL.Path, "/abort"):
+		if st.failAbort {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprint(w, `{"error":{"code":"internal_error","message":"abort failed"}}`)
+			return
+		}
 		fmt.Fprint(w, `{"data":{"id":"job-1","status":"aborted"}}`)
 
 	case strings.HasPrefix(r.URL.Path, "/api/v1/import/enex/"):
@@ -693,5 +702,73 @@ func TestImportJobFailureStaysQuietWhenNothingWasLost(t *testing.T) {
 		if err := importJobFailure([]byte(body)); err != nil {
 			t.Errorf("%s: want no error, got %v", name, err)
 		}
+	}
+}
+
+// TestImportEnexReportsAnAbortThatFailed covers the half of the abort criterion
+// the happy path cannot: when the abort ITSELF fails the job keeps its staged
+// bytes, and the job id is the only handle the user has left on it.
+//
+// It must not depend on --verbose. A silent failure here leaves an upload open
+// with nothing on screen to say so.
+func TestImportEnexReportsAnAbortThatFailed(t *testing.T) {
+	st := newImportStub(t, 4, `{"data":{"id":"job-1","status":"completed"}}`)
+	st.failPart = 2
+	st.failAbort = true
+
+	stderr := captureStderr(t, func() {
+		if _, err := runCLI(t, st.api, "import", "enex", writeENEX(t, 10), "--poll-interval", "1ms"); err == nil {
+			t.Error("a failed upload must not exit 0")
+		}
+	})
+
+	if !strings.Contains(stderr, "could not abort") {
+		t.Errorf("a failed abort must be reported without --verbose:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "harbor import abort job-1") {
+		t.Errorf("the user needs the job id and a way to use it:\n%s", stderr)
+	}
+}
+
+// TestImportAbortCommand verifies the command the failure message points at
+// actually reaches the abort endpoint — a message naming a command that does
+// not work would be worse than saying nothing.
+func TestImportAbortCommand(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"POST /api/v1/import/enex/uploads/job-1/abort": {Status: 200, Body: `{"data":{"id":"job-1","status":"aborted"}}`},
+	})
+	out, err := runCLI(t, m, "import", "abort", "job-1")
+	if err != nil {
+		t.Fatalf("import abort: %v", err)
+	}
+	if !slices.Contains(m.calls(), "POST /api/v1/import/enex/uploads/job-1/abort") {
+		t.Errorf("abort was not sent: %v", m.calls())
+	}
+	if !strings.Contains(out, "aborted") {
+		t.Errorf("no confirmation printed:\n%s", out)
+	}
+}
+
+// TestImportEnexNotifyEmailIsExplicit pins the one field that must never be
+// omitted: the server reads an ABSENT notify_email as true, so leaving it off
+// would opt every CLI import into an email the user never asked for.
+func TestImportEnexNotifyEmailIsExplicit(t *testing.T) {
+	done := `{"data":{"id":"job-1","status":"completed","total_notes":1,"imported_notes":1,"errors":[]}}`
+
+	st := newImportStub(t, 64, done)
+	if _, err := runCLI(t, st.api, "import", "enex", writeENEX(t, 8), "--poll-interval", "1ms"); err != nil {
+		t.Fatalf("import enex: %v", err)
+	}
+	raw := st.api.rawBodyOf(t, "POST /api/v1/import/enex/uploads")
+	if !strings.Contains(raw, `"notify_email":false`) {
+		t.Errorf("notify_email must be sent as false by default, got %s", raw)
+	}
+
+	st2 := newImportStub(t, 64, done)
+	if _, err := runCLI(t, st2.api, "import", "enex", writeENEX(t, 8), "--notify-email", "--poll-interval", "1ms"); err != nil {
+		t.Fatalf("import enex --notify-email: %v", err)
+	}
+	if raw := st2.api.rawBodyOf(t, "POST /api/v1/import/enex/uploads"); !strings.Contains(raw, `"notify_email":true`) {
+		t.Errorf("--notify-email must send true, got %s", raw)
 	}
 }
