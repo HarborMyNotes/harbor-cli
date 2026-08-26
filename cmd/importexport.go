@@ -298,6 +298,11 @@ func mapImportExportError(err error) error {
 		case "cannot_import_into_encrypted":
 			return errors.New("cannot import into an encrypted notebook (the server holds no key) — choose a different --notebook")
 		case "import_upload_incomplete":
+			// Every code here is raised by create or complete, both OUTSIDE the
+			// window where an abort can fail — which is what keeps this mapper
+			// from flattening importAbortError and discarding the job id, the
+			// recovery keys and the network classification with it. A code that
+			// can arrive from a part upload needs handling there, not here.
 			return errors.New("the upload did not finish — not every chunk reached storage, so the file would have imported truncated. Run the import again")
 		}
 	}

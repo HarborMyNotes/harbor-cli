@@ -6,6 +6,7 @@ package cmd
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -468,5 +469,26 @@ func TestSkillShow(t *testing.T) {
 	// An unknown file is a friendly error, not a panic.
 	if err := skillShowCmd.RunE(skillShowCmd, []string{"missing.md"}); err == nil {
 		t.Error("showing an unknown file should error")
+	}
+}
+
+// TestSkillVersionMatchesTheShippedMarker keeps the two hand-maintained version
+// numbers from drifting apart.
+//
+// skillVersion is what an install reports; the marker at the top of SKILL.md is
+// what a reader of the installed file sees. They have already drifted three
+// releases once, which makes an install claim to be current while the file it
+// wrote says otherwise — and nothing but this test notices.
+func TestSkillVersionMatchesTheShippedMarker(t *testing.T) {
+	body, err := skillFS.ReadFile(skillSourceDir + "/SKILL.md")
+	if err != nil {
+		t.Fatalf("cannot read the embedded SKILL.md: %v", err)
+	}
+	marker := regexp.MustCompile(`(?m)^<!-- Harbor agent skill • v(\S+) -->$`).FindStringSubmatch(string(body))
+	if marker == nil {
+		t.Fatal("SKILL.md has no `<!-- Harbor agent skill • vX.Y.Z -->` marker")
+	}
+	if marker[1] != skillVersion {
+		t.Errorf("SKILL.md's marker says v%s but skillVersion is %s — bump both together", marker[1], skillVersion)
 	}
 }
