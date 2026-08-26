@@ -216,7 +216,7 @@ See `harbor search --help`.
 | `harbor account export/exports/export-status/export-delete` | Data export: ENEX, HTML or Markdown, whole account or one notebook, with `--wait` and `--download`. |
 | `harbor account clear/clear-status` | Destroy everything IN the account, keeping the account, its login and its plan. Immediate and irreversible; waits for the job to finish. |
 | `harbor account delete/cancel-delete` | Schedule (and cancel) account deletion. |
-| `harbor import enex <file>` / `harbor export enex` | Evernote ENEX interchange. The import uploads straight to storage in chunks (any size), then waits for the import to finish — `--no-wait` returns as soon as it is queued. |
+| `harbor import enex <file>` / `harbor export enex` | Evernote ENEX interchange. The import uploads straight to storage in chunks (any size), then waits for the import to finish. `--no-wait` returns as soon as it is queued, and asks for a completion email by itself since it is the case where the email is your only signal; `--notify-email` overrides that either way. `harbor import abort <job-id>` cancels an upload that never finished. |
 | `harbor status` | Server health (liveness, readiness, version). |
 | `harbor api-version` | Server build version. |
 | `harbor openapi` | Fetch the OpenAPI 3.0 spec. |

@@ -350,7 +350,7 @@ harbor notes append "$NOTE_ID" --format html --content '<p style="color:#1e8e3e;
 | Tables | GFM pipe tables (or `<table>`) | ✅ |
 | Links | `[t](https://…)`, `mailto:`, `harbor:note/<uuid>` | ✅ |
 | Text color / highlight | `<span style="color:…;background-color:…">` | ✅ |
-| Alignment | `style="text-align:center|right|left"` | ✅ |
+| Alignment | `style="text-align:center\|right\|left"` | ✅ |
 | Font weight/size/family | `style="font-…"` | ✅ |
 | Semantic classes | `class="…"` | ✅ |
 | Embedded uploaded file/image | `<harbor-embed type=… resource="sha256:…">` | ✅ |

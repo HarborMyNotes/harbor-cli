@@ -242,6 +242,9 @@ func resetCommandState(t *testing.T) {
 		// hundreds against different stub servers — "nb1 encrypts" would outlive the
 		// server that said so.
 		notebookEncryptionLookups = nil
+		// --no-wait sets this and nothing clears it, so one async import would
+		// otherwise change how every later run's summary is rendered.
+		importEnexAsync = false
 		resetFlags(rootCmd)
 	}
 	clear()

@@ -10,11 +10,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
 )
@@ -284,6 +287,17 @@ type importStub struct {
 	// failPart, when non-zero, makes that part's PUT fail — the trigger for the
 	// abort path.
 	failPart int
+	// failAbort makes the abort call itself fail, which is the case the CLI has
+	// to tell the user about: the job keeps its staged bytes and only the job id
+	// gets them back to it.
+	failAbort bool
+	// interruptOnPart, when non-zero, raises a real SIGINT from inside that
+	// part's PUT. It is the only way to exercise the Ctrl-C branch: a rejected
+	// chunk fails the upload without ever cancelling the context, so the two
+	// paths diverge exactly where the message does.
+	interruptOnPart int
+	// completedParts records the part/ETag list the complete call received.
+	completedParts []map[string]any
 	// statuses is the sequence the poller reports; the last entry repeats.
 	statuses []string
 	polls    int
@@ -297,6 +311,18 @@ func newImportStub(t *testing.T, partSize int64, statuses ...string) *importStub
 
 	st.storage = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n, _ := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/part/"))
+		if n == st.interruptOnPart {
+			if p, perr := os.FindProcess(os.Getpid()); perr == nil {
+				_ = p.Signal(os.Interrupt)
+			}
+			// Give the signal time to reach the handler before this PUT's
+			// failure races it, so the run is cancelled rather than merely
+			// broken.
+			time.Sleep(150 * time.Millisecond)
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte("<Error><Code>AccessDenied</Code></Error>"))
+			return
+		}
 		if n == st.failPart {
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = w.Write([]byte("<Error><Code>AccessDenied</Code></Error>"))
@@ -341,10 +367,20 @@ func (st *importStub) serve(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"data":{"parts":[%s],"expires_in_seconds":21600}}`, strings.Join(parts, ","))
 
 	case strings.HasSuffix(r.URL.Path, "/complete"):
+		var req struct {
+			Parts []map[string]any `json:"parts"`
+		}
+		_ = json.Unmarshal(body, &req)
+		st.completedParts = req.Parts
 		w.WriteHeader(http.StatusAccepted)
 		fmt.Fprint(w, `{"data":{"import_job_id":"job-1","status":"queued"}}`)
 
 	case strings.HasSuffix(r.URL.Path, "/abort"):
+		if st.failAbort {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprint(w, `{"error":{"code":"internal_error","message":"abort failed"}}`)
+			return
+		}
 		fmt.Fprint(w, `{"data":{"id":"job-1","status":"aborted"}}`)
 
 	case strings.HasPrefix(r.URL.Path, "/api/v1/import/enex/"):
@@ -487,6 +523,14 @@ func TestImportEnexAbortsAFailedUpload(t *testing.T) {
 	}
 	if !slices.Contains(st.api.calls(), "POST /api/v1/import/enex/uploads/job-1/abort") {
 		t.Errorf("the upload was never aborted: %v", st.api.calls())
+	}
+	// The upload's own failure is what went wrong; a clean abort must not
+	// rewrite the error into a cancellation the user never asked for.
+	if strings.Contains(err.Error(), "canceled") {
+		t.Errorf("a rejected chunk is not a cancellation: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "403") && !strings.Contains(err.Error(), "storage") {
+		t.Errorf("the error should still name the upload failure, got %q", err.Error())
 	}
 	// Nothing was staged, so nothing may be completed or polled either.
 	for _, call := range st.api.calls() {
@@ -693,5 +737,405 @@ func TestImportJobFailureStaysQuietWhenNothingWasLost(t *testing.T) {
 		if err := importJobFailure([]byte(body)); err != nil {
 			t.Errorf("%s: want no error, got %v", name, err)
 		}
+	}
+}
+
+// TestImportEnexReportsAnAbortThatFailed covers the half of the abort criterion
+// the happy path cannot: when the abort ITSELF fails the job keeps its staged
+// bytes, and the job id is the only handle the user has left on it.
+//
+// It must not depend on --verbose. A silent failure here leaves an upload open
+// with nothing on screen to say so.
+func TestImportEnexReportsAnAbortThatFailed(t *testing.T) {
+	st := newImportStub(t, 4, `{"data":{"id":"job-1","status":"completed"}}`)
+	st.failPart = 2
+	st.failAbort = true
+
+	stderr := captureStderr(t, func() {
+		if _, err := runCLI(t, st.api, "import", "enex", writeENEX(t, 10), "--poll-interval", "1ms"); err == nil {
+			t.Error("a failed upload must not exit 0")
+		}
+	})
+
+	if !strings.Contains(stderr, "could not abort") {
+		t.Errorf("a failed abort must be reported without --verbose:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "harbor import abort job-1") {
+		t.Errorf("the user needs the job id and a way to use it:\n%s", stderr)
+	}
+}
+
+// TestImportAbortCommand verifies the command the failure message points at
+// actually reaches the abort endpoint — a message naming a command that does
+// not work would be worse than saying nothing.
+func TestImportAbortCommand(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"POST /api/v1/import/enex/uploads/job-1/abort": {Status: 200, Body: `{"data":{"id":"job-1","status":"aborted"}}`},
+	})
+	out, err := runCLI(t, m, "import", "abort", "job-1")
+	if err != nil {
+		t.Fatalf("import abort: %v", err)
+	}
+	if !slices.Contains(m.calls(), "POST /api/v1/import/enex/uploads/job-1/abort") {
+		t.Errorf("abort was not sent: %v", m.calls())
+	}
+	if !strings.Contains(out, "aborted") {
+		t.Errorf("no confirmation printed:\n%s", out)
+	}
+
+	// --json is a machine surface: the server's job record, not a sentence.
+	m2 := newAPIMock(t, map[string]mockReply{
+		"POST /api/v1/import/enex/uploads/job-1/abort": {Status: 200, Body: `{"data":{"id":"job-1","status":"aborted"}}`},
+	})
+	out, err = runCLI(t, m2, "import", "abort", "job-1", "--json")
+	if err != nil {
+		t.Fatalf("import abort --json: %v", err)
+	}
+	var got map[string]any
+	if jerr := json.Unmarshal([]byte(out), &got); jerr != nil {
+		t.Fatalf("--json did not emit JSON: %v\n%s", jerr, out)
+	}
+	if data, ok := got["data"].(map[string]any); !ok || data["status"] != "aborted" {
+		t.Errorf("--json lost the job record: %s", out)
+	}
+}
+
+// TestImportEnexNotifyEmail pins the one field that must never be omitted — the
+// server reads an ABSENT notify_email as true — and the rule that decides it.
+//
+// The default follows --no-wait rather than being a fixed false: waiting prints
+// the outcome to the terminal you are sitting at, while --no-wait is the case
+// where the email is the only completion signal you get.
+func TestImportEnexNotifyEmail(t *testing.T) {
+	done := `{"data":{"id":"job-1","status":"completed","total_notes":1,"imported_notes":1,"errors":[]}}`
+
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"waiting sends none", []string{"--poll-interval", "1ms"}, `"notify_email":false`},
+		{"--no-wait asks for one", []string{"--no-wait"}, `"notify_email":true`},
+		{"explicit on while waiting", []string{"--notify-email", "--poll-interval", "1ms"}, `"notify_email":true`},
+		{"explicit off beats --no-wait", []string{"--no-wait", "--notify-email=false"}, `"notify_email":false`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newImportStub(t, 64, done)
+			args := append([]string{"import", "enex", writeENEX(t, 8)}, tc.args...)
+			if _, err := runCLI(t, st.api, args...); err != nil {
+				t.Fatalf("import enex %v: %v", tc.args, err)
+			}
+			if raw := st.api.rawBodyOf(t, "POST /api/v1/import/enex/uploads"); !strings.Contains(raw, tc.want) {
+				t.Errorf("want %s in %s", tc.want, raw)
+			}
+		})
+	}
+}
+
+// TestImportEnexInterruptTellsTheTruthAboutTheAbort raises a real SIGINT
+// mid-upload — the only way to reach the Ctrl-C branch, since a rejected chunk
+// fails without ever cancelling the context.
+//
+// The two outcomes must not share a sentence. Saying "the upload was aborted and
+// nothing was imported" when the abort is what failed sends the user away
+// believing a job was cleaned up that is still holding its bytes.
+func TestImportEnexInterruptTellsTheTruthAboutTheAbort(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Interrupt cannot be delivered to a process on Windows")
+	}
+	t.Run("abort succeeds", func(t *testing.T) {
+		st := newImportStub(t, 4, `{"data":{"id":"job-1","status":"aborted"}}`)
+		st.interruptOnPart = 2
+
+		_, err := runCLI(t, st.api, "import", "enex", writeENEX(t, 10), "--poll-interval", "1ms")
+		if err == nil {
+			t.Fatal("an interrupted import must not exit 0")
+		}
+		if !strings.Contains(err.Error(), "was aborted and nothing was imported") {
+			t.Errorf("error = %q, want the clean-cancel wording", err.Error())
+		}
+	})
+
+	t.Run("abort fails", func(t *testing.T) {
+		st := newImportStub(t, 4, `{"data":{"id":"job-1","status":"aborted"}}`)
+		st.interruptOnPart = 2
+		st.failAbort = true
+
+		_, err := runCLI(t, st.api, "import", "enex", writeENEX(t, 10), "--poll-interval", "1ms")
+		if err == nil {
+			t.Fatal("an interrupted import must not exit 0")
+		}
+		if strings.Contains(err.Error(), "was aborted and nothing was imported") {
+			t.Errorf("a failed abort must not claim the upload was aborted: %q", err.Error())
+		}
+		if !strings.Contains(err.Error(), "could NOT be aborted") {
+			t.Errorf("error = %q, want the failed-abort wording", err.Error())
+		}
+	})
+}
+
+// TestImportEnexAbortFailureIsMachineReadable pins the --json contract: stderr
+// carries one parseable error envelope and no prose, and the job id — the only
+// handle left on an upload still holding its bytes — is a field rather than
+// something a script must regex out of a sentence.
+func TestImportEnexAbortFailureIsMachineReadable(t *testing.T) {
+	st := newImportStub(t, 4, `{"data":{"id":"job-1","status":"completed"}}`)
+	st.failPart = 2
+	st.failAbort = true
+
+	var err error
+	stderr := captureStderr(t, func() {
+		_, err = runCLI(t, st.api, "import", "enex", writeENEX(t, 10), "--json", "--poll-interval", "1ms")
+		renderError(err)
+	})
+	if err == nil {
+		t.Fatal("expected a failure")
+	}
+	if strings.Contains(stderr, "warning:") {
+		t.Errorf("--json must not put prose on stderr:\n%s", stderr)
+	}
+
+	var env struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if jerr := json.Unmarshal([]byte(stderr), &env); jerr != nil {
+		t.Fatalf("stderr is not one JSON envelope: %v\n%s", jerr, stderr)
+	}
+	if env.Error.Code != "import_abort_failed" {
+		t.Errorf("code = %q, want import_abort_failed", env.Error.Code)
+	}
+	if env.Error.Details["job_id"] != "job-1" {
+		t.Errorf("job_id = %v, want job-1", env.Error.Details["job_id"])
+	}
+	if env.Error.Details["recover"] != "harbor import abort job-1" {
+		t.Errorf("recover = %v", env.Error.Details["recover"])
+	}
+}
+
+// TestImportEnexHandsBackEveryETag pins the half of the ETag criterion the
+// client test cannot reach: object storage refuses to assemble a multipart
+// upload without them, so dropping them between the PUT and the complete call
+// fails only against a real store.
+func TestImportEnexHandsBackEveryETag(t *testing.T) {
+	st := newImportStub(t, 4, `{"data":{"id":"job-1","status":"completed","total_notes":1,"imported_notes":1,"errors":[]}}`)
+	if _, err := runCLI(t, st.api, "import", "enex", writeENEX(t, 10), "--poll-interval", "1ms"); err != nil {
+		t.Fatalf("import enex: %v", err)
+	}
+	if len(st.completedParts) != 3 {
+		t.Fatalf("complete carried %d parts, want 3", len(st.completedParts))
+	}
+	for i, p := range st.completedParts {
+		want := fmt.Sprintf("%q", "etag-"+strconv.Itoa(i+1))
+		if p["etag"] != want {
+			t.Errorf("part %d etag = %v, want %s", i+1, p["etag"], want)
+		}
+		if p["part_number"] != float64(i+1) {
+			t.Errorf("part_number = %v, want %d", p["part_number"], i+1)
+		}
+	}
+}
+
+// TestImportPresignBatchRespectsTheServerCap pins the batch size below the
+// server's documented 1000-per-call maximum. Exceeding it fails the presign
+// request outright, which no unit test would otherwise notice.
+func TestImportPresignBatchRespectsTheServerCap(t *testing.T) {
+	const serverMax = 1000
+	if importPresignBatch > serverMax {
+		t.Errorf("importPresignBatch = %d, over the server's %d-per-call cap", importPresignBatch, serverMax)
+	}
+	if importPresignBatch < 1 {
+		t.Errorf("importPresignBatch = %d, must request at least one part", importPresignBatch)
+	}
+}
+
+// TestImportPresignsInMultipleBatches exercises the batching loop, which a
+// small fixture otherwise leaves entirely unrun — every import so far fits in
+// one request.
+func TestImportPresignsInMultipleBatches(t *testing.T) {
+	st := newImportStub(t, 1, `{"data":{"id":"job-1","status":"completed","total_notes":1,"imported_notes":1,"errors":[]}}`)
+	if _, err := runCLI(t, st.api, "import", "enex", writeENEX(t, importPresignBatch+3), "--poll-interval", "1ms"); err != nil {
+		t.Fatalf("import enex: %v", err)
+	}
+	var presigns int
+	for _, call := range st.api.calls() {
+		if strings.HasSuffix(call, "/parts") {
+			presigns++
+		}
+	}
+	if presigns < 2 {
+		t.Errorf("a %d-part upload should presign in more than one batch, got %d call(s)",
+			importPresignBatch+3, presigns)
+	}
+	if len(st.completedParts) != importPresignBatch+3 {
+		t.Errorf("complete carried %d parts, want %d", len(st.completedParts), importPresignBatch+3)
+	}
+}
+
+// TestImportProgressIsSuppressedUnderJSON keeps the machine-readable surface
+// machine-readable: progress is a human affordance, and a percentage printed
+// mid-stream would sit in front of whatever a script is parsing.
+func TestImportProgressIsSuppressedUnderJSON(t *testing.T) {
+	jsonOutput = true
+	t.Cleanup(func() { jsonOutput = false })
+	quiet := &importProgress{total: 100, lastPct: -1}
+	if out := captureStderr(t, func() { quiet.advance(50) }); out != "" {
+		t.Errorf("--json must print no progress, got %q", out)
+	}
+
+	jsonOutput = false
+	human := &importProgress{total: 100, lastPct: -1}
+	if out := captureStderr(t, func() { human.advance(50) }); !strings.Contains(out, "50%") {
+		t.Errorf("progress should still print for a human, got %q", out)
+	}
+}
+
+// TestImportEnexKeepsTheUploadErrorWhenTheAbortAlsoFails covers the case that
+// makes a failed abort common in the first place: the network drops, so the
+// chunk PUT fails AND the abort POST goes over the same dead connection.
+//
+// Reporting only "could not be aborted" would leave the user knowing their
+// import broke but not why — and would cost a wrapper script the exit code it
+// branches on, since a transport failure is retryable and a bare CLI error is
+// not.
+func TestImportEnexKeepsTheUploadErrorWhenTheAbortAlsoFails(t *testing.T) {
+	st := newImportStub(t, 4, `{"data":{"id":"job-1","status":"completed"}}`)
+	st.failPart = 2
+	st.failAbort = true
+
+	_, err := runCLI(t, st.api, "import", "enex", writeENEX(t, 10), "--poll-interval", "1ms")
+	if err == nil {
+		t.Fatal("expected a failure")
+	}
+	if !strings.Contains(err.Error(), "403") && !strings.Contains(err.Error(), "storage") {
+		t.Errorf("the upload's own failure was discarded: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "could not be aborted") {
+		t.Errorf("the failed abort was not reported: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "job-1") {
+		t.Errorf("the job id is the only handle left and is missing: %q", err.Error())
+	}
+}
+
+// TestImportEnexNetworkFailureKeepsExitThree pins the documented exit-code
+// contract through the failed-abort path: 3 means "the API could not be reached,
+// try again", and a wrapper that retries on it must not be told 1 — a permanent
+// failure — for a dropped connection.
+func TestImportEnexNetworkFailureKeepsExitThree(t *testing.T) {
+	cause := &url.Error{Op: "Put", URL: "https://store.example/part/2", Err: errors.New("connection refused")}
+
+	if got := exitCodeFor(abortFailedError(cause, "job-1", false)); got != exitNetwork {
+		t.Errorf("exit code = %d, want %d (retryable) — the wrapped transport error was lost", got, exitNetwork)
+	}
+	// A deliberate Ctrl-C is not a retryable network condition.
+	if got := exitCodeFor(abortFailedError(cause, "job-1", true)); got != exitError {
+		t.Errorf("interrupted exit code = %d, want %d", got, exitError)
+	}
+}
+
+// TestAbortFailedErrorKeepsAServerCode verifies a typed cause survives with its
+// own code and details, gaining the recovery keys rather than being replaced by
+// them — so --json still reports what the server actually said.
+func TestAbortFailedErrorKeepsAServerCode(t *testing.T) {
+	cause := &client.APIError{
+		Code:    "storage_rejected",
+		Message: "the store refused the chunk",
+		Status:  403,
+		Details: map[string]any{"part": "2"},
+	}
+
+	var got *client.APIError
+	if !errors.As(abortFailedError(cause, "job-1", false), &got) {
+		t.Fatal("a typed cause must stay typed")
+	}
+	if got.Code != "storage_rejected" || got.Status != 403 {
+		t.Errorf("server code lost: code=%q status=%d", got.Code, got.Status)
+	}
+	if got.Details["part"] != "2" {
+		t.Errorf("the server's own details were dropped: %v", got.Details)
+	}
+	if got.Details["job_id"] != "job-1" || got.Details["recover"] != "harbor import abort job-1" {
+		t.Errorf("recovery details missing: %v", got.Details)
+	}
+	if cause.Details["job_id"] != nil {
+		t.Error("the caller's details map was mutated")
+	}
+
+	// The code belongs on its own line, not spliced into the wording. Building
+	// the headline from Error() rather than Message doubles it — and for a plan
+	// limit it corrupts the sentence every Harbor client shares, since
+	// planLimitHeadline prints Message verbatim.
+	if strings.HasPrefix(got.Message, "storage_rejected:") {
+		t.Errorf("the code was baked into the message: %q", got.Message)
+	}
+	if !strings.HasPrefix(got.Message, "the store refused the chunk — ") {
+		t.Errorf("message = %q, want the server's own wording first", got.Message)
+	}
+
+	plan := &client.APIError{Code: planLimitCode, Message: "You have reached your plan's limit.", Status: 403}
+	var planGot *client.APIError
+	if !errors.As(abortFailedError(plan, "job-1", false), &planGot) {
+		t.Fatal("a plan limit must stay typed")
+	}
+	if !strings.HasPrefix(planLimitHeadline(planGot), "You have reached your plan's limit.") {
+		t.Errorf("the shared plan-limit wording was corrupted: %q", planLimitHeadline(planGot))
+	}
+	if got := exitCodeFor(abortFailedError(plan, "job-1", false)); got != exitPlanLimit {
+		t.Errorf("plan-limit exit code = %d, want %d", got, exitPlanLimit)
+	}
+}
+
+// TestImportUploadsOneChunkAtATime is the memory criterion made checkable: a
+// file many times the part size must reach the store as part-sized pieces, so
+// nothing the size of the file is ever held at once.
+func TestImportUploadsOneChunkAtATime(t *testing.T) {
+	const partSize, fileSize = 8, 100
+	st := newImportStub(t, partSize, `{"data":{"id":"job-1","status":"completed","total_notes":1,"imported_notes":1,"errors":[]}}`)
+
+	if _, err := runCLI(t, st.api, "import", "enex", writeENEX(t, fileSize), "--poll-interval", "1ms"); err != nil {
+		t.Fatalf("import enex: %v", err)
+	}
+	if len(st.puts) != (fileSize+partSize-1)/partSize {
+		t.Fatalf("store received %d parts, want %d", len(st.puts), (fileSize+partSize-1)/partSize)
+	}
+	for n, body := range st.puts {
+		if len(body) > partSize {
+			t.Errorf("part %d carried %d bytes, over the %d-byte plan — the file was not sliced",
+				n, len(body), partSize)
+		}
+	}
+	if got := st.assembled(); len(got) != fileSize {
+		t.Errorf("reassembled %d bytes, want %d", len(got), fileSize)
+	}
+}
+
+// TestImportProgressClosesItsLine pins the newline that ends an in-place
+// progress line. On a terminal advance() redraws with a carriage return and no
+// newline, so without this the next stderr write lands on the same line — which
+// is what a failed upload's warning does.
+//
+// Whether the call is DEFERRED cannot be observed here: the reporter is created
+// inside uploadImportParts, and tests capture to a pipe where tty is false. This
+// guards the helper; the defer is a one-line reading of the code above it.
+func TestImportProgressClosesItsLine(t *testing.T) {
+	drawn := &importProgress{total: 100, tty: true, lastPct: 40}
+	if out := captureStderr(t, drawn.done); out != "\n" {
+		t.Errorf("a drawn progress line must be closed with a newline, got %q", out)
+	}
+
+	// Nothing was ever drawn, so there is no line to close.
+	untouched := &importProgress{total: 100, tty: true, lastPct: -1}
+	if out := captureStderr(t, untouched.done); out != "" {
+		t.Errorf("nothing was drawn, so nothing should be closed, got %q", out)
+	}
+
+	// Off a terminal every line already ended itself.
+	piped := &importProgress{total: 100, tty: false, lastPct: 40}
+	if out := captureStderr(t, piped.done); out != "" {
+		t.Errorf("off a terminal there is no line to close, got %q", out)
 	}
 }

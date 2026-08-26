@@ -10,7 +10,7 @@ description: >-
   assistant.
 ---
 
-<!-- Harbor agent skill • v1.1.0 -->
+<!-- Harbor agent skill • v1.7.0 -->
 <!-- Copyright (c) 2026 Cloudmanic Labs, LLC. All rights reserved. Date: 2026-06-22 -->
 
 # Harbor CLI — managing notes from the terminal

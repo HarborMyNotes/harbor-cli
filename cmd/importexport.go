@@ -61,7 +61,11 @@ return as soon as the upload is accepted and poll it later with 'harbor import
 status'. Ctrl-C during the upload cancels it cleanly on the server.
 
 By default the notes land in a new notebook named after the file — use
---notebook to force them into an existing (non-encrypted) one.`,
+--notebook to force them into an existing (non-encrypted) one.
+
+A completion email is sent only when you are not waiting for the result: this
+command prints the outcome itself, so --no-wait asks for one and the default
+waiting mode does not. --notify-email=true|false overrides either way.`,
 	Example: `  harbor import enex evernote.enex
   harbor import enex backup.enex --notebook 5b1f2c9a --filename "My Export.enex"
   harbor import enex huge.enex --no-wait`,
@@ -99,7 +103,8 @@ By default the notes land in a new notebook named after the file — use
 			filename = filepathBase(path)
 		}
 
-		data, err := uploadImportFile(c, importEnexKind, f, info.Size(), filename, stringFlag(cmd, "notebook"))
+		data, err := uploadImportFile(c, importEnexKind, f, info.Size(), filename,
+			stringFlag(cmd, "notebook"), wantsImportEmail(cmd))
 		if err != nil {
 			return mapImportExportError(err)
 		}
@@ -145,6 +150,41 @@ var importStatusCmd = &cobra.Command{
 			return mapImportExportError(err)
 		}
 		printResult(data, displayImportStatus)
+		return nil
+	},
+}
+
+// importAbortCmd cancels an upload that never finished handing over its bytes.
+//
+// It exists because an upload interrupted in a way the CLI could not clean up
+// after — the abort call itself failed, the machine lost power, the process was
+// killed — leaves a job sitting in awaiting_upload with a half-written multipart
+// object behind it. That is the only state this can act on: once the bytes are
+// staged the import belongs to the server and there is nothing to abort.
+var importAbortCmd = &cobra.Command{
+	Use:   "abort <job-id>",
+	Short: "Abort an import whose upload never finished",
+	Args:  cobra.ExactArgs(1),
+	Long: `Cancel an import job that is still awaiting its bytes and release the
+partial upload behind it.
+
+You need this only when an upload died without cleaning up after itself — the
+CLI aborts automatically on a failed chunk or a Ctrl-C, and tells you this
+command's exact invocation on the rare occasion that automatic abort fails.
+
+A job that already has its bytes is the server's to finish and cannot be
+aborted; poll it with 'harbor import status' instead.`,
+	Example: "  harbor import abort 0f9c2b1e-1a2b-3c4d-5e6f-7a8b9c0d1e2f",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		c, _, err := loadClientFromConfig()
+		if err != nil {
+			return err
+		}
+		data, err := c.AbortImportUpload(importEnexKind, args[0])
+		if err != nil {
+			return mapImportExportError(err)
+		}
+		printResult(data, displayMessage("Upload aborted — nothing was imported."))
 		return nil
 	},
 }
@@ -258,6 +298,11 @@ func mapImportExportError(err error) error {
 		case "cannot_import_into_encrypted":
 			return errors.New("cannot import into an encrypted notebook (the server holds no key) — choose a different --notebook")
 		case "import_upload_incomplete":
+			// Every code here is raised by create or complete, both OUTSIDE the
+			// window where an abort can fail — which is what keeps this mapper
+			// from flattening importAbortError and discarding the job id, the
+			// recovery keys and the network classification with it. A code that
+			// can arrive from a part upload needs handling there, not here.
 			return errors.New("the upload did not finish — not every chunk reached storage, so the file would have imported truncated. Run the import again")
 		}
 	}
@@ -279,8 +324,8 @@ func mapImportExportError(err error) error {
 // Any failure in the upload window — a rejected chunk, a Ctrl-C — aborts the
 // upload server-side. Without that the job sits in awaiting_upload with a
 // half-written multipart object behind it until a sweeper reclaims it.
-func uploadImportFile(c *client.Client, kind string, f *os.File, size int64, filename, notebookID string) ([]byte, error) {
-	created, err := c.CreateImportUpload(kind, size, filename, notebookID)
+func uploadImportFile(c *client.Client, kind string, f *os.File, size int64, filename, notebookID string, notifyEmail bool) ([]byte, error) {
+	created, err := c.CreateImportUpload(kind, size, filename, notebookID, notifyEmail)
 	if err != nil {
 		return nil, err
 	}
@@ -307,8 +352,17 @@ func uploadImportFile(c *client.Client, kind string, f *os.File, size int64, fil
 	stop()
 
 	if err != nil {
-		if _, abortErr := c.AbortImportUpload(kind, jobID); abortErr != nil && verboseFlag {
-			fmt.Fprintf(os.Stderr, "%s could not abort the upload: %v\n", dim("note:"), abortErr)
+		_, abortErr := c.AbortImportUpload(kind, jobID)
+		if abortErr != nil {
+			// Never silent: the job keeps its staged bytes until a sweeper
+			// reclaims it, and the id is the only handle the user has on it.
+			// Under --json the same facts ride on the returned error instead,
+			// so stderr stays a single parseable envelope.
+			if !jsonOutput {
+				fmt.Fprintf(os.Stderr, "%s could not abort the upload: %v\n", amberWarn("warning:"), abortErr)
+				fmt.Fprintf(os.Stderr, "  the upload is still open — abort it with: harbor import abort %s\n", jobID)
+			}
+			return nil, abortFailedError(err, jobID, interrupted)
 		}
 		if interrupted {
 			return nil, fmt.Errorf("import canceled — the upload was aborted and nothing was imported (job %s)", jobID)
@@ -317,6 +371,93 @@ func uploadImportFile(c *client.Client, kind string, f *os.File, size int64, fil
 	}
 	return c.CompleteImportUpload(kind, jobID, parts)
 }
+
+// wantsImportEmail decides whether the server should email when the import
+// finishes.
+//
+// It follows --no-wait unless the user said otherwise: waiting prints the
+// outcome to the terminal you are sitting at, so an email is noise, while
+// --no-wait is the "I am walking away" case where it is the only signal you get.
+// An explicit --notify-email wins over both.
+func wantsImportEmail(cmd *cobra.Command) bool {
+	if cmd.Flags().Changed("notify-email") {
+		return boolFlag(cmd, "notify-email")
+	}
+	return boolFlag(cmd, "no-wait")
+}
+
+// abortFailedError describes an upload whose abort did not go through, carrying
+// the job id and the recovery command as structured details so a script reading
+// --json never has to regex them out of a sentence.
+//
+// It keeps the CAUSE. The commonest way an abort fails is the network dropping
+// mid-upload — the abort POST goes over the same dead connection — so the case
+// where the abort fails is exactly the case where the upload's own error mattered.
+// Replacing it would cost the user the explanation and cost a wrapper script the
+// exit code it branches on: a transport failure classifies as exitNetwork (3,
+// retryable), and an error that no longer wraps it drops to a plain 1.
+func abortFailedError(cause error, jobID string, interrupted bool) error {
+	recovery := map[string]any{"job_id": jobID, "recover": "harbor import abort " + jobID}
+
+	// An interrupt has no cause worth keeping — the user stopped it on purpose —
+	// so this half says only what is now true of the job.
+	if interrupted {
+		return &client.APIError{
+			Code:    "import_abort_failed",
+			Message: fmt.Sprintf("import canceled, but the upload could NOT be aborted (job %s)", jobID),
+			Details: recovery,
+		}
+	}
+
+	note := fmt.Sprintf("the upload could not be aborted either, so it is still open (job %s)", jobID)
+
+	// A typed cause keeps its own code and details; the recovery keys are added
+	// beside them rather than replacing the envelope the server sent.
+	envelope := &client.APIError{
+		Code:    "import_abort_failed",
+		Message: fmt.Sprintf("%v — %s", cause, note),
+		Details: recovery,
+	}
+	var apiErr *client.APIError
+	if errors.As(cause, &apiErr) {
+		envelope.Code = apiErr.Code
+		envelope.Status = apiErr.Status
+		envelope.RequestID = apiErr.RequestID
+		// Message, not Error(): Error() prefixes the code, which renderError
+		// already prints on its own line — and which planLimitHeadline would
+		// otherwise splice into the wording every Harbor client shares.
+		headline := apiErr.Message
+		if headline == "" {
+			headline = apiErr.Error()
+		}
+		envelope.Message = fmt.Sprintf("%s — %s", headline, note)
+		for k, v := range apiErr.Details {
+			if _, taken := envelope.Details[k]; !taken {
+				envelope.Details[k] = v
+			}
+		}
+	}
+	return &importAbortError{envelope: envelope, cause: cause}
+}
+
+// importAbortError carries BOTH the recovery envelope and the failure that
+// caused it.
+//
+// Unwrap returns the two side by side so each lookup finds what it needs from
+// the same error: the display layer's errors.As reaches the envelope and prints
+// the code, the bullets and the recovery keys, while exitCodeFor's reaches the
+// cause and still classifies a dropped connection as retryable. Collapsing them
+// into one value loses whichever half the other lookup wanted.
+type importAbortError struct {
+	envelope *client.APIError
+	cause    error
+}
+
+// Error renders the envelope's message, which already names the cause.
+func (e *importAbortError) Error() string { return e.envelope.Error() }
+
+// Unwrap exposes both branches to errors.As and errors.Is.
+func (e *importAbortError) Unwrap() []error { return []error{e.envelope, e.cause} }
 
 // uploadImportParts slices the file into the plan's chunks and PUTs each one to
 // its presigned URL, returning the part/ETag list the complete call assembles
@@ -330,6 +471,10 @@ func uploadImportFile(c *client.Client, kind string, f *os.File, size int64, fil
 func uploadImportParts(ctx context.Context, c *client.Client, kind, jobID string, f *os.File, size, partSize int64, partCount int) ([]client.ImportUploadPart, error) {
 	parts := make([]client.ImportUploadPart, 0, partCount)
 	progress := newImportProgress(size)
+	// Deferred, not just called at the end: on a terminal the progress line is
+	// redrawn with a carriage return and no newline, so an early return would
+	// leave the next stderr write pasted onto the end of it.
+	defer progress.done()
 
 	for first := 1; first <= partCount; first += importPresignBatch {
 		if err := ctx.Err(); err != nil {
@@ -368,7 +513,6 @@ func uploadImportParts(ctx context.Context, c *client.Client, kind, jobID string
 			progress.advance(length)
 		}
 	}
-	progress.done()
 	return parts, nil
 }
 
@@ -788,7 +932,8 @@ func init() {
 	importEnexCmd.Flags().Bool("no-wait", false, "Return once the upload is accepted instead of waiting for the import to finish")
 	importEnexCmd.Flags().Duration("poll-interval", 2*time.Second, "How often to poll while waiting")
 	importEnexCmd.Flags().Duration("timeout", 0, "Give up waiting after this long (0 = no limit; the import keeps running)")
-	importCmd.AddCommand(importEnexCmd, importStatusCmd)
+	importEnexCmd.Flags().Bool("notify-email", false, "Email me when the import finishes (defaults to on with --no-wait, off when waiting)")
+	importCmd.AddCommand(importEnexCmd, importStatusCmd, importAbortCmd)
 	rootCmd.AddCommand(importCmd)
 
 	exportEnexCmd.Flags().String("notebook", "", "DEPRECATED — use 'harbor account export --format enex --notebook <id>'. Exports this notebook's live notes (the successor also includes trashed ones)")
