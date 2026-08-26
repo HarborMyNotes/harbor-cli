@@ -418,7 +418,14 @@ func abortFailedError(cause error, jobID string, interrupted bool) error {
 		envelope.Code = apiErr.Code
 		envelope.Status = apiErr.Status
 		envelope.RequestID = apiErr.RequestID
-		envelope.Message = fmt.Sprintf("%s — %s", apiErr.Error(), note)
+		// Message, not Error(): Error() prefixes the code, which renderError
+		// already prints on its own line — and which planLimitHeadline would
+		// otherwise splice into the wording every Harbor client shares.
+		headline := apiErr.Message
+		if headline == "" {
+			headline = apiErr.Error()
+		}
+		envelope.Message = fmt.Sprintf("%s — %s", headline, note)
 		for k, v := range apiErr.Details {
 			if _, taken := envelope.Details[k]; !taken {
 				envelope.Details[k] = v
@@ -459,6 +466,10 @@ func (e *importAbortError) Unwrap() []error { return []error{e.envelope, e.cause
 func uploadImportParts(ctx context.Context, c *client.Client, kind, jobID string, f *os.File, size, partSize int64, partCount int) ([]client.ImportUploadPart, error) {
 	parts := make([]client.ImportUploadPart, 0, partCount)
 	progress := newImportProgress(size)
+	// Deferred, not just called at the end: on a terminal the progress line is
+	// redrawn with a carriage return and no newline, so an early return would
+	// leave the next stderr write pasted onto the end of it.
+	defer progress.done()
 
 	for first := 1; first <= partCount; first += importPresignBatch {
 		if err := ctx.Err(); err != nil {
@@ -497,7 +508,6 @@ func uploadImportParts(ctx context.Context, c *client.Client, kind, jobID string
 			progress.advance(length)
 		}
 	}
-	progress.done()
 	return parts, nil
 }
 

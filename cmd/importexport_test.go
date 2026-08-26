@@ -1064,6 +1064,29 @@ func TestAbortFailedErrorKeepsAServerCode(t *testing.T) {
 	if cause.Details["job_id"] != nil {
 		t.Error("the caller's details map was mutated")
 	}
+
+	// The code belongs on its own line, not spliced into the wording. Building
+	// the headline from Error() rather than Message doubles it — and for a plan
+	// limit it corrupts the sentence every Harbor client shares, since
+	// planLimitHeadline prints Message verbatim.
+	if strings.HasPrefix(got.Message, "storage_rejected:") {
+		t.Errorf("the code was baked into the message: %q", got.Message)
+	}
+	if !strings.HasPrefix(got.Message, "the store refused the chunk — ") {
+		t.Errorf("message = %q, want the server's own wording first", got.Message)
+	}
+
+	plan := &client.APIError{Code: planLimitCode, Message: "You have reached your plan's limit.", Status: 403}
+	var planGot *client.APIError
+	if !errors.As(abortFailedError(plan, "job-1", false), &planGot) {
+		t.Fatal("a plan limit must stay typed")
+	}
+	if !strings.HasPrefix(planLimitHeadline(planGot), "You have reached your plan's limit.") {
+		t.Errorf("the shared plan-limit wording was corrupted: %q", planLimitHeadline(planGot))
+	}
+	if got := exitCodeFor(abortFailedError(plan, "job-1", false)); got != exitPlanLimit {
+		t.Errorf("plan-limit exit code = %d, want %d", got, exitPlanLimit)
+	}
 }
 
 // TestImportUploadsOneChunkAtATime is the memory criterion made checkable: a
@@ -1087,5 +1110,32 @@ func TestImportUploadsOneChunkAtATime(t *testing.T) {
 	}
 	if got := st.assembled(); len(got) != fileSize {
 		t.Errorf("reassembled %d bytes, want %d", len(got), fileSize)
+	}
+}
+
+// TestImportProgressClosesItsLine pins the newline that ends an in-place
+// progress line. On a terminal advance() redraws with a carriage return and no
+// newline, so without this the next stderr write lands on the same line — which
+// is what a failed upload's warning does.
+//
+// Whether the call is DEFERRED cannot be observed here: the reporter is created
+// inside uploadImportParts, and tests capture to a pipe where tty is false. This
+// guards the helper; the defer is a one-line reading of the code above it.
+func TestImportProgressClosesItsLine(t *testing.T) {
+	drawn := &importProgress{total: 100, tty: true, lastPct: 40}
+	if out := captureStderr(t, drawn.done); out != "\n" {
+		t.Errorf("a drawn progress line must be closed with a newline, got %q", out)
+	}
+
+	// Nothing was ever drawn, so there is no line to close.
+	untouched := &importProgress{total: 100, tty: true, lastPct: -1}
+	if out := captureStderr(t, untouched.done); out != "" {
+		t.Errorf("nothing was drawn, so nothing should be closed, got %q", out)
+	}
+
+	// Off a terminal every line already ended itself.
+	piped := &importProgress{total: 100, tty: false, lastPct: 40}
+	if out := captureStderr(t, piped.done); out != "" {
+		t.Errorf("off a terminal there is no line to close, got %q", out)
 	}
 }
