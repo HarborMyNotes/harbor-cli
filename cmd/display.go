@@ -76,6 +76,11 @@ func bold(s string) string { return colorize(s, text.Bold) }
 // the irreversible encryption-setup notice).
 func redWarn(s string) string { return colorize(s, text.FgRed, text.Bold) }
 
+// amberWarn renders a yellow label for a stderr warning — something the user
+// needs to act on, short of the failure itself. Distinct from redWarn, which is
+// for the irreversible.
+func amberWarn(s string) string { return colorize(s, text.FgYellow) }
+
 // star renders the default-marker glyph in yellow.
 func star() string { return colorize("★", text.FgYellow) }
 

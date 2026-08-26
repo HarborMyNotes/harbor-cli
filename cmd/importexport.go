@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
-	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -181,10 +180,11 @@ aborted; poll it with 'harbor import status' instead.`,
 		if err != nil {
 			return err
 		}
-		if _, err := c.AbortImportUpload(importEnexKind, args[0]); err != nil {
+		data, err := c.AbortImportUpload(importEnexKind, args[0])
+		if err != nil {
 			return mapImportExportError(err)
 		}
-		fmt.Println("Upload aborted — nothing was imported.")
+		printResult(data, displayMessage("Upload aborted — nothing was imported."))
 		return nil
 	},
 }
@@ -354,10 +354,10 @@ func uploadImportFile(c *client.Client, kind string, f *os.File, size int64, fil
 			// Under --json the same facts ride on the returned error instead,
 			// so stderr stays a single parseable envelope.
 			if !jsonOutput {
-				fmt.Fprintf(os.Stderr, "%s could not abort the upload: %v\n", colorize("warning:", text.FgYellow), abortErr)
+				fmt.Fprintf(os.Stderr, "%s could not abort the upload: %v\n", amberWarn("warning:"), abortErr)
 				fmt.Fprintf(os.Stderr, "  the upload is still open — abort it with: harbor import abort %s\n", jobID)
 			}
-			return nil, abortFailedError(jobID, interrupted)
+			return nil, abortFailedError(err, jobID, interrupted)
 		}
 		if interrupted {
 			return nil, fmt.Errorf("import canceled — the upload was aborted and nothing was imported (job %s)", jobID)
@@ -382,25 +382,70 @@ func wantsImportEmail(cmd *cobra.Command) bool {
 }
 
 // abortFailedError describes an upload whose abort did not go through, carrying
-// the job id and the recovery command as structured details.
+// the job id and the recovery command as structured details so a script reading
+// --json never has to regex them out of a sentence.
 //
-// It is a *client.APIError so --json reports one parseable envelope: the id is
-// the only handle left on a job still holding its staged bytes, and making a
-// script regex it out of a prose sentence would put it out of reach.
-func abortFailedError(jobID string, interrupted bool) error {
-	msg := "the upload could not be aborted and is still open"
+// It keeps the CAUSE. The commonest way an abort fails is the network dropping
+// mid-upload — the abort POST goes over the same dead connection — so the case
+// where the abort fails is exactly the case where the upload's own error mattered.
+// Replacing it would cost the user the explanation and cost a wrapper script the
+// exit code it branches on: a transport failure classifies as exitNetwork (3,
+// retryable), and an error that no longer wraps it drops to a plain 1.
+func abortFailedError(cause error, jobID string, interrupted bool) error {
+	recovery := map[string]any{"job_id": jobID, "recover": "harbor import abort " + jobID}
+
+	// An interrupt has no cause worth keeping — the user stopped it on purpose —
+	// so this half says only what is now true of the job.
 	if interrupted {
-		msg = "import canceled, but the upload could NOT be aborted"
+		return &client.APIError{
+			Code:    "import_abort_failed",
+			Message: fmt.Sprintf("import canceled, but the upload could NOT be aborted (job %s)", jobID),
+			Details: recovery,
+		}
 	}
-	return &client.APIError{
+
+	note := fmt.Sprintf("the upload could not be aborted either, so it is still open (job %s)", jobID)
+
+	// A typed cause keeps its own code and details; the recovery keys are added
+	// beside them rather than replacing the envelope the server sent.
+	envelope := &client.APIError{
 		Code:    "import_abort_failed",
-		Message: fmt.Sprintf("%s (job %s)", msg, jobID),
-		Details: map[string]any{
-			"job_id":  jobID,
-			"recover": "harbor import abort " + jobID,
-		},
+		Message: fmt.Sprintf("%v — %s", cause, note),
+		Details: recovery,
 	}
+	var apiErr *client.APIError
+	if errors.As(cause, &apiErr) {
+		envelope.Code = apiErr.Code
+		envelope.Status = apiErr.Status
+		envelope.RequestID = apiErr.RequestID
+		envelope.Message = fmt.Sprintf("%s — %s", apiErr.Error(), note)
+		for k, v := range apiErr.Details {
+			if _, taken := envelope.Details[k]; !taken {
+				envelope.Details[k] = v
+			}
+		}
+	}
+	return &importAbortError{envelope: envelope, cause: cause}
 }
+
+// importAbortError carries BOTH the recovery envelope and the failure that
+// caused it.
+//
+// Unwrap returns the two side by side so each lookup finds what it needs from
+// the same error: the display layer's errors.As reaches the envelope and prints
+// the code, the bullets and the recovery keys, while exitCodeFor's reaches the
+// cause and still classifies a dropped connection as retryable. Collapsing them
+// into one value loses whichever half the other lookup wanted.
+type importAbortError struct {
+	envelope *client.APIError
+	cause    error
+}
+
+// Error renders the envelope's message, which already names the cause.
+func (e *importAbortError) Error() string { return e.envelope.Error() }
+
+// Unwrap exposes both branches to errors.As and errors.Is.
+func (e *importAbortError) Unwrap() []error { return []error{e.envelope, e.cause} }
 
 // uploadImportParts slices the file into the plan's chunks and PUTs each one to
 // its presigned URL, returning the part/ETag list the complete call assembles

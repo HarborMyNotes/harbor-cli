@@ -10,11 +10,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -311,7 +312,9 @@ func newImportStub(t *testing.T, partSize int64, statuses ...string) *importStub
 	st.storage = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n, _ := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/part/"))
 		if n == st.interruptOnPart {
-			_ = syscall.Kill(syscall.Getpid(), syscall.SIGINT)
+			if p, perr := os.FindProcess(os.Getpid()); perr == nil {
+				_ = p.Signal(os.Interrupt)
+			}
 			// Give the signal time to reach the handler before this PUT's
 			// failure races it, so the run is cancelled rather than merely
 			// broken.
@@ -520,6 +523,14 @@ func TestImportEnexAbortsAFailedUpload(t *testing.T) {
 	}
 	if !slices.Contains(st.api.calls(), "POST /api/v1/import/enex/uploads/job-1/abort") {
 		t.Errorf("the upload was never aborted: %v", st.api.calls())
+	}
+	// The upload's own failure is what went wrong; a clean abort must not
+	// rewrite the error into a cancellation the user never asked for.
+	if strings.Contains(err.Error(), "canceled") {
+		t.Errorf("a rejected chunk is not a cancellation: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "403") && !strings.Contains(err.Error(), "storage") {
+		t.Errorf("the error should still name the upload failure, got %q", err.Error())
 	}
 	// Nothing was staged, so nothing may be completed or polled either.
 	for _, call := range st.api.calls() {
@@ -771,6 +782,22 @@ func TestImportAbortCommand(t *testing.T) {
 	if !strings.Contains(out, "aborted") {
 		t.Errorf("no confirmation printed:\n%s", out)
 	}
+
+	// --json is a machine surface: the server's job record, not a sentence.
+	m2 := newAPIMock(t, map[string]mockReply{
+		"POST /api/v1/import/enex/uploads/job-1/abort": {Status: 200, Body: `{"data":{"id":"job-1","status":"aborted"}}`},
+	})
+	out, err = runCLI(t, m2, "import", "abort", "job-1", "--json")
+	if err != nil {
+		t.Fatalf("import abort --json: %v", err)
+	}
+	var got map[string]any
+	if jerr := json.Unmarshal([]byte(out), &got); jerr != nil {
+		t.Fatalf("--json did not emit JSON: %v\n%s", jerr, out)
+	}
+	if data, ok := got["data"].(map[string]any); !ok || data["status"] != "aborted" {
+		t.Errorf("--json lost the job record: %s", out)
+	}
 }
 
 // TestImportEnexNotifyEmail pins the one field that must never be omitted — the
@@ -814,6 +841,9 @@ func TestImportEnexNotifyEmail(t *testing.T) {
 // nothing was imported" when the abort is what failed sends the user away
 // believing a job was cleaned up that is still holding its bytes.
 func TestImportEnexInterruptTellsTheTruthAboutTheAbort(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Interrupt cannot be delivered to a process on Windows")
+	}
 	t.Run("abort succeeds", func(t *testing.T) {
 		st := newImportStub(t, 4, `{"data":{"id":"job-1","status":"aborted"}}`)
 		st.interruptOnPart = 2
@@ -960,5 +990,102 @@ func TestImportProgressIsSuppressedUnderJSON(t *testing.T) {
 	human := &importProgress{total: 100, lastPct: -1}
 	if out := captureStderr(t, func() { human.advance(50) }); !strings.Contains(out, "50%") {
 		t.Errorf("progress should still print for a human, got %q", out)
+	}
+}
+
+// TestImportEnexKeepsTheUploadErrorWhenTheAbortAlsoFails covers the case that
+// makes a failed abort common in the first place: the network drops, so the
+// chunk PUT fails AND the abort POST goes over the same dead connection.
+//
+// Reporting only "could not be aborted" would leave the user knowing their
+// import broke but not why — and would cost a wrapper script the exit code it
+// branches on, since a transport failure is retryable and a bare CLI error is
+// not.
+func TestImportEnexKeepsTheUploadErrorWhenTheAbortAlsoFails(t *testing.T) {
+	st := newImportStub(t, 4, `{"data":{"id":"job-1","status":"completed"}}`)
+	st.failPart = 2
+	st.failAbort = true
+
+	_, err := runCLI(t, st.api, "import", "enex", writeENEX(t, 10), "--poll-interval", "1ms")
+	if err == nil {
+		t.Fatal("expected a failure")
+	}
+	if !strings.Contains(err.Error(), "403") && !strings.Contains(err.Error(), "storage") {
+		t.Errorf("the upload's own failure was discarded: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "could not be aborted") {
+		t.Errorf("the failed abort was not reported: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "job-1") {
+		t.Errorf("the job id is the only handle left and is missing: %q", err.Error())
+	}
+}
+
+// TestImportEnexNetworkFailureKeepsExitThree pins the documented exit-code
+// contract through the failed-abort path: 3 means "the API could not be reached,
+// try again", and a wrapper that retries on it must not be told 1 — a permanent
+// failure — for a dropped connection.
+func TestImportEnexNetworkFailureKeepsExitThree(t *testing.T) {
+	cause := &url.Error{Op: "Put", URL: "https://store.example/part/2", Err: errors.New("connection refused")}
+
+	if got := exitCodeFor(abortFailedError(cause, "job-1", false)); got != exitNetwork {
+		t.Errorf("exit code = %d, want %d (retryable) — the wrapped transport error was lost", got, exitNetwork)
+	}
+	// A deliberate Ctrl-C is not a retryable network condition.
+	if got := exitCodeFor(abortFailedError(cause, "job-1", true)); got != exitError {
+		t.Errorf("interrupted exit code = %d, want %d", got, exitError)
+	}
+}
+
+// TestAbortFailedErrorKeepsAServerCode verifies a typed cause survives with its
+// own code and details, gaining the recovery keys rather than being replaced by
+// them — so --json still reports what the server actually said.
+func TestAbortFailedErrorKeepsAServerCode(t *testing.T) {
+	cause := &client.APIError{
+		Code:    "storage_rejected",
+		Message: "the store refused the chunk",
+		Status:  403,
+		Details: map[string]any{"part": "2"},
+	}
+
+	var got *client.APIError
+	if !errors.As(abortFailedError(cause, "job-1", false), &got) {
+		t.Fatal("a typed cause must stay typed")
+	}
+	if got.Code != "storage_rejected" || got.Status != 403 {
+		t.Errorf("server code lost: code=%q status=%d", got.Code, got.Status)
+	}
+	if got.Details["part"] != "2" {
+		t.Errorf("the server's own details were dropped: %v", got.Details)
+	}
+	if got.Details["job_id"] != "job-1" || got.Details["recover"] != "harbor import abort job-1" {
+		t.Errorf("recovery details missing: %v", got.Details)
+	}
+	if cause.Details["job_id"] != nil {
+		t.Error("the caller's details map was mutated")
+	}
+}
+
+// TestImportUploadsOneChunkAtATime is the memory criterion made checkable: a
+// file many times the part size must reach the store as part-sized pieces, so
+// nothing the size of the file is ever held at once.
+func TestImportUploadsOneChunkAtATime(t *testing.T) {
+	const partSize, fileSize = 8, 100
+	st := newImportStub(t, partSize, `{"data":{"id":"job-1","status":"completed","total_notes":1,"imported_notes":1,"errors":[]}}`)
+
+	if _, err := runCLI(t, st.api, "import", "enex", writeENEX(t, fileSize), "--poll-interval", "1ms"); err != nil {
+		t.Fatalf("import enex: %v", err)
+	}
+	if len(st.puts) != (fileSize+partSize-1)/partSize {
+		t.Fatalf("store received %d parts, want %d", len(st.puts), (fileSize+partSize-1)/partSize)
+	}
+	for n, body := range st.puts {
+		if len(body) > partSize {
+			t.Errorf("part %d carried %d bytes, over the %d-byte plan — the file was not sliced",
+				n, len(body), partSize)
+		}
+	}
+	if got := st.assembled(); len(got) != fileSize {
+		t.Errorf("reassembled %d bytes, want %d", len(got), fileSize)
 	}
 }

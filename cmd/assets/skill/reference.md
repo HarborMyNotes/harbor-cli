@@ -511,8 +511,11 @@ A completion email is sent only when you are not waiting for the result:
 `--notify-email=true|false` overrides either way.
 
 A failed chunk or a Ctrl-C aborts the upload automatically. If that automatic
-abort itself fails the CLI says so and prints the exact `harbor import abort`
-invocation; until it runs, the job holds its staged bytes.
+abort itself fails, the CLI says so — as a stderr warning naming the exact
+`harbor import abort` invocation, or under `--json` as `details.recover` on the
+error, alongside `details.job_id`. The error still carries why the UPLOAD failed
+and still exits `3` for a dropped connection. Until the abort runs the job holds
+its staged bytes, though the server reclaims orphans on its own eventually.
 
 `--notebook` here is **deprecated** — use `harbor account export --format enex
 --notebook <id>`, which runs a real export job (progress, email, retention,
