@@ -288,6 +288,10 @@ func mapTemplateError(err error) error {
 		// surfaces here on create, update AND apply, so the wording stays
 		// neutral about which one the user ran; the server explains the rest
 		// via details.
+		// The detail is inlined even though it also prints as a bullet below:
+		// "that notebook cannot be used" alone does not say WHY, and the why
+		// differs — missing, someone else's, tombstoned, or encrypt-by-default.
+		// One duplicated line is worth the first line being the whole answer.
 		if nb, ok := apiErr.Details["notebook_id"]; ok {
 			friendly = fmt.Sprintf("that notebook cannot be used: %v", nb)
 			break

@@ -191,6 +191,22 @@ func TestTemplatesApplyTagsSentWinsOmittedInherits(t *testing.T) {
 		if !strings.Contains(out, appliedNotice) {
 			t.Errorf("apply did not print the server's notice:\n%s", out)
 		}
+		// The HUMAN path needs its own passthrough check: --json short-circuits
+		// before the display function, so a display that rewrote tokens would
+		// never be exercised by the --json test.
+		if !strings.Contains(out, "{{ Unknown_Token }}") {
+			t.Errorf("the rendered body must not touch an unexpanded token:\n%s", out)
+		}
+	})
+
+	t.Run("notebook override is forwarded", func(t *testing.T) {
+		m := templatesMock(t)
+		if _, err := runCLI(t, m, "templates", "apply", "tpl1", "--notebook", "nb9"); err != nil {
+			t.Fatalf("apply failed: %v", err)
+		}
+		if body := m.bodyOf(t, "POST /api/v1/templates/tpl1/apply"); body["notebook_id"] != "nb9" {
+			t.Errorf("notebook_id = %v, want nb9", body["notebook_id"])
+		}
 	})
 
 	t.Run("empty means none", func(t *testing.T) {
@@ -218,9 +234,11 @@ func TestTemplatesApplyTagsSentWinsOmittedInherits(t *testing.T) {
 // TestDisplayTemplatesShowsTagCount verifies the list table carries a tag COUNT
 // — ids are too wide for a column and belong in the detail view.
 //
-// No other number in the fixture may equal a tag count, or the assertion passes
-// on an unrelated cell: an earlier version of this test was satisfied by a USN
-// that happened to be 3.
+// The count is read out of its own CELL, not searched for in the row. Every
+// other cell can contain the digit by accident: the USNs are numbers, and the
+// UPDATED column renders in the machine's LOCAL zone, so a timestamp that reads
+// "2025-06-16 23:06" east of UTC satisfies a whole-row search for "3" while the
+// count itself is wrong.
 func TestDisplayTemplatesShowsTagCount(t *testing.T) {
 	data := []byte(`{"data":[
 		{"id":"tpl1","name":"Meeting notes","is_system":false,"tag_ids":["t1","t2","t3"],"usn":1200,"updated_at":1750000000000},
@@ -230,22 +248,34 @@ func TestDisplayTemplatesShowsTagCount(t *testing.T) {
 	if !strings.Contains(out, "TAGS") {
 		t.Errorf("no TAGS column:\n%s", out)
 	}
-	// Scoped to its own row, so the count cannot be satisfied by another cell.
-	var tplRow string
+	if got := tableCell(t, out, "Meeting notes", 3); got != "3" {
+		t.Errorf("TAGS cell = %q, want %q:\n%s", got, "3", out)
+	}
+	if got := tableCell(t, out, "Bare", 3); got != "—" {
+		t.Errorf("an empty tag list should read as an em dash, got %q:\n%s", got, out)
+	}
+}
+
+// tableCell returns the trimmed contents of the nth zero-indexed column on the
+// rendered row containing marker.
+//
+// Assertions that search a whole row pass on any cell that happens to contain
+// the value, which for a table carrying ids, counts, USNs and a local-time
+// timestamp is most of them.
+func tableCell(t *testing.T, out, marker string, n int) string {
+	t.Helper()
 	for _, line := range strings.Split(out, "\n") {
-		if strings.Contains(line, "Meeting notes") {
-			tplRow = line
+		if !strings.Contains(line, marker) {
+			continue
 		}
+		cells := strings.Split(strings.Trim(line, "│ "), "│")
+		if n >= len(cells) {
+			t.Fatalf("row %q has %d cells, wanted #%d", marker, len(cells), n)
+		}
+		return strings.TrimSpace(cells[n])
 	}
-	if !strings.Contains(tplRow, "3") {
-		t.Errorf("tag count missing from the template's own row:\n%s", out)
-	}
-	if strings.Contains(tplRow, "—") {
-		t.Errorf("a template WITH tags must not show a dash:\n%s", out)
-	}
-	if !strings.Contains(out, "—") {
-		t.Errorf("an empty tag list should read as an em dash, not a blank:\n%s", out)
-	}
+	t.Fatalf("no row containing %q in:\n%s", marker, out)
+	return ""
 }
 
 // The detail view shows the filing as ids, and says plainly when there is none.
@@ -278,10 +308,13 @@ func TestDisplayAppliedNotePrintsTheNotice(t *testing.T) {
 		t.Errorf("notice not printed verbatim:\n%s", out)
 	}
 
+	// An empty notice must add NOTHING — compared against the plain note render
+	// rather than probed for a word, so any spurious advisory line fails.
 	quiet := []byte(`{"note":{"id":"n1","title":"Standup","usn":88,"updated_at":1750000000000},"usn":88,"notice":""}`)
-	out = captureStdout(t, func() { displayAppliedNote(quiet) })
-	if strings.Contains(out, "notebook") {
-		t.Errorf("an empty notice should print nothing:\n%s", out)
+	withEmpty := captureStdout(t, func() { displayAppliedNote(quiet) })
+	bare := captureStdout(t, func() { displayNote(quiet) })
+	if withEmpty != bare {
+		t.Errorf("an empty notice changed the output:\n got  %q\n want %q", withEmpty, bare)
 	}
 }
 
