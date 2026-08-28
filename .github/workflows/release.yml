@@ -4,7 +4,8 @@
 #
 # release.yml builds cross-platform binaries and creates a GitHub release with
 # an auto-incrementing patch version on every push to main, then bumps the
-# Homebrew formula so `brew upgrade harbor` picks up the new release.
+# formula in the homebrew-harbor tap so `brew upgrade harbor` picks up the new
+# release.
 #
 
 name: Release
@@ -64,14 +65,12 @@ jobs:
       # change.
       #
       # Consumers, as of this writing:
-      #   - Formula/harbor.rb    downloads named assets (the four non-Windows
-      #                          ones). It does NOT yet pin a
-      #                          sha256; issue #85 moves it to a real tap and
-      #                          adds that pin, which is what checksums.txt is
-      #                          groundwork for.
-      #   - harbor.my/install.sh does not exist yet (harbor.my#49). It is
-      #                          specified to fetch checksums.txt and verify the
-      #                          binary against it.
+      #   - the homebrew-harbor tap formula, which pins the four non-Windows
+      #     names alongside their checksums. bump-tap-formula.py fails the
+      #     release when a name it expects is absent, so a rename breaks here
+      #     rather than at someone's install.
+      #   - harbor.my/install.sh, which fetches checksums.txt and verifies the
+      #     binary it downloaded against it.
       # ---------------------------------------------------------------------
       - name: Build binaries
         run: |
@@ -84,10 +83,9 @@ jobs:
           GOOS=linux   GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/harbor-linux-arm64 .
           GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/harbor-windows-amd64.exe .
 
-      # Publishes a SHA-256 manifest so a download can be verified. Nothing
-      # consumes it yet — it is the prerequisite for the tap's sha256 pin (#85)
-      # and for install.sh (harbor.my#49), neither of which can verify a
-      # download until this file exists.
+      # Publishes a SHA-256 manifest so a download can be verified. The tap
+      # formula's per-platform sha256 is copied straight out of this file, and
+      # install.sh checks its download against it.
       - name: Generate checksums
         run: |
           cd dist
@@ -126,24 +124,42 @@ jobs:
           generate_release_notes: true
           files: dist/*
 
-      - name: Update Homebrew formula version
+      # Pushes the new version into HarborMyNotes/homebrew-harbor. That is a
+      # separate repo, so the default GITHUB_TOKEN cannot write to it; the
+      # deploy key in HOMEBREW_TAP_DEPLOY_KEY grants write to that one repo and
+      # nothing else.
+      #
+      # Unlike a push to this repo's main, this cannot trigger another release —
+      # the tap has no release workflow. It does run the tap's formula tests,
+      # which is where a bad checksum would surface.
+      #
+      # The release itself already exists by this point, so a failure here
+      # leaves the tap stale rather than the release half-made.
+      - name: Update the Homebrew tap formula
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
         run: |
-          VERSION=${{ steps.version.outputs.version }}
-          BREW_VERSION="${VERSION#v}"
-          sed -i "s/version \".*\"/version \"${BREW_VERSION}\"/" Formula/harbor.rb
-          # No-op when the formula is already at this version (e.g. the first
-          # release, where the committed version matches) — never fail the job.
-          if git diff --quiet -- Formula/harbor.rb; then
-            echo "Formula already at ${BREW_VERSION}; nothing to bump."
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+          git clone --depth 1 git@github.com:HarborMyNotes/homebrew-harbor.git tap
+
+          python3 .github/scripts/bump-tap-formula.py \
+            --formula tap/Formula/harbor.rb \
+            --checksums dist/checksums.txt \
+            --version "$VERSION"
+
+          cd tap
+          # A re-run at the same version rewrites nothing, so there is no commit
+          # to make and no reason to fail the release.
+          if git diff --quiet; then
+            echo "Tap formula already at ${VERSION}; nothing to bump."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/harbor.rb
-          git commit -m "Update Homebrew formula to ${VERSION}"
-          # This push MUST use the default GITHUB_TOKEN. A push authenticated by
-          # that token does not trigger workflows, which is the only thing
-          # stopping this commit from starting another release — and so on
-          # forever. Switching to a PAT or a deploy key here creates an infinite
-          # release loop that burns a version number every few minutes.
+          git commit -aqm "Update harbor to ${VERSION}"
           git push origin main
