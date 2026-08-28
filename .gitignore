@@ -7,3 +7,6 @@ coverage.html
 .playwright/
 .claude/*
 !.claude/skills/
+
+# Byte-compiled cache from the CI helper script.
+__pycache__/

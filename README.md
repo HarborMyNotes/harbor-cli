@@ -29,10 +29,23 @@ harbor notes list --json | jq '.data[] | {id, title}'
 ### Homebrew (macOS / Linux)
 
 ```sh
-brew tap HarborMyNotes/harbor https://github.com/HarborMyNotes/harbor-cli
-brew install harbor
+brew install HarborMyNotes/harbor/harbor
 brew upgrade harbor   # later, to update
 ```
+
+Naming the formula in full taps `HarborMyNotes/harbor` for you and counts as
+approving it, which Homebrew 6.0 requires before it will run a third-party tap's
+code. If you would rather tap first and approve the whole tap, that is three
+commands:
+
+```sh
+brew tap HarborMyNotes/harbor
+brew trust HarborMyNotes/harbor
+brew install harbor
+```
+
+Skipping `brew trust` on that second route stops with an error rather than
+installing anything.
 
 ### Prebuilt binaries
 

@@ -128,8 +128,9 @@ crypto/                 client-side E2E note crypto (zero-knowledge server)
   README.md             the canonical cross-client interop contract
 config/
   config.go             credentials.json load/save (0600), expiry helpers; keystore-blob cache
-Formula/harbor.rb       Homebrew formula (version auto-bumped by release CI)
 .github/workflows/      test.yml (CI) + release.yml (CD)
+.github/scripts/        bump-tap-formula.py — repoints the homebrew-harbor
+                        formula at a new release (run by release.yml)
 ```
 
 Every source file `X.go` has a sibling `X_test.go` (one test file per file).
@@ -277,4 +278,13 @@ printed (use `--show-token` to opt in explicitly).
 Pushing to `main` triggers `release.yml`: it tests, auto-increments the patch
 version off the latest `vX.Y.Z` tag (first release `v0.1.0`), cross-compiles the
 five platform binaries with the version baked in via ldflags, publishes a GitHub
-release, and bumps `Formula/harbor.rb` so `brew upgrade harbor` works.
+release, and bumps the formula in
+[HarborMyNotes/homebrew-harbor](https://github.com/HarborMyNotes/homebrew-harbor)
+so `brew upgrade harbor` works.
+
+The formula lives in that separate repo because Homebrew's one-argument tap
+shortcut only works for a repo named `homebrew-<name>`. It pins an explicit
+release tag and a per-platform `sha256` taken from that release's
+`checksums.txt`; `release.yml` rewrites both together via
+`.github/scripts/bump-tap-formula.py`, authenticated by a deploy key scoped to
+the tap repo alone.

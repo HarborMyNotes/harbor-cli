@@ -208,9 +208,9 @@ Strictly **one issue at a time** — no parallel worktrees, no batching. For eac
 - **`go test ./...` must pass with no network and no config.** A test that needs a live
   API or a real `~/.config/harbor` is a broken test, not a passing verification.
 - **Merging is the end of an issue.** Every merge to `main` fires `release.yml`, which
-  auto-bumps the patch version, cuts the GitHub release, and updates `Formula/harbor.rb`
-  on its own. Never hand-bump a version, cut a tag, or edit the formula — unless an issue
-  explicitly asks for it.
+  auto-bumps the patch version, cuts the GitHub release, and updates the formula in
+  `HarborMyNotes/homebrew-harbor` on its own. Never hand-bump a version, cut a tag, or
+  edit the formula — unless an issue explicitly asks for it.
 - **Don't work around a blocker just to keep a streak going.** A skipped issue with a
   clear comment is a good outcome; a merged guess is not.
 
