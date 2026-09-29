@@ -3,12 +3,22 @@
 
 package client
 
-import "net/http"
+import (
+	"net/http"
+	"net/url"
+)
 
 // ListNotes returns the user's notes (collection envelope). Accepts limit,
 // offset, order, notebook_id, tag, updated_since, deleted, and fields params.
 func (c *Client) ListNotes(params map[string]string) ([]byte, error) {
 	return c.doGet("/notes", params)
+}
+
+// ListNotesQuery is ListNotes with a caller-built query, for the metadata
+// filters: meta_has repeats and meta.KEY may carry an empty value, and the map
+// form can express neither.
+func (c *Client) ListNotesQuery(q url.Values) ([]byte, error) {
+	return c.doGetQuery("/notes", q)
 }
 
 // GetNote fetches one note. params may include deleted=true and

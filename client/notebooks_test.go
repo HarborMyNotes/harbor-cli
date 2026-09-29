@@ -5,6 +5,7 @@ package client
 
 import (
 	"encoding/json"
+	"net/url"
 	"testing"
 )
 
@@ -102,4 +103,22 @@ func containsAll(s string, subs ...string) bool {
 		}
 	}
 	return true
+}
+
+// TestListNotebooksQuery covers the caller-built query form used by the
+// metadata filters.
+func TestListNotebooksQuery(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 200, `{"data":[],"paging":{"total":0}}`)
+	defer srv.Close()
+	q := url.Values{"meta.gallery": {"true"}, "stack": {"Projects"}}
+	if _, err := testClient(srv.URL).ListNotebooksQuery(q); err != nil {
+		t.Fatalf("ListNotebooksQuery: %v", err)
+	}
+	if rec.Method != "GET" || rec.Path != "/notebooks" {
+		t.Errorf("%s %s", rec.Method, rec.Path)
+	}
+	if !containsAll(rec.Query, "meta.gallery=true", "stack=Projects") {
+		t.Errorf("query = %q", rec.Query)
+	}
 }

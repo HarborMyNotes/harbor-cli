@@ -198,3 +198,73 @@ func TestLocalRefusalMatchesTheServerWording(t *testing.T) {
 		t.Errorf("the local refusal has drifted from the server's copy:\n local: %s\nserver: %s", defaultCannotEncryptMessage, normalized)
 	}
 }
+
+// TestNotebooksCreateSendsMetadata covers --meta on create.
+func TestNotebooksCreateSendsMetadata(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"POST /api/v1/notebooks": {Status: 201, Body: `{"id":"nb1","name":"Portfolio","metadata":{"gallery":true}}`},
+	})
+	if _, err := runCLI(t, m, "notebooks", "create", "--name", "Portfolio", "--meta", "gallery=true"); err != nil {
+		t.Fatalf("notebooks create: %v", err)
+	}
+	if got := m.rawBodyOf(t, "POST /api/v1/notebooks"); got != `{"metadata":{"gallery":true},"name":"Portfolio"}` {
+		t.Errorf("body = %s", got)
+	}
+}
+
+// TestNotebooksUpdateMetadataOnly proves metadata alone skips the notebook's
+// own PATCH.
+func TestNotebooksUpdateMetadataOnly(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"PUT /api/v1/notebooks/nb1/metadata": {Status: 200, Body: `{"metadata":{"client":"acme"}}`},
+	})
+	if _, err := runCLI(t, m, "notebooks", "update", "nb1", "--meta-json", `{"client":"acme"}`); err != nil {
+		t.Fatalf("notebooks update: %v", err)
+	}
+	if calls := strings.Join(m.calls(), ", "); calls != "PUT /api/v1/notebooks/nb1/metadata" {
+		t.Errorf("calls = %s", calls)
+	}
+}
+
+// TestNotebooksUpdateFieldsThenClear covers a rename plus --clear-meta: the
+// PATCH, then a DELETE, and the printed notebook shows no metadata.
+func TestNotebooksUpdateFieldsThenClear(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"PATCH /api/v1/notebooks/nb1":           {Status: 200, Body: `{"id":"nb1","name":"Renamed","metadata":{"old":1}}`},
+		"DELETE /api/v1/notebooks/nb1/metadata": {Status: 204, Body: ``},
+	})
+	out, err := runCLI(t, m, "notebooks", "update", "nb1", "--name", "Renamed", "--clear-meta", "--json")
+	if err != nil {
+		t.Fatalf("notebooks update: %v", err)
+	}
+	if calls := strings.Join(m.calls(), ", "); calls != "PATCH /api/v1/notebooks/nb1, DELETE /api/v1/notebooks/nb1/metadata" {
+		t.Errorf("calls = %s", calls)
+	}
+	if !strings.Contains(out, `"metadata": {}`) || strings.Contains(out, `"old"`) {
+		t.Errorf("printed notebook still shows the old metadata:\n%s", out)
+	}
+}
+
+// TestNotebooksListForwardsMetaFilters pins the list query.
+func TestNotebooksListForwardsMetaFilters(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/notebooks": {Status: 200, Body: `{"data":[],"paging":{"total":0}}`},
+	})
+	if _, err := runCLI(t, m, "notebooks", "list", "--stack", "Projects", "--meta-eq", "gallery=true"); err != nil {
+		t.Fatalf("notebooks list: %v", err)
+	}
+	q := m.queryOf(t, "GET /api/v1/notebooks")
+	if q.Get("stack") != "Projects" || q.Get("meta.gallery") != "true" {
+		t.Errorf("query = %v", q)
+	}
+}
+
+// TestDisplayNotebookShowsMetadata covers the detail view's Metadata row.
+func TestDisplayNotebookShowsMetadata(t *testing.T) {
+	out := captureStdout(t, func() {
+		displayNotebook([]byte(`{"id":"nb1","name":"Work","metadata":{"gallery":true}}`))
+	})
+	if !strings.Contains(out, "gallery=true") {
+		t.Errorf("metadata row missing:\n%s", out)
+	}
+}

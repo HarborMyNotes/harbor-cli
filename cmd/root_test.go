@@ -252,11 +252,14 @@ func resetCommandState(t *testing.T) {
 }
 
 // resetFlags restores every flag in a command tree to its declared default.
-// Slice/array flags are skipped: pflag appends to those on Set, so "resetting"
-// one would grow it instead.
+// Slice/array flags are emptied with Replace rather than Set: pflag appends to
+// those on Set, so "resetting" one that way would grow it instead. Every one in
+// this tree defaults to empty.
 func resetFlags(c *cobra.Command) {
 	restore := func(f *pflag.Flag) {
-		if strings.Contains(f.Value.Type(), "Slice") || strings.Contains(f.Value.Type(), "Array") {
+		if sv, ok := f.Value.(pflag.SliceValue); ok {
+			_ = sv.Replace(nil)
+			f.Changed = false
 			return
 		}
 		_ = f.Value.Set(f.DefValue)

@@ -64,10 +64,11 @@ Containers for notes; exactly one **default** notebook per account.
 
 | Command | What it does | Key flags |
 |---|---|---|
-| `harbor notebooks list` | List notebooks | `--stack`, `--include-deleted`, paging |
+| `harbor notebooks list` | List notebooks | `--stack`, `--include-deleted`, `--meta-eq`, `--meta-has`, paging |
 | `harbor notebooks get <id>` | One notebook | `--include-deleted` |
-| `harbor notebooks create` | Create | `--name` (req), `--stack`, `--default-encrypt` |
-| `harbor notebooks update <id>` | Partial update | `--name`, `--stack`, `--public`, `--make-default`, `--default-encrypt` |
+| `harbor notebooks create` | Create | `--name` (req), `--stack`, `--default-encrypt`, `--meta`, `--meta-json` |
+| `harbor notebooks update <id>` | Partial update | `--name`, `--stack`, `--public`, `--make-default`, `--default-encrypt`, `--meta`, `--meta-json`, `--unset-meta`, `--clear-meta` |
+| `harbor notebooks meta <id>` | Read or change its metadata | `--set`, `--unset`, `--replace`, `--clear` |
 | `harbor notebooks delete <id>` | Tombstone | `--notes move_to_default\|trash` |
 
 `--make-default` promotes a notebook (the prior default is demoted; you can't
@@ -93,10 +94,11 @@ Bodies are Markdown (default) or HTML (`--format`), supplied via `--content`,
 
 | Command | What it does | Key flags |
 |---|---|---|
-| `harbor notes list` | List notes | `--notebook`, `--tag`, `--updated-since`, `--deleted`, `--meta`, paging |
+| `harbor notes list` | List notes | `--notebook`, `--tag`, `--updated-since`, `--deleted`, `--meta`, `--meta-eq`, `--meta-has`, paging |
 | `harbor notes get <id>` | One note | `--format markdown\|html`, `--deleted` |
-| `harbor notes create` | Create (returns `{note,usn}`) | `--title`, `--notebook`, `--content/--file/--stdin`, `--format`, `--source-url`, `--author` |
-| `harbor notes update <id>` | Partial update (**body is replaced** if sent) | same as create + `--notebook` (move) |
+| `harbor notes create` | Create (returns `{note,usn}`) | `--title`, `--notebook`, `--content/--file/--stdin`, `--format`, `--source-url`, `--author`, `--meta`, `--meta-json` |
+| `harbor notes update <id>` | Partial update (**body is replaced** if sent) | same as create + `--notebook` (move), `--unset-meta`, `--clear-meta` |
+| `harbor notes meta <id>` | Read or change its metadata | `--set`, `--unset`, `--replace`, `--clear` |
 | `harbor notes append <id>` | Append to the END | `--content/--file/--stdin`, `--format` |
 | `harbor notes delete <id>` | Trash (or expunge) | `--permanent` |
 | `harbor notes tag <id>` | Attach a tag (idempotent) | `--tag-name` (creates if missing) or `--tag-id` |
@@ -108,8 +110,71 @@ Bodies are Markdown (default) or HTML (`--format`), supplied via `--content`,
 | `harbor notes audit <id>` | Change log | `--action create\|update\|append\|delete\|restore\|tag\|move\|share`, `--order created_at\|usn`, paging |
 | `harbor notes export <id>` | Write ONE note to a file | `--output` (req; `-` = stdout, a directory takes the server's filename), `--zip`, `--format markdown` |
 
-`--meta` omits bodies for lighter list payloads. List sort fields: `updated_at`,
-`created_at`, `title`, `usn`.
+On `notes list`, `--meta` is a switch that omits bodies for lighter list
+payloads; it is not the metadata filter (that is `--meta-eq`). List sort fields:
+`updated_at`, `created_at`, `title`, `usn`.
+
+---
+
+## Stacks  (alias: `stack`)
+
+A stack is a named group of notebooks. A notebook joins one through its label:
+`harbor notebooks update <id> --stack NAME`.
+
+| Command | What it does | Key flags |
+|---|---|---|
+| `harbor stacks list` | List stacks with notebook counts | `--meta-eq`, `--meta-has`, `--order name\|notebook_count`, paging (default: every stack) |
+| `harbor stacks meta <name>` | Read or change a stack's metadata | `--set`, `--unset`, `--replace`, `--clear` |
+
+A stack is named exactly, case included. Renaming a stack keeps its metadata;
+deleting it discards it.
+
+---
+
+## Metadata  (notes, notebooks, stacks)
+
+A small hidden JSON object on every note, notebook and stack, for scripts and
+integrations to label things. Harbor never shows it or acts on it. It is stored
+in **plain text**, even on an encrypted note — never put secrets in it.
+
+**Writing.** On `create`/`update`, and on the `meta` subcommands:
+
+| Flag on create/update | On `… meta` | Does |
+|---|---|---|
+| `--meta KEY=VALUE` (repeat) | `--set KEY=VALUE` | Set keys; others are left alone (JSON Merge Patch) |
+| `--unset-meta KEY` (repeat) | `--unset KEY` | Remove keys (update only) |
+| `--meta-json '{…}'` / `@file.json` / `@-` | `--replace …` | Replace the whole object |
+| `--clear-meta` | `--clear` | Remove all of it (update only) |
+
+VALUE is read as JSON when it is valid JSON, else as text: `a=true` is a
+boolean, `a=5` a number, `a=[1,2]` an array, `a=hello` a string. Quote it as
+JSON to keep it text: `'zip="02134"'`. `null` is refused — use `--unset-meta`.
+
+```bash
+harbor notebooks update <id> --meta gallery=true
+harbor notes meta <id> --set crm_id=4411 --unset draft
+harbor stacks meta "Client Work" --replace '{"client":"acme","rate":150}'
+harbor notes meta <id> --json            # read it
+```
+
+A metadata-only change is **not an edit**: it goes to the record's own metadata
+route, so the updated time does not move and no history version is made. An
+update that also changes other fields saves those first, then the metadata.
+
+**Limits** (the server enforces them and names the broken rule): a JSON object,
+at most 16 KB, at most 64 top-level keys, keys `A–Z a–z 0–9 _ -` (1–64 chars,
+case-sensitive), nesting at most 5 deep.
+
+**Filtering lists** (`notes list`, `notebooks list`, `stacks list`):
+`--meta-eq KEY=VALUE` (repeat; all must match) and `--meta-has KEY` (repeat).
+Only top-level keys match. Strings ignore case; `true`/`false` match booleans;
+an array matches if any element matches.
+
+**Search:** `harbor search 'meta:gallery=true'`, `meta:KEY` (has the key), and
+`-meta:…` to exclude.
+
+`--json` output carries `"metadata": {…}` on every note, notebook and stack.
+Tables show a `META` column only when some row has metadata.
 
 ---
 
@@ -140,6 +205,8 @@ Hierarchical (nested). A tag's parent is set with `--parent` (or `--top-level`).
 | `resource:RTYPE` | has an attachment: `image\|pdf\|audio\|application\|any` |
 | `created:RANGE` | created date: `YYYYMMDD`, `YYYYMMDD..YYYYMMDD`, `day-N` |
 | `updated:RANGE` | last-updated date (same forms) |
+| `meta:KEY=VALUE` | note metadata KEY equals VALUE (`meta:KEY="two words"`) |
+| `meta:KEY` | note metadata has KEY, whatever its value |
 | `"exact phrase"` | consecutive, in-order words |
 | `term*` | prefix match |
 | `-token` | negate any token |

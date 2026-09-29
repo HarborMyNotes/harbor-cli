@@ -564,3 +564,22 @@ func TestPrettyJSON(t *testing.T) {
 		t.Errorf("expected indented output, got %q", out)
 	}
 }
+
+// TestPrettyJSONKeepsTheServersBytes pins that --json output is the server's
+// answer re-indented, not re-encoded: a 64-bit number stays exact (a float64
+// round trip would round it), `<` is not rewritten as \u003c, and a trailing
+// newline from the server does not become a blank line.
+func TestPrettyJSONKeepsTheServersBytes(t *testing.T) {
+	out, err := PrettyJSON([]byte(`{"metadata":{"crm_id":12345678901234567890,"price":1.50},"content":"<p>hi</p>"}` + "\n"))
+	if err != nil {
+		t.Fatalf("PrettyJSON error: %v", err)
+	}
+	for _, want := range []string{"12345678901234567890", "1.50", "<p>hi</p>"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lost %q:\n%s", want, out)
+		}
+	}
+	if strings.HasSuffix(out, "\n") {
+		t.Errorf("output ends in a newline: %q", out)
+	}
+}

@@ -3,10 +3,19 @@
 
 package client
 
+import "net/url"
+
 // ListNotebooks returns the user's notebooks (collection envelope). Accepts the
 // standard list params (limit, offset, order, stack, include_deleted).
 func (c *Client) ListNotebooks(params map[string]string) ([]byte, error) {
 	return c.doGet("/notebooks", params)
+}
+
+// ListNotebooksQuery is ListNotebooks with a caller-built query, for the
+// metadata filters: meta_has repeats and meta.KEY may carry an empty value, and
+// the map form can express neither.
+func (c *Client) ListNotebooksQuery(q url.Values) ([]byte, error) {
+	return c.doGetQuery("/notebooks", q)
 }
 
 // GetNotebook fetches a single notebook by id. With includeDeleted, tombstoned
