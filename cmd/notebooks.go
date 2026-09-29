@@ -26,7 +26,8 @@ var notebooksListCmd = &cobra.Command{
 	Short: "List notebooks",
 	Example: `  harbor notebooks list
   harbor notebooks list --stack Projects --order -updated_at
-  harbor notebooks list --json | jq '.data[].name'`,
+  harbor notebooks list --json | jq '.data[].name'
+  harbor notebooks list --meta-eq gallery=true`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c, _, err := loadClientFromConfig()
 		if err != nil {
@@ -39,7 +40,11 @@ var notebooksListCmd = &cobra.Command{
 		if boolFlag(cmd, "include-deleted") {
 			params["include_deleted"] = "true"
 		}
-		data, err := c.ListNotebooks(params)
+		q, err := metaFilterQuery(cmd, params)
+		if err != nil {
+			return err
+		}
+		data, err := c.ListNotebooksQuery(q)
 		if err != nil {
 			return err
 		}
@@ -72,9 +77,15 @@ var notebooksGetCmd = &cobra.Command{
 var notebooksCreateCmd = &cobra.Command{
 	Use:   "create",
 	Short: "Create a notebook",
+	Long:  "Create a notebook.\n\n" + metadataHelp,
 	Example: `  harbor notebooks create --name "Work" --stack Projects
-  harbor notebooks create --name "Secrets" --default-encrypt`,
+  harbor notebooks create --name "Secrets" --default-encrypt
+  harbor notebooks create --name "Portfolio" --meta gallery=true`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		meta, err := readMetaChange(cmd, createMetaFlags)
+		if err != nil {
+			return err
+		}
 		c, _, err := loadClientFromConfig()
 		if err != nil {
 			return err
@@ -86,9 +97,12 @@ var notebooksCreateCmd = &cobra.Command{
 		body := map[string]any{"name": name}
 		addStringIfChanged(cmd, body, "stack", "stack")
 		addBoolIfChanged(cmd, body, "default-encrypt", "default_encrypt")
+		if meta != nil {
+			body["metadata"] = meta.object
+		}
 		data, err := c.CreateNotebook(body)
 		if err != nil {
-			return mapNotebookError(err)
+			return mapMetadataError(mapNotebookError(err))
 		}
 		printResult(data, displayNotebook)
 		return nil
@@ -110,12 +124,19 @@ The default notebook can never also be encrypt-by-default: forwarded email,
 imports, and notes created with no notebook all land in the default, and none of
 those writers can encrypt. So --default-encrypt is refused on the default
 notebook, and --make-default is refused on a notebook that encrypts — unless you
-turn it off in the same command, e.g. --make-default --default-encrypt=false.`,
+turn it off in the same command, e.g. --make-default --default-encrypt=false.
+
+` + metadataHelp,
 	Example: `  harbor notebooks update 5b1f... --name "Work — Active"
   harbor notebooks update 5b1f... --stack Archive --public=false
   harbor notebooks update 5b1f... --make-default
-  harbor notebooks update 5b1f... --make-default --default-encrypt=false`,
+  harbor notebooks update 5b1f... --make-default --default-encrypt=false
+  harbor notebooks update 5b1f... --meta gallery=true --unset-meta draft`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		meta, err := readMetaChange(cmd, recordMetaFlags)
+		if err != nil {
+			return err
+		}
 		c, _, err := loadClientFromConfig()
 		if err != nil {
 			return err
@@ -129,7 +150,17 @@ turn it off in the same command, e.g. --make-default --default-encrypt=false.`,
 			body["is_default"] = true
 		}
 		if len(body) == 0 {
-			return errors.New("nothing to update — pass at least one field flag")
+			if meta == nil {
+				return errors.New("nothing to update — pass at least one field flag")
+			}
+			// Metadata alone goes only to its own route, so the notebook is not
+			// edited and its updated time does not move.
+			data, err := applyMetaChange(c, client.NotebookMetadataPath(args[0]), meta)
+			if err != nil {
+				return err
+			}
+			printResult(data, displayMetadata)
+			return nil
 		}
 		// Refuse the banned pair before spending a request on a guaranteed 422.
 		if err := guardDefaultNotebookEncrypt(c, args[0], body); err != nil {
@@ -138,6 +169,12 @@ turn it off in the same command, e.g. --make-default --default-encrypt=false.`,
 		data, err := c.UpdateNotebook(args[0], body)
 		if err != nil {
 			return mapNotebookError(err)
+		}
+		if meta != nil {
+			data, err = writeMetaAfterUpdate(c, client.NotebookMetadataPath(args[0]), "notebook", meta, data)
+			if err != nil {
+				return err
+			}
 		}
 		printResult(data, displayNotebook)
 		return nil
@@ -270,6 +307,7 @@ func displayNotebooks(data []byte) {
 			epochMS(num(nb, "updated_at")),
 		})
 	}
+	headers, rows = withMetaColumn(items, headers, rows)
 	printTable(headers, rows)
 	printPagingFooter(data)
 }
@@ -281,7 +319,7 @@ func displayNotebook(data []byte) {
 		fmt.Println(string(data))
 		return
 	}
-	printKV([][2]string{
+	pairs := [][2]string{
 		{"ID", bold(str(nb, "id"))},
 		{"Name", str(nb, "name")},
 		{"Stack", str(nb, "stack")},
@@ -292,7 +330,11 @@ func displayNotebook(data []byte) {
 		{"Deleted", boolMark(boolean(nb, "deleted"))},
 		{"Updated", epochMS(num(nb, "updated_at"))},
 		{"Created", epochMS(num(nb, "created_at"))},
-	})
+	}
+	if meta, ok := metadataPair(data); ok {
+		pairs = append(pairs, meta)
+	}
+	printKV(pairs)
 }
 
 // defaultStar renders the default-notebook marker.
@@ -307,18 +349,21 @@ func init() {
 	addPagingFlags(notebooksListCmd)
 	notebooksListCmd.Flags().String("stack", "", "Filter to one stack")
 	notebooksListCmd.Flags().Bool("include-deleted", false, "Include tombstoned notebooks")
+	addMetaFilterFlags(notebooksListCmd)
 
 	notebooksGetCmd.Flags().Bool("include-deleted", false, "Return the notebook even if tombstoned")
 
 	notebooksCreateCmd.Flags().String("name", "", "Notebook name (required)")
 	notebooksCreateCmd.Flags().String("stack", "", "Stack (grouping label)")
 	notebooksCreateCmd.Flags().Bool("default-encrypt", false, "Encrypt new notes in this notebook by default")
+	addMetaWriteFlags(notebooksCreateCmd, createMetaFlags)
 
 	notebooksUpdateCmd.Flags().String("name", "", "New name")
 	notebooksUpdateCmd.Flags().String("stack", "", "New stack")
 	notebooksUpdateCmd.Flags().Bool("default-encrypt", false, "Encrypt new notes by default (never allowed on the default notebook)")
 	notebooksUpdateCmd.Flags().Bool("public", false, "Make the notebook public")
 	notebooksUpdateCmd.Flags().Bool("make-default", false, "Promote this notebook to the account default (refused if it encrypts by default)")
+	addMetaWriteFlags(notebooksUpdateCmd, recordMetaFlags)
 
 	notebooksDeleteCmd.Flags().String("notes", "", "What to do with its notes: move_to_default (default) or trash")
 

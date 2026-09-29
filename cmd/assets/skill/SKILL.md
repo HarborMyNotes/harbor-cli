@@ -469,6 +469,11 @@ has copy-paste recipes and the full allowlist.
   `.paging.has_more`. `--order` takes fields like `-updated_at,title` (`-` =
   descending).
 - **Cheap listings:** `harbor notes list --meta --json` omits note bodies.
+- **Metadata:** notes, notebooks and stacks carry a hidden JSON object for
+  scripts to label things (plain text, never shown in the apps). Set it with
+  `--meta KEY=VALUE` on create/update, read or change it with
+  `harbor notes|notebooks|stacks meta <id|name>`, and filter lists with
+  `--meta-eq KEY=VALUE` / `--meta-has KEY`. See reference.md → Metadata.
 - **Exit codes:** `0` success, `1` any error, `3` the API was unreachable (worth
   retrying), `4` a plan limit blocked the write (never worth retrying). Safe to
   branch on `$?`. Errors go to stderr — with `--json` they are the error

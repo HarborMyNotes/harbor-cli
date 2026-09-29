@@ -354,14 +354,15 @@ func generateRequestID() string {
 
 // PrettyJSON pretty-prints raw JSON bytes with two-space indentation. Used for
 // the --json output mode on every command.
+//
+// It re-indents the server's bytes rather than decoding and re-encoding them.
+// A decode turns every number into a float64, so a 64-bit id stored in metadata
+// would come out rounded, and a re-encode would also rewrite `<` in a note body
+// as \u003c. --json promises the server's answer, so it prints exactly that.
 func PrettyJSON(data []byte) (string, error) {
-	var obj any
-	if err := json.Unmarshal(data, &obj); err != nil {
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, data, "", "  "); err != nil {
 		return "", err
 	}
-	pretty, err := json.MarshalIndent(obj, "", "  ")
-	if err != nil {
-		return "", err
-	}
-	return string(pretty), nil
+	return strings.TrimSpace(buf.String()), nil
 }

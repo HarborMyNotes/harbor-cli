@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -216,5 +217,23 @@ func TestExportNoteMarkdownEncrypted(t *testing.T) {
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.Code != "encrypted_not_exportable" {
 		t.Errorf("err = %v, want an APIError with code encrypted_not_exportable", err)
+	}
+}
+
+// TestListNotesQuery covers the caller-built query form, which carries a
+// repeated meta_has and a meta.KEY filter to the notes route.
+func TestListNotesQuery(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 200, `{"data":[],"paging":{"total":0}}`)
+	defer srv.Close()
+	q := url.Values{"meta.gallery": {"true"}, "meta_has": {"crm_id", "owner"}}
+	if _, err := testClient(srv.URL).ListNotesQuery(q); err != nil {
+		t.Fatalf("ListNotesQuery: %v", err)
+	}
+	if rec.Method != "GET" || rec.Path != "/notes" {
+		t.Errorf("%s %s", rec.Method, rec.Path)
+	}
+	if !containsAll(rec.Query, "meta.gallery=true", "meta_has=crm_id", "meta_has=owner") {
+		t.Errorf("query = %q", rec.Query)
 	}
 }

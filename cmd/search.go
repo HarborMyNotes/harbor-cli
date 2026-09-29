@@ -27,12 +27,15 @@ Query operators (combine freely; multiple bare words AND together):
   resource:RTYPE     note owns an attachment of: image|pdf|audio|application|any
   created:RANGE      created date: YYYYMMDD | YYYYMMDD..YYYYMMDD | day-N
   updated:RANGE      last-updated date (same forms)
+  meta:KEY=VALUE     note metadata KEY equals VALUE (meta:KEY="two words")
+  meta:KEY           note metadata has KEY, whatever its value
   "exact phrase"     consecutive, in-order words
   term*              prefix match (recei* → receipt, receive…)
   -token             negate any token (subtracts from the result set)`,
 	Example: `  harbor search budget
   harbor search 'tag:finance resource:pdf "q3 plan"'
   harbor search 'report -draft' --order -updated_at
+  harbor search 'meta:gallery=true -meta:draft'
   harbor search invoice --json | jq '.data[] | select(.type=="attachment")'`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c, _, err := loadClientFromConfig()

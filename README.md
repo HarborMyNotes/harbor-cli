@@ -144,19 +144,27 @@ Run `harbor <command> --help` for full flags and examples on any command.
 ### Notebooks
 | Command | Description |
 |---|---|
-| `harbor notebooks list` | List notebooks (`--stack`, `--order`, paging). |
+| `harbor notebooks list` | List notebooks (`--stack`, `--meta-eq`, `--meta-has`, `--order`, paging). |
 | `harbor notebooks get <id>` | Show one notebook. |
-| `harbor notebooks create --name …` | Create a notebook (`--stack`, `--default-encrypt`). |
-| `harbor notebooks update <id>` | Update; `--make-default` promotes to default. |
+| `harbor notebooks create --name …` | Create a notebook (`--stack`, `--default-encrypt`, `--meta`). |
+| `harbor notebooks update <id>` | Update; `--make-default` promotes to default; `--meta`, `--unset-meta`, `--meta-json`, `--clear-meta` change metadata. |
+| `harbor notebooks meta <id>` | Read or change a notebook's metadata (`--set`, `--unset`, `--replace`, `--clear`). |
 | `harbor notebooks delete <id>` | Delete (`--notes move_to_default\|trash`). |
+
+### Stacks
+| Command | Description |
+|---|---|
+| `harbor stacks list` | List stacks with notebook counts (`--meta-eq`, `--meta-has`). |
+| `harbor stacks meta <name>` | Read or change a stack's metadata (`--set`, `--unset`, `--replace`, `--clear`). |
 
 ### Notes
 | Command | Description |
 |---|---|
-| `harbor notes list` | List notes (`--notebook`, `--tag`, `--meta`, paging). |
+| `harbor notes list` | List notes (`--notebook`, `--tag`, `--meta` to omit bodies, `--meta-eq`/`--meta-has` to filter by metadata, paging). |
 | `harbor notes get <id>` | Show a note (`--format markdown\|html`). |
-| `harbor notes create` | Create a note (`--content`/`--file`/`--stdin`, `--format`). |
-| `harbor notes update <id>` | Update fields and/or body. |
+| `harbor notes create` | Create a note (`--content`/`--file`/`--stdin`, `--format`, `--meta`). |
+| `harbor notes update <id>` | Update fields and/or body; `--meta`, `--unset-meta`, `--meta-json`, `--clear-meta` change metadata. |
+| `harbor notes meta <id>` | Read or change a note's metadata (`--set`, `--unset`, `--replace`, `--clear`). |
 | `harbor notes append <id>` | Append a fragment to the body. |
 | `harbor notes delete <id>` | Trash (or `--permanent` to expunge). |
 | `harbor notes tags <id>` | List a note's tags. |
@@ -194,7 +202,8 @@ Run `harbor <command> --help` for full flags and examples on any command.
 | `harbor search coordinates --resource-id …` | OCR highlight boxes for an attachment. |
 
 The query grammar supports `tag:`, `notebook:`, `intitle:`, `resource:`,
-`created:`/`updated:` date ranges, `"exact phrases"`, `prefix*`, and `-negation`.
+`created:`/`updated:` date ranges, `meta:KEY=VALUE` / `meta:KEY` (metadata),
+`"exact phrases"`, `prefix*`, and `-negation`.
 See `harbor search --help`.
 
 ### Sync

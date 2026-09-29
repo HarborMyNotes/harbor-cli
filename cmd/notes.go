@@ -30,9 +30,11 @@ for both humans and AI agents.`,
 var notesListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List notes",
+	Args:  notesListArgs,
 	Example: `  harbor notes list
   harbor notes list --notebook 5b1f... --order -created_at
-  harbor notes list --meta --json | jq '.data[] | {id, title}'`,
+  harbor notes list --meta --json | jq '.data[] | {id, title}'
+  harbor notes list --meta-eq gallery=true --meta-has crm_id`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c, creds, err := loadClientFromConfig()
 		if err != nil {
@@ -54,7 +56,11 @@ var notesListCmd = &cobra.Command{
 		if boolFlag(cmd, "meta") {
 			params["fields"] = "meta"
 		}
-		data, err := c.ListNotes(params)
+		q, err := metaFilterQuery(cmd, params)
+		if err != nil {
+			return err
+		}
+		data, err := c.ListNotesQuery(q)
 		if err != nil {
 			return err
 		}
@@ -62,6 +68,20 @@ var notesListCmd = &cobra.Command{
 		printResult(data, displayNotes)
 		return nil
 	},
+}
+
+// notesListArgs refuses stray arguments like every other command, with a hint
+// for the likeliest one. `--meta` here is a switch (leave out bodies), so
+// `--meta gallery=true` leaves "gallery=true" behind as an argument; the
+// person meant the metadata filter, and the plain "unknown command" error would
+// not tell them so.
+func notesListArgs(cmd *cobra.Command, args []string) error {
+	for _, arg := range args {
+		if strings.Contains(arg, "=") {
+			return fmt.Errorf("unexpected argument %q — to filter by metadata, use --meta-eq %s (--meta on this command only leaves out note bodies)", arg, arg)
+		}
+	}
+	return rejectUnknownArgs(cmd, args)
 }
 
 // notesGetCmd fetches one note, defaulting to readable Markdown content.
@@ -105,12 +125,20 @@ applies to your default notebook too. Creating a note in one needs your
 passphrase: set HARBOR_PASSPHRASE and the note is sealed before it leaves this
 machine. WITHOUT IT THE CREATE IS REFUSED and nothing is written — the CLI will
 not quietly land a plaintext note in a notebook you asked to be encrypted. To
-put an unencrypted note there on purpose, say so with --plaintext.`,
+put an unencrypted note there on purpose, say so with --plaintext.
+
+` + metadataHelp + ` Metadata is stored in plain text, even on an
+encrypted note.`,
 	Example: `  harbor notes create --title "Plan" --content "# Goals\n\n- ship it"
   echo "# Notes" | harbor notes create --title Standup --stdin
   harbor notes create --title Recipe --file recipe.md --notebook 5b1f...
-  harbor notes create --title Draft --content "wip" --plaintext   # unencrypted, on purpose`,
+  harbor notes create --title Draft --content "wip" --plaintext   # unencrypted, on purpose
+  harbor notes create --title Lead --content "..." --meta crm_id=4411 --meta hot=true`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		meta, err := readMetaChange(cmd, createMetaFlags)
+		if err != nil {
+			return err
+		}
 		c, creds, err := loadClientFromConfig()
 		if err != nil {
 			return err
@@ -130,6 +158,9 @@ put an unencrypted note there on purpose, say so with --plaintext.`,
 		if hasContent {
 			body["content"] = content
 			body["content_format"] = format
+		}
+		if meta != nil {
+			body["metadata"] = meta.object
 		}
 		// Encrypt client-side when --encrypt is set or the target notebook defaults
 		// to encryption. The note id is generated first because the field AAD binds
@@ -151,7 +182,7 @@ put an unencrypted note there on purpose, say so with --plaintext.`,
 		}
 		data, err := c.CreateNote(body)
 		if err != nil {
-			return mapNoteError(err)
+			return mapMetadataError(mapNoteError(err))
 		}
 		data = decryptResult(c, creds, data)
 		printResult(data, displayNote)
@@ -205,12 +236,20 @@ Because that history does not come back, a move that seals ASKS FIRST — but on
 when the note actually has earlier versions to lose. A note with nothing older
 than its current contents is sealed silently, since there is nothing to destroy.
 Pass --yes to skip the question; in --json or non-interactive use it is required
-to get past it, but only on the moves that would actually destroy something.`,
+to get past it, but only on the moves that would actually destroy something.
+
+` + metadataHelp + ` Metadata is stored in plain text, even on an
+encrypted note, and changing it needs no passphrase.`,
 	Example: `  harbor notes update 9c2e... --title "Plan (final)"
   harbor notes update 9c2e... --file updated.md
   harbor notes update 9c2e... --content "# Rewritten" --keep-tasks
-  harbor notes update 9c2e... --notebook 5b1f...   # sealed if 5b1f encrypts by default`,
+  harbor notes update 9c2e... --notebook 5b1f...   # sealed if 5b1f encrypts by default
+  harbor notes update 9c2e... --meta gallery=true --unset-meta draft`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		meta, err := readMetaChange(cmd, recordMetaFlags)
+		if err != nil {
+			return err
+		}
 		c, creds, err := loadClientFromConfig()
 		if err != nil {
 			return err
@@ -229,7 +268,17 @@ to get past it, but only on the moves that would actually destroy something.`,
 			body["content_format"] = format
 		}
 		if len(body) == 0 {
-			return errors.New("nothing to update — pass --title, content, or another field")
+			if meta == nil {
+				return errors.New("nothing to update — pass --title, content, --meta, or another field")
+			}
+			// Metadata alone goes only to its own route, so the note is not
+			// edited: no new updated time, no history version.
+			data, err := applyMetaChange(c, client.NoteMetadataPath(args[0]), meta)
+			if err != nil {
+				return err
+			}
+			printResult(data, displayMetadata)
+			return nil
 		}
 		// Replacing the body releases every task the new body does not carry, and
 		// the server deletes a released task. Refuse rather than do that silently
@@ -267,6 +316,12 @@ to get past it, but only on the moves that would actually destroy something.`,
 		data, err := writeNoteUpdate(c, args[0], body, move)
 		if err != nil {
 			return err
+		}
+		if meta != nil {
+			data, err = writeMetaAfterUpdate(c, client.NoteMetadataPath(args[0]), "note", meta, data)
+			if err != nil {
+				return err
+			}
 		}
 		data = decryptResult(c, creds, data)
 		printResult(data, displayNote)
@@ -541,6 +596,7 @@ func displayNotes(data []byte) {
 			epochMS(num(n, "updated_at")),
 		})
 	}
+	headers, rows = withMetaColumn(items, headers, rows)
 	printTable(headers, rows)
 	printPagingFooter(data)
 }
@@ -569,6 +625,9 @@ func displayNote(data []byte) {
 	}
 	if u := str(n, "source_url"); u != "" {
 		pairs = append(pairs, [2]string{"Source", u})
+	}
+	if meta, ok := metadataPair(data); ok {
+		pairs = append(pairs, meta)
 	}
 	if usn != "" {
 		pairs = append(pairs, [2]string{"New USN", bold(usn)})
@@ -608,6 +667,7 @@ func init() {
 	notesListCmd.Flags().String("updated-since", "", "Only notes updated at or after this epoch-ms")
 	notesListCmd.Flags().Bool("deleted", false, "Include trashed notes")
 	notesListCmd.Flags().Bool("meta", false, "Omit note content for lighter listings")
+	addMetaFilterFlags(notesListCmd)
 
 	notesGetCmd.Flags().String("format", "markdown", "Content format to return: markdown or html")
 	notesGetCmd.Flags().Bool("deleted", false, "Return the note even if trashed")
@@ -619,6 +679,7 @@ func init() {
 	notesCreateCmd.Flags().Bool("encrypt", false, "Encrypt this note end-to-end (requires HARBOR_PASSPHRASE)")
 	notesCreateCmd.Flags().Bool("plaintext", false, "Create an unencrypted note in a default_encrypt notebook (otherwise refused without HARBOR_PASSPHRASE)")
 	addContentFlags(notesCreateCmd)
+	addMetaWriteFlags(notesCreateCmd, createMetaFlags)
 
 	notesUpdateCmd.Flags().String("title", "", "New title")
 	notesUpdateCmd.Flags().String("notebook", "", "Move to this notebook id")
@@ -627,6 +688,7 @@ func init() {
 	notesUpdateCmd.Flags().Bool("yes", false, "Skip the confirmation a sealed move asks when it would destroy the note's version history")
 	addContentFlags(notesUpdateCmd)
 	addTaskLossFlags(notesUpdateCmd)
+	addMetaWriteFlags(notesUpdateCmd, recordMetaFlags)
 
 	addContentFlags(notesAppendCmd)
 

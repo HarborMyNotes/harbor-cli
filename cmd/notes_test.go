@@ -408,3 +408,133 @@ func TestNotesExportBlamesTheServerOnlyWhenItNamedNothing(t *testing.T) {
 		t.Errorf("the server named the file; the directory in the way is the user's:\n%s", err)
 	}
 }
+
+// notebooksForCreate answers the default-notebook lookup every note create
+// makes before it writes.
+const notebooksForCreate = `{"data":[{"id":"nb1","is_default":true,"default_encrypt":false}],` +
+	`"paging":{"limit":500,"offset":0,"total":1,"has_more":false}}`
+
+// TestNotesCreateSendsMetadata covers --meta and --meta-json on create: one
+// object in the create body, with --meta applied on top of the JSON.
+func TestNotesCreateSendsMetadata(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/notebooks": {Status: 200, Body: notebooksForCreate},
+		"POST /api/v1/notes":    {Status: 201, Body: `{"note":{"id":"n1","title":"Lead","metadata":{"a":true,"b":1}},"usn":2}`},
+	})
+	if _, err := runCLI(t, m, "notes", "create", "--title", "Lead", "--content", "x",
+		"--meta-json", `{"b":1,"a":false}`, "--meta", "a=true"); err != nil {
+		t.Fatalf("notes create: %v", err)
+	}
+	body := m.bodyOf(t, "POST /api/v1/notes")
+	want := map[string]any{"a": true, "b": float64(1)}
+	if got, _ := body["metadata"].(map[string]any); len(got) != 2 || got["a"] != want["a"] || got["b"] != want["b"] {
+		t.Errorf("metadata = %#v", body["metadata"])
+	}
+}
+
+// TestNotesUpdateMetadataOnly proves metadata alone touches only the metadata
+// route, so the note itself is not edited.
+func TestNotesUpdateMetadataOnly(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"PATCH /api/v1/notes/n1/metadata": {Status: 200, Body: `{"metadata":{"gallery":true}}`},
+	})
+	out, err := runCLI(t, m, "notes", "update", "n1", "--meta", "gallery=true", "--unset-meta", "draft")
+	if err != nil {
+		t.Fatalf("notes update: %v", err)
+	}
+	if calls := strings.Join(m.calls(), ", "); calls != "PATCH /api/v1/notes/n1/metadata" {
+		t.Errorf("calls = %s", calls)
+	}
+	if got := m.rawBodyOf(t, "PATCH /api/v1/notes/n1/metadata"); got != `{"draft":null,"gallery":true}` {
+		t.Errorf("body = %s", got)
+	}
+	if !strings.Contains(out, "gallery") {
+		t.Errorf("output:\n%s", out)
+	}
+}
+
+// TestNotesUpdateFieldsThenMetadata covers an update carrying both: the note's
+// own PATCH goes first and never carries metadata, the metadata write follows,
+// and the printed note shows the new metadata.
+func TestNotesUpdateFieldsThenMetadata(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/notes/n1":            {Status: 200, Body: `{"id":"n1","title":"Old","is_encrypted":false}`},
+		"PATCH /api/v1/notes/n1":          {Status: 200, Body: `{"note":{"id":"n1","title":"New","metadata":{"old":1}},"usn":5}`},
+		"PATCH /api/v1/notes/n1/metadata": {Status: 200, Body: `{"metadata":{"gallery":true,"old":1}}`},
+	})
+	out, err := runCLI(t, m, "notes", "update", "n1", "--title", "New", "--meta", "gallery=true", "--json")
+	if err != nil {
+		t.Fatalf("notes update: %v", err)
+	}
+	calls := m.calls()
+	if len(calls) != 3 || calls[1] != "PATCH /api/v1/notes/n1" || calls[2] != "PATCH /api/v1/notes/n1/metadata" {
+		t.Errorf("calls = %v", calls)
+	}
+	if _, ok := m.bodyOf(t, "PATCH /api/v1/notes/n1")["metadata"]; ok {
+		t.Error("the note's own PATCH carried metadata; it must go to the metadata route")
+	}
+	if !strings.Contains(out, `"gallery": true`) || !strings.Contains(out, `"title": "New"`) {
+		t.Errorf("printed note lacks the new metadata:\n%s", out)
+	}
+}
+
+// TestNotesUpdateReportsAHalfDoneUpdate covers a metadata refusal after the
+// note's own fields were saved: the error must say which half landed.
+func TestNotesUpdateReportsAHalfDoneUpdate(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/notes/n1":   {Status: 200, Body: `{"id":"n1","is_encrypted":false}`},
+		"PATCH /api/v1/notes/n1": {Status: 200, Body: `{"note":{"id":"n1"},"usn":5}`},
+		"PATCH /api/v1/notes/n1/metadata": {Status: 422, Body: `{"error":{"code":"validation_failed","message":"The request was invalid.",` +
+			`"details":{"metadata":"has 65 top-level keys; the limit is 64"}}}`},
+	})
+	_, err := runCLI(t, m, "notes", "update", "n1", "--title", "New", "--meta", "a=1")
+	if err == nil || !strings.Contains(err.Error(), "the note was updated, but its metadata was not") ||
+		!strings.Contains(err.Error(), "65 top-level keys") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+// TestNotesListForwardsMetaFilters pins the query, next to the existing
+// --meta switch that leaves out bodies.
+func TestNotesListForwardsMetaFilters(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/notes": {Status: 200, Body: `{"data":[],"paging":{"total":0}}`},
+	})
+	if _, err := runCLI(t, m, "notes", "list", "--meta", "--meta-eq", "gallery=true", "--meta-has", "crm_id"); err != nil {
+		t.Fatalf("notes list: %v", err)
+	}
+	q := m.queryOf(t, "GET /api/v1/notes")
+	if q.Get("fields") != "meta" || q.Get("meta.gallery") != "true" || q.Get("meta_has") != "crm_id" {
+		t.Errorf("query = %v", q)
+	}
+}
+
+// TestNotesListPointsAtMetaEq covers the likeliest mistake: `--meta KEY=VALUE`
+// on a command where --meta is a switch.
+func TestNotesListPointsAtMetaEq(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{})
+	_, err := runCLI(t, m, "notes", "list", "--meta", "gallery=true")
+	if err == nil || !strings.Contains(err.Error(), "--meta-eq gallery=true") {
+		t.Errorf("err = %v", err)
+	}
+	if len(m.calls()) != 0 {
+		t.Errorf("requests made: %v", m.calls())
+	}
+	if _, err := runCLI(t, m, "notes", "list", "bogus"); err == nil || !strings.Contains(err.Error(), "unknown command") {
+		t.Errorf("a plain stray argument: err = %v", err)
+	}
+}
+
+// TestDisplayNoteShowsMetadata covers the detail view's Metadata row.
+func TestDisplayNoteShowsMetadata(t *testing.T) {
+	out := captureStdout(t, func() {
+		displayNote([]byte(`{"note":{"id":"n1","title":"T","content":"hi","metadata":{"crm_id":12345678901234567890}},"usn":3}`))
+	})
+	if !strings.Contains(out, "Metadata") || !strings.Contains(out, "crm_id=12345678901234567890") {
+		t.Errorf("metadata row missing or rounded:\n%s", out)
+	}
+	out = captureStdout(t, func() { displayNote([]byte(`{"id":"n1","title":"T","content":"hi","metadata":{}}`)) })
+	if strings.Contains(out, "Metadata") {
+		t.Errorf("empty metadata shown:\n%s", out)
+	}
+}
