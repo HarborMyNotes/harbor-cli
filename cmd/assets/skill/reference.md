@@ -463,7 +463,9 @@ Account preferences (NOT synced; last-write-wins). `set` is a partial update.
 `--clear-default-notebook`, `--default-sort`, `--locale`, `--timezone`,
 `--email-product-news`, `--email-reminders`, `--push-reminders`,
 `--editor-font-size`, `--editor-font-family sans\|serif\|mono`,
-`--editor-autosave`, `--editor-spellcheck`, `--editor-show-word-count`.
+`--editor-autosave`, `--editor-spellcheck`, `--editor-show-word-count`,
+`--editor-show-list-guides`. Turn a switch off with `=false`
+(e.g. `--editor-show-list-guides=false`).
 
 ---
 
