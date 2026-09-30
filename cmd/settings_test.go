@@ -26,6 +26,7 @@ func settingsTestCmd() *cobra.Command {
 	c.Flags().Bool("editor-spellcheck", false, "")
 	c.Flags().Int("editor-autosave", 0, "")
 	c.Flags().Bool("editor-show-word-count", false, "")
+	c.Flags().Bool("editor-show-list-guides", false, "")
 	c.Flags().Bool("email-reminders", false, "")
 	c.Flags().Bool("email-product-news", false, "")
 	c.Flags().Bool("push-reminders", false, "")
@@ -72,7 +73,7 @@ func TestSettingsBuildSetBodyPartial(t *testing.T) {
 	if len(editor) != 1 || editor["font_size"] != 16+2 {
 		t.Errorf("editor_prefs = %v, want only {font_size:18}", editor)
 	}
-	for _, k := range []string{"font_family", "spellcheck", "autosave_seconds", "show_word_count"} {
+	for _, k := range []string{"font_family", "spellcheck", "autosave_seconds", "show_word_count", "show_list_guides"} {
 		if _, ok := editor[k]; ok {
 			t.Errorf("editor_prefs.%s should be absent, got %v", k, editor)
 		}
@@ -158,6 +159,69 @@ func TestDisplaySettings(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("display missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// TestSettingsSetListGuidesWireBody runs the real 'settings set' against a mock
+// API and pins the exact PUT body, so the flag name, the wire key, and the
+// partial-update shape are all checked together.
+func TestSettingsSetListGuidesWireBody(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"bare flag turns it on", []string{"--editor-show-list-guides"}, `{"editor_prefs":{"show_list_guides":true}}`},
+		{"explicit true", []string{"--editor-show-list-guides=true"}, `{"editor_prefs":{"show_list_guides":true}}`},
+		{"explicit false sends false", []string{"--editor-show-list-guides=false"}, `{"editor_prefs":{"show_list_guides":false}}`},
+		{"not passed sends nothing for it", []string{"--theme", "dark"}, `{"theme":"dark"}`},
+		{"other editor pref leaves it out", []string{"--editor-show-word-count"}, `{"editor_prefs":{"show_word_count":true}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newAPIMock(t, map[string]mockReply{
+				"PUT /api/v1/settings": {Status: 200, Body: `{"data":{"editor_prefs":{}}}`},
+			})
+			args := append([]string{"settings", "set"}, tc.args...)
+			if _, err := runCLI(t, m, args...); err != nil {
+				t.Fatalf("settings set: %v", err)
+			}
+			if got := m.rawBodyOf(t, "PUT /api/v1/settings"); got != tc.want {
+				t.Errorf("body = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDisplaySettingsListGuides verifies the "Show list guide lines" row follows
+// the stored value: a check mark when on, the dim dot when off.
+func TestDisplaySettingsListGuides(t *testing.T) {
+	cases := []struct {
+		name   string
+		editor string
+		mark   string
+	}{
+		{"on", `{"show_list_guides":true}`, "✓"},
+		{"off", `{"show_list_guides":false}`, "·"},
+		{"missing reads as off", `{}`, "·"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := []byte(`{"data":{"theme":"system","editor_prefs":` + tc.editor + `}}`)
+			out := captureStdout(t, func() { displaySettings(data) })
+			line := ""
+			for _, l := range strings.Split(out, "\n") {
+				if strings.Contains(l, "Show list guide lines") {
+					line = l
+				}
+			}
+			if line == "" {
+				t.Fatalf("no \"Show list guide lines\" row:\n%s", out)
+			}
+			if !strings.Contains(line, tc.mark) {
+				t.Errorf("row = %q, want mark %q", line, tc.mark)
+			}
+		})
 	}
 }
 
