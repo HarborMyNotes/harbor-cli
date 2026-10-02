@@ -111,3 +111,22 @@ func (c *Client) ExportNoteMarkdown(id string, zip bool) (*http.Response, error)
 	}
 	return c.doGetRaw("/notes/"+id+"/export.md", params)
 }
+
+// ExportNotePDF streams one note rendered to a PDF on the server, with any
+// embedded PDF attachments combined into it. It returns the live *http.Response
+// — the caller MUST close the body — because two things ride in headers the
+// caller needs: the file name (Content-Disposition) and how many attachments
+// could not be combined (X-Skipped-Attachments). An encrypted note is refused
+// with encrypted_not_exportable.
+func (c *Client) ExportNotePDF(id string) (*http.Response, error) {
+	return c.doGetRaw("/notes/"+id+"/export.pdf", nil)
+}
+
+// ExportNoteHTML streams one note as a single self-contained HTML page: the
+// stylesheet and every attachment are inlined, so it opens with no network. It
+// returns the live *http.Response (the caller MUST close the body and take the
+// file name from Content-Disposition). An encrypted note is refused with
+// encrypted_not_exportable, and a page over the size cap with export_too_large.
+func (c *Client) ExportNoteHTML(id string) (*http.Response, error) {
+	return c.doGetRaw("/notes/"+id+"/export.html", nil)
+}

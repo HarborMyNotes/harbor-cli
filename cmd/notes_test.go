@@ -4,7 +4,9 @@
 package cmd
 
 import (
+	"encoding/json"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -277,19 +279,27 @@ func TestNotesExportToStdoutWritesOnlyTheDocument(t *testing.T) {
 	}
 }
 
-// TestNotesExportRequiresAnOutput refuses rather than guessing. The two shapes
-// this command can return have different extensions, so a default filename
-// would be wrong half the time.
-func TestNotesExportRequiresAnOutput(t *testing.T) {
+// TestNotesExportDefaultsToTheCurrentDirectory saves under the server's own
+// name in the working directory when --output is left off, as every other
+// Harbor app saves a download under that name.
+func TestNotesExportDefaultsToTheCurrentDirectory(t *testing.T) {
 	m := noteExportMock(t, "Plan.md", "text/markdown; charset=utf-8", "# Plan\n")
+	t.Chdir(t.TempDir())
 
-	_, err := runCLI(t, m, "notes", "export", "n1")
-
-	if err == nil {
-		t.Fatal("notes export ran with nowhere to put the result")
+	out, err := runCLI(t, m, "notes", "export", "n1")
+	if err != nil {
+		t.Fatalf("notes export with no --output: %v", err)
 	}
-	if !strings.Contains(err.Error(), "--output") {
-		t.Errorf("the refusal never names the missing flag:\n%s", err)
+
+	got, rerr := os.ReadFile("Plan.md")
+	if rerr != nil {
+		t.Fatalf("nothing was written to the current directory: %v", rerr)
+	}
+	if string(got) != "# Plan\n" {
+		t.Errorf("the file does not hold the export: %q", got)
+	}
+	if !strings.Contains(out, "Plan.md") {
+		t.Errorf("the command never said where it put the file:\n%s", out)
 	}
 }
 
@@ -313,12 +323,12 @@ func TestNotesExportZipIsAskedForOnTheWire(t *testing.T) {
 func TestNotesExportFormatIsValidatedLocally(t *testing.T) {
 	m := noteExportMock(t, "Plan.md", "text/markdown; charset=utf-8", "# Plan\n")
 
-	_, err := runCLI(t, m, "notes", "export", "n1", "--format", "pdf", "--output", "-")
+	_, err := runCLI(t, m, "notes", "export", "n1", "--format", "docx", "--output", "-")
 
 	if err == nil {
 		t.Fatal("an unsupported --format was sent to the server")
 	}
-	if !strings.Contains(err.Error(), "markdown") {
+	if !strings.Contains(err.Error(), "markdown|pdf|html|enex") {
 		t.Errorf("the refusal never says what is supported:\n%s", err)
 	}
 	for _, r := range m.requests {
@@ -328,18 +338,19 @@ func TestNotesExportFormatIsValidatedLocally(t *testing.T) {
 	}
 }
 
-// TestEncryptedNoteExportSaysWhy turns the API code into the sentence a person
-// can act on, and names the way through.
+// TestEncryptedNoteExportSaysWhy turns the API code into the sentence every
+// Harbor app shows, and names the way through.
 func TestEncryptedNoteExportSaysWhy(t *testing.T) {
 	err := mapNoteError(apiErr("encrypted_not_exportable"))
 
 	if err == nil {
 		t.Fatal("the encrypted refusal was passed through as a raw API code")
 	}
-	for _, want := range []string{"encrypted", "notes decrypt"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("the message never mentions %q:\n%s", want, err)
-		}
+	if first := strings.SplitN(err.Error(), "\n", 2)[0]; first != "Encrypted notes can't be exported." {
+		t.Errorf("first line = %q, want the shared sentence", first)
+	}
+	if !strings.Contains(err.Error(), "notes decrypt") {
+		t.Errorf("the message never names the way through:\n%s", err)
 	}
 }
 
@@ -353,7 +364,7 @@ func TestNotesExportChecksFlagsBeforeCredentials(t *testing.T) {
 	resetCommandState(t)
 	prepareCommandTree()
 
-	rootCmd.SetArgs([]string{"notes", "export", "n1", "--format", "pdf", "--output", "-"})
+	rootCmd.SetArgs([]string{"notes", "export", "n1", "--format", "docx", "--output", "-"})
 	err := rootCmd.Execute()
 
 	if err == nil {
@@ -364,34 +375,9 @@ func TestNotesExportChecksFlagsBeforeCredentials(t *testing.T) {
 	}
 }
 
-// TestNotesExportSaysWhenTheServerNamedNoFile keeps the blame in the right
-// place. Falling through to os.Create on a directory reports "is a directory",
-// which reads like the path was wrong when it was the response.
-func TestNotesExportSaysWhenTheServerNamedNoFile(t *testing.T) {
-	m := newAPIMock(t, map[string]mockReply{})
-	m.handler = func(w http.ResponseWriter, r *http.Request) {
-		// No Content-Disposition at all.
-		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
-		w.WriteHeader(200)
-		_, _ = w.Write([]byte("# Plan\n"))
-	}
-	dir := t.TempDir()
-
-	_, err := runCLI(t, m, "notes", "export", "n1", "--output", dir)
-
-	if err == nil {
-		t.Fatal("a nameless response wrote something anyway")
-	}
-	if !strings.Contains(err.Error(), "did not name the file") {
-		t.Errorf("the error blames the wrong thing:\n%s", err)
-	}
-}
-
-// TestNotesExportBlamesTheServerOnlyWhenItNamedNothing keeps the refusal above
-// from misattributing. A directory that happens to share the note's exported
-// name is the user's filesystem, not a server that failed to name the file, and
-// saying otherwise sends them looking in the wrong place.
-func TestNotesExportBlamesTheServerOnlyWhenItNamedNothing(t *testing.T) {
+// TestNotesExportWontWriteOverADirectory reports a directory in the way of the
+// server's file name as the filesystem error it is, and writes nothing.
+func TestNotesExportWontWriteOverADirectory(t *testing.T) {
 	m := noteExportMock(t, "Plan.md", "text/markdown; charset=utf-8", "# Plan\n")
 	dir := t.TempDir()
 	t.Chdir(dir)
@@ -404,8 +390,316 @@ func TestNotesExportBlamesTheServerOnlyWhenItNamedNothing(t *testing.T) {
 	if err == nil {
 		t.Fatal("the export wrote over a directory")
 	}
-	if strings.Contains(err.Error(), "did not name the file") {
-		t.Errorf("the server named the file; the directory in the way is the user's:\n%s", err)
+	if !strings.Contains(err.Error(), "cannot create output file") {
+		t.Errorf("err = %q, want the filesystem refusal", err)
+	}
+}
+
+// exportFixtureNote is one note in exportFixtureMock: the bodies it exports
+// to, and whether the server holds it only as ciphertext.
+type exportFixtureNote struct {
+	encrypted bool
+	title     string // the exact name, as filename* carries it
+	asciiName string // the ASCII stand-in in plain filename
+	pdfName   string // the server's ASCII-only, dash-separated PDF name
+}
+
+// exportFixtureMock serves all four per-note exports the way the server does,
+// for an encrypted note AND a normal one in the same account. PDF, Markdown and
+// HTML refuse the encrypted note with 422; ENEX answers it 200 with an empty
+// export and X-Skipped-Encrypted: 1. disposition picks the header shape:
+// "both" (filename + filename*), "plain" (filename only) or "none".
+func exportFixtureMock(t *testing.T, notes map[string]exportFixtureNote, disposition string) *apiMock {
+	t.Helper()
+	m := newAPIMock(t, map[string]mockReply{})
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		var id, ext, body string
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/export/enex":
+			var req struct {
+				NoteIDs []string `json:"note_ids"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if len(req.NoteIDs) != 1 {
+				t.Errorf("ENEX asked for %v, want exactly one note", req.NoteIDs)
+			}
+			id, ext = req.NoteIDs[0], ".enex"
+			if notes[id].encrypted {
+				// The real server: 200, zero notes, the skip in a header.
+				w.Header().Set("Content-Type", "application/xml")
+				w.Header().Set("Content-Disposition", `attachment; filename="note.enex"; filename*=UTF-8''note.enex`)
+				w.Header().Set("X-Skipped-Encrypted", "1")
+				w.WriteHeader(200)
+				_, _ = w.Write([]byte(`<?xml version="1.0"?><en-export></en-export>`))
+				return
+			}
+			w.Header().Set("X-Skipped-Encrypted", "0")
+			body = `<en-export><note><title>` + notes[id].title + `</title></note></en-export>`
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/notes/"):
+			rest := strings.TrimPrefix(r.URL.Path, "/api/v1/notes/")
+			dot := strings.Index(rest, "/export.")
+			if dot < 0 {
+				t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+				w.WriteHeader(404)
+				return
+			}
+			id, ext = rest[:dot], "."+strings.TrimPrefix(rest[dot:], "/export.")
+			if notes[id].encrypted {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(422)
+				_, _ = w.Write([]byte(apiErrorBody("encrypted_not_exportable", "this note is encrypted and cannot be exported")))
+				return
+			}
+			body = ext + " export of " + id
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(404)
+			return
+		}
+		n := notes[id]
+		name, ascii := n.title+ext, n.asciiName+ext
+		if ext == ".pdf" {
+			// PDF names are ASCII only on the server, so both forms agree.
+			name, ascii = n.pdfName+ext, n.pdfName+ext
+		}
+		switch disposition {
+		case "both":
+			w.Header().Set("Content-Disposition", `attachment; filename="`+ascii+`"; filename*=UTF-8''`+url.PathEscape(name))
+		case "plain":
+			w.Header().Set("Content-Disposition", `attachment; filename="`+ascii+`"`)
+		}
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(body))
+	}
+	return m
+}
+
+// exportFixtureNotes is one normal note with an emoji title and one
+// encrypted note, side by side.
+var exportFixtureNotes = map[string]exportFixtureNote{
+	"plain1": {title: "Welcome to Harbor 👋", asciiName: "Welcome to Harbor _", pdfName: "Welcome-to-Harbor"},
+	"sealed": {encrypted: true, title: "note", asciiName: "note", pdfName: "note"},
+}
+
+// dirNames lists what a directory holds, for asserting what a run left behind.
+func dirNames(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := []string{}
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
+// TestNotesExportEachFormatAsksForTheRightThing pins every format to its own
+// request: the three downloads on their own paths, and ENEX as a one-id
+// selection with the attachments included.
+func TestNotesExportEachFormatAsksForTheRightThing(t *testing.T) {
+	cases := map[string]string{
+		"markdown": "GET /api/v1/notes/plain1/export.md",
+		"pdf":      "GET /api/v1/notes/plain1/export.pdf",
+		"html":     "GET /api/v1/notes/plain1/export.html",
+		"enex":     "POST /api/v1/export/enex",
+	}
+	for format, want := range cases {
+		t.Run(format, func(t *testing.T) {
+			m := exportFixtureMock(t, exportFixtureNotes, "both")
+			t.Chdir(t.TempDir())
+
+			if _, err := runCLI(t, m, "notes", "export", "plain1", "--format", format); err != nil {
+				t.Fatalf("notes export --format %s: %v", format, err)
+			}
+
+			if calls := m.calls(); len(calls) != 1 || calls[0] != want {
+				t.Fatalf("calls = %v, want [%s]", calls, want)
+			}
+			if format == "enex" {
+				body := m.bodyOf(t, want)
+				ids, _ := body["note_ids"].([]any)
+				if len(ids) != 1 || ids[0] != "plain1" || body["include_resources"] != true {
+					t.Errorf("ENEX body = %v, want note_ids [plain1] and include_resources true", body)
+				}
+				if _, ok := body["notebook_id"]; ok {
+					t.Errorf("ENEX body carries a notebook_id: %v", body)
+				}
+			}
+		})
+	}
+}
+
+// TestNotesExportNamesTheFileLikeTheServerSays covers the three header shapes
+// for every format: filename* wins when it is there (emoji intact), plain
+// filename is next, and with no header the shared fallback name is used.
+func TestNotesExportNamesTheFileLikeTheServerSays(t *testing.T) {
+	want := map[string]map[string]string{
+		"both": {
+			"markdown": "Welcome to Harbor 👋.md",
+			"pdf":      "Welcome-to-Harbor.pdf",
+			"html":     "Welcome to Harbor 👋.html",
+			"enex":     "Welcome to Harbor 👋.enex",
+		},
+		"plain": {
+			"markdown": "Welcome to Harbor _.md",
+			"pdf":      "Welcome-to-Harbor.pdf",
+			"html":     "Welcome to Harbor _.html",
+			"enex":     "Welcome to Harbor _.enex",
+		},
+		"none": {
+			"markdown": "note.md",
+			"pdf":      "note.pdf",
+			"html":     "note.html",
+			"enex":     "note.enex",
+		},
+	}
+	for disposition, byFormat := range want {
+		for format, name := range byFormat {
+			t.Run(disposition+"/"+format, func(t *testing.T) {
+				m := exportFixtureMock(t, exportFixtureNotes, disposition)
+				dir := t.TempDir()
+				t.Chdir(dir)
+
+				out, err := runCLI(t, m, "notes", "export", "plain1", "--format", format)
+				if err != nil {
+					t.Fatalf("notes export: %v", err)
+				}
+
+				if got := dirNames(t, dir); len(got) != 1 || got[0] != name {
+					t.Fatalf("the directory holds %q, want [%q]", got, name)
+				}
+				if !strings.Contains(out, name) {
+					t.Errorf("the command never said where it put the file:\n%s", out)
+				}
+			})
+		}
+	}
+}
+
+// TestNotesExportMarkdownFallbackNamesAZipAsAZip keeps the one fallback that
+// depends on the response: a Markdown export that came back as an archive.
+func TestNotesExportMarkdownFallbackNamesAZipAsAZip(t *testing.T) {
+	cases := map[string]string{
+		"application/zip":              "note.zip",
+		"text/markdown; charset=utf-8": "note.md",
+		"":                             "note.md",
+	}
+	for contentType, want := range cases {
+		if got := notesExportFallbackName("markdown", contentType); got != want {
+			t.Errorf("notesExportFallbackName(markdown, %q) = %q, want %q", contentType, got, want)
+		}
+	}
+	// The other formats do not look at the content type.
+	if got := notesExportFallbackName("pdf", "application/zip"); got != "note.pdf" {
+		t.Errorf("pdf fallback = %q", got)
+	}
+}
+
+// TestNotesExportEncryptedNoteFailsCleanly runs every format against an
+// encrypted note and a normal note in the same account. The encrypted one must
+// fail with the shared sentence, a non-zero exit and no file — including ENEX,
+// where the server answers 200 — while the normal one still exports.
+func TestNotesExportEncryptedNoteFailsCleanly(t *testing.T) {
+	for _, format := range notesExportFormats {
+		t.Run(format, func(t *testing.T) {
+			m := exportFixtureMock(t, exportFixtureNotes, "both")
+			dir := t.TempDir()
+			t.Chdir(dir)
+
+			out, err := runCLI(t, m, "notes", "export", "sealed", "--format", format)
+			if err == nil {
+				t.Fatalf("an encrypted note exported without complaint:\n%s", out)
+			}
+			if first := strings.SplitN(err.Error(), "\n", 2)[0]; first != "Encrypted notes can't be exported." {
+				t.Errorf("err = %q, want the shared sentence first", err)
+			}
+			if code := exitCodeFor(err); code == exitOK {
+				t.Errorf("exit code = %d, want non-zero", code)
+			}
+			if got := dirNames(t, dir); len(got) != 0 {
+				t.Errorf("a file was left behind for the encrypted note: %v", got)
+			}
+			if strings.Contains(out, "Wrote") {
+				t.Errorf("stdout claimed success:\n%s", out)
+			}
+
+			// To stdout, nothing at all may be written.
+			out, err = runCLI(t, m, "notes", "export", "sealed", "--format", format, "--output", "-")
+			if err == nil || out != "" {
+				t.Errorf("-o -: err = %v, stdout = %q; want an error and nothing written", err, out)
+			}
+
+			// The normal note in the same account is unaffected.
+			if _, err := runCLI(t, m, "notes", "export", "plain1", "--format", format); err != nil {
+				t.Fatalf("the normal note failed too: %v", err)
+			}
+			if got := dirNames(t, dir); len(got) != 1 {
+				t.Errorf("the normal note left %v, want one file", got)
+			}
+		})
+	}
+}
+
+// TestNotesExportPDFReportsSkippedAttachments warns on stderr when the server
+// could not combine some attachments, keeps stdout clean for -o -, and says
+// nothing when every attachment went in.
+func TestNotesExportPDFReportsSkippedAttachments(t *testing.T) {
+	serve := func(skipped string) *apiMock {
+		m := newAPIMock(t, map[string]mockReply{})
+		m.handler = func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/pdf")
+			w.Header().Set("Content-Disposition", `attachment; filename="Plan.pdf"`)
+			if skipped != "" {
+				w.Header().Set("X-Skipped-Attachments", skipped)
+			}
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte("%PDF-1.3"))
+		}
+		return m
+	}
+
+	t.Chdir(t.TempDir())
+	var out string
+	stderr := captureStderr(t, func() {
+		var err error
+		out, err = runCLI(t, serve("2"), "notes", "export", "n1", "--format", "pdf", "--output", "-")
+		if err != nil {
+			t.Fatalf("notes export: %v", err)
+		}
+	})
+	if out != "%PDF-1.3" {
+		t.Errorf("stdout = %q, want only the PDF", out)
+	}
+	if !strings.Contains(stderr, "2 attachments could not be combined") {
+		t.Errorf("stderr = %q, want the skipped count", stderr)
+	}
+
+	for _, header := range []string{"", "0"} {
+		stderr = captureStderr(t, func() {
+			if _, err := runCLI(t, serve(header), "notes", "export", "n1", "--format", "pdf"); err != nil {
+				t.Fatalf("notes export: %v", err)
+			}
+		})
+		if strings.Contains(stderr, "could not be combined") {
+			t.Errorf("X-Skipped-Attachments %q still warned: %q", header, stderr)
+		}
+	}
+}
+
+// TestNotesExportZipIsMarkdownOnly refuses --zip with any other format before
+// a request is spent, rather than silently ignoring it.
+func TestNotesExportZipIsMarkdownOnly(t *testing.T) {
+	m := exportFixtureMock(t, exportFixtureNotes, "both")
+	for _, format := range []string{"pdf", "html", "enex"} {
+		_, err := runCLI(t, m, "notes", "export", "plain1", "--format", format, "--zip", "--output", "-")
+		if err == nil || !strings.Contains(err.Error(), "--zip only applies to --format markdown") {
+			t.Errorf("--format %s --zip: err = %v", format, err)
+		}
+	}
+	if len(m.calls()) != 0 {
+		t.Errorf("a rejected flag combination still cost requests: %v", m.calls())
 	}
 }
 

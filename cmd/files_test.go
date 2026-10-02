@@ -58,6 +58,26 @@ func TestWriteOutputToFileAndStdout(t *testing.T) {
 	}
 }
 
+// TestWriteOutputRemovesAPartialFile drops a download that broke part way, so
+// a truncated file is never left looking like a finished one.
+func TestWriteOutputRemovesAPartialFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out.bin")
+	broken := io.MultiReader(strings.NewReader("half a file"), iotestErrReader{})
+
+	if _, err := writeOutput(path, broken); err == nil {
+		t.Fatal("a failed stream was reported as written")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("the partial file is still there (stat err = %v)", err)
+	}
+}
+
+// iotestErrReader fails every read, standing in for a dropped connection.
+type iotestErrReader struct{}
+
+// Read always fails.
+func (iotestErrReader) Read([]byte) (int, error) { return 0, errors.New("connection reset") }
+
 // TestFilenameFromContentDisposition covers the shapes the header actually
 // arrives in.
 //
@@ -87,6 +107,9 @@ func TestFilenameFromContentDisposition(t *testing.T) {
 		// row above — note titles are whatever the user typed.
 		`attachment; filename*=UTF-8''%E5%9B%9B%E5%8D%8A%E6%9C%9F.md`: "四半期.md",
 		`attachment; filename="Plan 🚢.md"`:                            "Plan 🚢.md",
+		// What the server sends today: an ASCII stand-in AND the exact name.
+		// The exact one wins, emoji and all.
+		`attachment; filename="Welcome to Harbor _.html"; filename*=UTF-8''Welcome%20to%20Harbor%20%F0%9F%91%8B.html`: "Welcome to Harbor 👋.html",
 	}
 	for in, want := range cases {
 		if got := filenameFromContentDisposition(in); got != want {

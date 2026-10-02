@@ -220,6 +220,73 @@ func TestExportNoteMarkdownEncrypted(t *testing.T) {
 	}
 }
 
+// TestExportNotePDFAndHTML pins the two newer per-note exports: each is a plain
+// GET on its own path with no query, and the headers the caller reads come back
+// intact on the live response.
+func TestExportNotePDFAndHTML(t *testing.T) {
+	cases := []struct {
+		name string
+		call func(c *Client) (*http.Response, error)
+		path string
+	}{
+		{"pdf", func(c *Client) (*http.Response, error) { return c.ExportNotePDF("n1") }, "/notes/n1/export.pdf"},
+		{"html", func(c *Client) (*http.Response, error) { return c.ExportNoteHTML("n1") }, "/notes/n1/export.html"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var rec recordedRequest
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				rec.Method, rec.Path, rec.Query = r.Method, r.URL.Path, r.URL.RawQuery
+				w.Header().Set("Content-Disposition", `attachment; filename="Plan"`)
+				w.Header().Set("X-Skipped-Attachments", "2")
+				w.WriteHeader(200)
+				_, _ = w.Write([]byte("bytes"))
+			}))
+			defer srv.Close()
+
+			resp, err := tc.call(testClient(srv.URL))
+			if err != nil {
+				t.Fatalf("export error: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if rec.Method != "GET" || rec.Path != tc.path || rec.Query != "" {
+				t.Errorf("request = %s %s?%s, want GET %s", rec.Method, rec.Path, rec.Query, tc.path)
+			}
+			if got := resp.Header.Get("X-Skipped-Attachments"); got != "2" {
+				t.Errorf("X-Skipped-Attachments = %q, want it readable off the response", got)
+			}
+			raw, _ := io.ReadAll(resp.Body)
+			if string(raw) != "bytes" {
+				t.Errorf("body = %q", raw)
+			}
+		})
+	}
+}
+
+// TestExportNotePDFAndHTMLEncrypted keeps the encrypted refusal a typed API
+// error for both, so the command can turn it into one sentence.
+func TestExportNotePDFAndHTMLEncrypted(t *testing.T) {
+	srv := newTestServer(t, nil, 422, `{"error":{"code":"encrypted_not_exportable","message":"nope"}}`)
+	defer srv.Close()
+	c := testClient(srv.URL)
+
+	for name, call := range map[string]func() (*http.Response, error){
+		"pdf":  func() (*http.Response, error) { return c.ExportNotePDF("n1") },
+		"html": func() (*http.Response, error) { return c.ExportNoteHTML("n1") },
+	} {
+		resp, err := call()
+		if err == nil {
+			resp.Body.Close()
+			t.Fatalf("%s: an encrypted note exported without complaint", name)
+		}
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || apiErr.Code != "encrypted_not_exportable" {
+			t.Errorf("%s: err = %v, want an APIError with code encrypted_not_exportable", name, err)
+		}
+	}
+}
+
 // TestListNotesQuery covers the caller-built query form, which carries a
 // repeated meta_has and a meta.KEY filter to the notes route.
 func TestListNotesQuery(t *testing.T) {

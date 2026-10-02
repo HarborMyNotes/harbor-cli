@@ -775,8 +775,9 @@ func exportEnexDeprecationNotice(deprecationHeader, notebook string) string {
 		"      It is not a drop-in: it writes a ZIP, and includes notes in the trash that this command leaves out.")
 }
 
-// importExportSkipCount parses the X-Skipped-Encrypted header into a count,
-// treating a missing or unparseable value as zero.
+// importExportSkipCount parses a skipped-count header (X-Skipped-Encrypted,
+// X-Skipped-Attachments) into a count, treating a missing or unparseable value
+// as zero.
 func importExportSkipCount(header string) int {
 	if header == "" {
 		return 0

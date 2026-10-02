@@ -498,6 +498,8 @@ func hashFile(path string) (string, int64, error) {
 }
 
 // writeOutput streams r to a path ("-" = stdout) and returns the byte count.
+// If the stream fails part way, the file is removed: a truncated download that
+// looks like a finished one is worse than no file at all.
 func writeOutput(path string, r io.Reader) (int64, error) {
 	if path == "-" {
 		return io.Copy(os.Stdout, r)
@@ -506,8 +508,15 @@ func writeOutput(path string, r io.Reader) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("cannot create output file: %w", err)
 	}
-	defer f.Close()
-	return io.Copy(f, r)
+	n, err := io.Copy(f, r)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		_ = os.Remove(path)
+		return n, fmt.Errorf("cannot write output file: %w", err)
+	}
+	return n, nil
 }
 
 // filenameFromContentDisposition extracts a filename from a Content-Disposition

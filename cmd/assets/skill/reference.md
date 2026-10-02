@@ -108,7 +108,7 @@ Bodies are Markdown (default) or HTML (`--format`), supplied via `--content`,
 | `harbor notes links <id>` | Outgoing `harbor:note` links | paging |
 | `harbor notes backlinks <id>` | Live notes linking here | paging |
 | `harbor notes audit <id>` | Change log | `--action create\|update\|append\|delete\|restore\|tag\|move\|share`, `--order created_at\|usn`, paging |
-| `harbor notes export <id>` | Write ONE note to a file | `--output` (req; `-` = stdout, a directory takes the server's filename), `--zip`, `--format markdown` |
+| `harbor notes export <id>` | Write ONE note to a file | `--format markdown\|pdf\|html\|enex` (default markdown), `--output` (default: the current directory under the server's filename; a path, a directory, or `-` = stdout), `--zip` (Markdown only) |
 
 On `notes list`, `--meta` is a switch that omits bodies for lighter list
 payloads; it is not the metadata filter (that is `--meta-eq`). List sort fields:
@@ -548,21 +548,39 @@ Harbor can import back. All three formats skip encrypted notes (the server holds
 only ciphertext) and report the count.
 
 **One note to a file** is `harbor notes export <id>`, a different command from
-the account job: it returns the file directly rather than queueing anything.
+the account job: it returns the file directly rather than queueing anything. It
+offers the same four formats as the apps' note menu.
 
 ```bash
-harbor notes export "$NOTE_ID" --output note.md   # a note with no attachments
-harbor notes export "$NOTE_ID" --output .         # server names it; .md or .zip
-harbor notes export "$NOTE_ID" --zip --output .   # always the archive
+harbor notes export "$NOTE_ID"                    # Markdown, server's filename, here
+harbor notes export "$NOTE_ID" --format pdf       # e.g. Welcome-to-Harbor.pdf
+harbor notes export "$NOTE_ID" --format html      # one self-contained page
+harbor notes export "$NOTE_ID" --format enex      # Evernote, with attachments
+harbor notes export "$NOTE_ID" --output note.md   # a name of your own
+harbor notes export "$NOTE_ID" --zip              # Markdown, always the archive
+harbor notes export "$NOTE_ID" --output -         # stream to stdout
 ```
 
-The SAME command returns `text/markdown` for a note with no attachments and
-`application/zip` (the `.md` plus `files/`) for one with them, so let `--output
-.` take the server's own filename rather than choosing an extension yourself.
-Rendering happens server-side, so this needs a network connection, and encrypted
-notes are refused. **This is an export, not a read:** the file carries YAML front
-matter and the title as a heading, so writing it back with `notes update` would
-put all of that into the note — use `notes get --format markdown` for that.
+- **Names come from the server.** With no `--output` (or a directory) the file
+  takes the server's name: the title with spaces, accents and emoji kept for
+  Markdown, HTML and ENEX (`Welcome to Harbor 👋.html`), and an ASCII-only,
+  dash-separated title for PDF. If the server sends no name, the file is
+  `note.md` / `note.pdf` / `note.html` / `note.enex`.
+- **Markdown** returns `text/markdown` for a note with no attachments and
+  `application/zip` (the `.md` plus `files/`) for one with them, so let the
+  server name it rather than choosing an extension yourself. `--zip` forces the
+  archive and works only with Markdown.
+- **PDF** combines embedded PDF attachments into it. Any it could not combine
+  are reported on stderr as a warning; the file is still written.
+- **HTML** inlines the stylesheet and every attachment, so it opens offline.
+  Over 100 MiB the server refuses with "The exported file is too large."
+- **Encrypted notes can't be exported**, in any format — the server holds only
+  ciphertext. The command fails with a non-zero exit and writes no file.
+- Rendering happens server-side, so this needs a network connection.
+
+**This is an export, not a read:** the file carries YAML front matter and the
+title as a heading, so writing it back with `notes update` would put all of that
+into the note — use `notes get --format markdown` for that.
 
 ---
 
