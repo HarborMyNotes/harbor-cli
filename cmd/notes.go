@@ -543,7 +543,7 @@ of that INTO the note. Use 'harbor notes get <id> --format markdown' for that.`,
 		// note as encrypted, and the body is then an export with nothing in it.
 		// Checked before anything is created, so no empty file is left behind.
 		if format == "enex" && importExportSkipCount(resp.Header.Get("X-Skipped-Encrypted")) > 0 {
-			return mapNoteError(&client.APIError{Status: http.StatusUnprocessableEntity, Code: "encrypted_not_exportable"})
+			return mapNoteError(&client.APIError{Status: http.StatusUnprocessableEntity, Code: "encrypted_not_exportable", RequestID: c.LastRequestID})
 		}
 
 		// Read the header BEFORE draining the body: the Markdown endpoint answers
@@ -583,9 +583,11 @@ func mapNoteError(err error) error {
 		case "append_not_supported_encrypted":
 			return errors.New("cannot append to an encrypted note")
 		case "encrypted_not_exportable":
-			// The first line is the same sentence every Harbor app shows.
-			return errors.New("Encrypted notes can't be exported.\n" +
-				"       Decrypt the note first ('harbor notes decrypt <id>') if you want a file of it.")
+			// Still an APIError, so --json reports the server's code. The message
+			// is the same sentence every Harbor app shows.
+			friendly := *apiErr
+			friendly.Message = "Encrypted notes can't be exported."
+			return &friendly
 		case "cannot_move_plaintext_into_encrypted":
 			// The server's own backstop on this CLI's move guard. Nothing was written
 			// and no usn was spent, so re-running is always the fix — but WHY the local

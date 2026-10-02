@@ -5,12 +5,15 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/HarborMyNotes/harbor-cli/client"
 )
 
 func TestExtractNote(t *testing.T) {
@@ -339,18 +342,19 @@ func TestNotesExportFormatIsValidatedLocally(t *testing.T) {
 }
 
 // TestEncryptedNoteExportSaysWhy turns the API code into the sentence every
-// Harbor app shows, and names the way through.
+// Harbor app shows, and keeps it an APIError so --json reports the real code.
 func TestEncryptedNoteExportSaysWhy(t *testing.T) {
 	err := mapNoteError(apiErr("encrypted_not_exportable"))
 
-	if err == nil {
-		t.Fatal("the encrypted refusal was passed through as a raw API code")
+	var got *client.APIError
+	if !errors.As(err, &got) {
+		t.Fatalf("err = %T %v, want an APIError", err, err)
 	}
-	if first := strings.SplitN(err.Error(), "\n", 2)[0]; first != "Encrypted notes can't be exported." {
-		t.Errorf("first line = %q, want the shared sentence", first)
+	if got.Code != "encrypted_not_exportable" {
+		t.Errorf("code = %q, want encrypted_not_exportable", got.Code)
 	}
-	if !strings.Contains(err.Error(), "notes decrypt") {
-		t.Errorf("the message never names the way through:\n%s", err)
+	if got.Message != "Encrypted notes can't be exported." {
+		t.Errorf("message = %q, want the shared sentence and nothing else", got.Message)
 	}
 }
 
@@ -429,6 +433,7 @@ func exportFixtureMock(t *testing.T, notes map[string]exportFixtureNote, disposi
 				w.Header().Set("Content-Type", "application/xml")
 				w.Header().Set("Content-Disposition", `attachment; filename="note.enex"; filename*=UTF-8''note.enex`)
 				w.Header().Set("X-Skipped-Encrypted", "1")
+				w.Header().Set("X-Request-Id", "req_enex_skip")
 				w.WriteHeader(200)
 				_, _ = w.Write([]byte(`<?xml version="1.0"?><en-export></en-export>`))
 				return
@@ -612,8 +617,9 @@ func TestNotesExportEncryptedNoteFailsCleanly(t *testing.T) {
 			if err == nil {
 				t.Fatalf("an encrypted note exported without complaint:\n%s", out)
 			}
-			if first := strings.SplitN(err.Error(), "\n", 2)[0]; first != "Encrypted notes can't be exported." {
-				t.Errorf("err = %q, want the shared sentence first", err)
+			var apiErr *client.APIError
+			if !errors.As(err, &apiErr) || apiErr.Message != "Encrypted notes can't be exported." {
+				t.Errorf("err = %v, want the shared sentence", err)
 			}
 			if code := exitCodeFor(err); code == exitOK {
 				t.Errorf("exit code = %d, want non-zero", code)
@@ -639,6 +645,75 @@ func TestNotesExportEncryptedNoteFailsCleanly(t *testing.T) {
 				t.Errorf("the normal note left %v, want one file", got)
 			}
 		})
+	}
+}
+
+// TestNotesExportEncryptedJSONKeepsTheServerCode runs every format against the
+// encrypted note with --json. The error must carry encrypted_not_exportable —
+// not cli_error — and a one-line message, so a script can branch on it.
+func TestNotesExportEncryptedJSONKeepsTheServerCode(t *testing.T) {
+	for _, format := range notesExportFormats {
+		t.Run(format, func(t *testing.T) {
+			m := exportFixtureMock(t, exportFixtureNotes, "both")
+			t.Chdir(t.TempDir())
+
+			_, err := runCLI(t, m, "--json", "notes", "export", "sealed", "--format", format)
+			if err == nil {
+				t.Fatal("an encrypted note exported without complaint")
+			}
+			stderr := captureStderr(t, func() { renderError(err) })
+
+			var env struct {
+				Error struct {
+					Code      string `json:"code"`
+					Message   string `json:"message"`
+					RequestID string `json:"request_id"`
+				} `json:"error"`
+			}
+			if jerr := json.Unmarshal([]byte(stderr), &env); jerr != nil {
+				t.Fatalf("--json error is not JSON: %v\n%s", jerr, stderr)
+			}
+			if env.Error.Code != "encrypted_not_exportable" {
+				t.Errorf("code = %q, want encrypted_not_exportable", env.Error.Code)
+			}
+			if env.Error.Message != "Encrypted notes can't be exported." {
+				t.Errorf("message = %q, want the shared sentence on one line", env.Error.Message)
+			}
+			// ENEX's refusal is built by the CLI from a 200, so it has to carry
+			// that response's request id itself.
+			if format == "enex" && env.Error.RequestID != "req_enex_skip" {
+				t.Errorf("request_id = %q, want the 200 response's id", env.Error.RequestID)
+			}
+		})
+	}
+}
+
+// TestNotesExportHTMLTooLargeShowsTheServerMessage covers the HTML size cap:
+// the server's own sentence is printed, the exit is non-zero, and no file is
+// written.
+func TestNotesExportHTMLTooLargeShowsTheServerMessage(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/notes/n1/export.html": {Status: 422, Body: apiErrorBody("export_too_large", "The exported file is too large.")},
+	})
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	_, err := runCLI(t, m, "notes", "export", "n1", "--format", "html")
+	if err == nil {
+		t.Fatal("an over-cap export was reported as written")
+	}
+	if code := exitCodeFor(err); code == exitOK {
+		t.Errorf("exit code = %d, want non-zero", code)
+	}
+	stderr := captureStderr(t, func() { renderError(err) })
+	if !strings.Contains(stderr, "Error: The exported file is too large.") {
+		t.Errorf("stderr = %q, want the server's message", stderr)
+	}
+	if !strings.Contains(stderr, "export_too_large") {
+		t.Errorf("stderr = %q, want the code", stderr)
+	}
+	if got := dirNames(t, dir); len(got) != 0 {
+		t.Errorf("a file was written for a refused export: %v", got)
 	}
 }
 

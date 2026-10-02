@@ -498,8 +498,10 @@ func hashFile(path string) (string, int64, error) {
 }
 
 // writeOutput streams r to a path ("-" = stdout) and returns the byte count.
-// If the stream fails part way, the file is removed: a truncated download that
-// looks like a finished one is worse than no file at all.
+// If the stream fails part way, a regular file at the path is removed: a
+// truncated download that looks like a finished one is worse than no file at
+// all. Anything else there — a symlink, a device such as /dev/null, a named
+// pipe — belongs to the user and is left alone.
 func writeOutput(path string, r io.Reader) (int64, error) {
 	if path == "-" {
 		return io.Copy(os.Stdout, r)
@@ -513,10 +515,18 @@ func writeOutput(path string, r io.Reader) (int64, error) {
 		err = cerr
 	}
 	if err != nil {
-		_ = os.Remove(path)
+		removeIfRegularFile(path)
 		return n, fmt.Errorf("cannot write output file: %w", err)
 	}
 	return n, nil
+}
+
+// removeIfRegularFile deletes path only when it is a plain file. Lstat, not
+// Stat, so a symlink is judged as itself rather than by what it points to.
+func removeIfRegularFile(path string) {
+	if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() {
+		_ = os.Remove(path)
+	}
 }
 
 // filenameFromContentDisposition extracts a filename from a Content-Disposition

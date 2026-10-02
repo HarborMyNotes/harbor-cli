@@ -72,6 +72,36 @@ func TestWriteOutputRemovesAPartialFile(t *testing.T) {
 	}
 }
 
+// TestWriteOutputKeepsASymlinkOnFailure leaves a symlink at the output path in
+// place when the download breaks. The user made that link; only a plain file
+// the download itself produced is ours to clean up.
+func TestWriteOutputKeepsASymlinkOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.bin")
+	if err := os.WriteFile(target, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.bin")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable here: %v", err)
+	}
+	broken := io.MultiReader(strings.NewReader("half a file"), iotestErrReader{})
+
+	if _, err := writeOutput(link, broken); err == nil {
+		t.Fatal("a failed stream was reported as written")
+	}
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("the symlink was removed: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("the path is no longer a symlink (mode %v)", info.Mode())
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Errorf("the symlink's target was removed: %v", err)
+	}
+}
+
 // iotestErrReader fails every read, standing in for a dropped connection.
 type iotestErrReader struct{}
 

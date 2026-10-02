@@ -565,7 +565,8 @@ harbor notes export "$NOTE_ID" --output -         # stream to stdout
   takes the server's name: the title with spaces, accents and emoji kept for
   Markdown, HTML and ENEX (`Welcome to Harbor 👋.html`), and an ASCII-only,
   dash-separated title for PDF. If the server sends no name, the file is
-  `note.md` / `note.pdf` / `note.html` / `note.enex`.
+  `note.md` (or `note.zip` when the Markdown download is a ZIP) / `note.pdf` /
+  `note.html` / `note.enex`.
 - **Markdown** returns `text/markdown` for a note with no attachments and
   `application/zip` (the `.md` plus `files/`) for one with them, so let the
   server name it rather than choosing an extension yourself. `--zip` forces the
@@ -575,7 +576,8 @@ harbor notes export "$NOTE_ID" --output -         # stream to stdout
 - **HTML** inlines the stylesheet and every attachment, so it opens offline.
   Over 100 MiB the server refuses with "The exported file is too large."
 - **Encrypted notes can't be exported**, in any format — the server holds only
-  ciphertext. The command fails with a non-zero exit and writes no file.
+  ciphertext. The command fails with a non-zero exit and writes no file; with
+  `--json` the error's code is `encrypted_not_exportable`.
 - Rendering happens server-side, so this needs a network connection.
 
 **This is an export, not a read:** the file carries YAML front matter and the
