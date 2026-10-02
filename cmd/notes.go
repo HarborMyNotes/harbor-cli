@@ -6,6 +6,8 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"mime"
+	"net/http"
 	"os"
 	"strings"
 
@@ -417,13 +419,10 @@ func notesConfirmPermanentDelete(yes bool) error {
 	return confirmDestructive(notesDeletePermanentConfirmation, jsonOutput, stdinIsInteractive(), yes, askLine)
 }
 
-// notesExportFormats are the per-note export kinds. The flag exists so that a
-// second one is a new VALUE rather than a new flag users have to learn.
-//
-// Adding one is not only a value here: the format lives in the endpoint's own
-// path (export.md), so a new entry needs a client method to reach it. Adding it
-// to this list alone would accept the flag and return Markdown anyway.
-var notesExportFormats = []string{"markdown"}
+// notesExportFormats are the per-note export kinds, the same four every Harbor
+// app offers for one note. A new entry also needs a case in notesExportRequest
+// and notesExportFallbackName, or it would be accepted and fetch Markdown.
+var notesExportFormats = []string{"markdown", "pdf", "html", "enex"}
 
 // notesExportFormat reads and validates --format against that list.
 func notesExportFormat(cmd *cobra.Command) (string, error) {
@@ -436,10 +435,40 @@ func notesExportFormat(cmd *cobra.Command) (string, error) {
 			return format, nil
 		}
 	}
-	if len(notesExportFormats) == 1 {
-		return "", fmt.Errorf("--format must be %s", notesExportFormats[0])
-	}
 	return "", fmt.Errorf("--format must be one of %s", strings.Join(notesExportFormats, "|"))
+}
+
+// notesExportRequest fetches one note in the given format. ENEX goes through the
+// selection export with exactly one id, which the server names after the note.
+func notesExportRequest(c *client.Client, id, format string, zip bool) (*http.Response, error) {
+	switch format {
+	case "pdf":
+		return c.ExportNotePDF(id)
+	case "html":
+		return c.ExportNoteHTML(id)
+	case "enex":
+		return c.ExportENEX("", []string{id}, true)
+	default:
+		return c.ExportNoteMarkdown(id, zip)
+	}
+}
+
+// notesExportFallbackName names the file when the response carries no
+// Content-Disposition name. These match the other Harbor apps, except that a
+// Markdown export that came back as a ZIP is called note.zip, not note.md.
+func notesExportFallbackName(format, contentType string) string {
+	switch format {
+	case "pdf":
+		return "note.pdf"
+	case "html":
+		return "note.html"
+	case "enex":
+		return "note.enex"
+	}
+	if mediaType, _, err := mime.ParseMediaType(contentType); err == nil && mediaType == "application/zip" {
+		return "note.zip"
+	}
+	return "note.md"
 }
 
 // notesExportCmd writes one note to a file.
@@ -451,72 +480,92 @@ func notesExportFormat(cmd *cobra.Command) (string, error) {
 // what a human wants on disk and would corrupt the note if written back.
 var notesExportCmd = &cobra.Command{
 	Use:   "export <id>",
-	Short: "Export one note to a Markdown file (or a ZIP, if it has attachments)",
+	Short: "Export one note to a file: Markdown, PDF, HTML or ENEX",
 	Args:  cobra.ExactArgs(1),
-	Long: `Write one note to disk as Markdown.
+	Long: `Write one note to disk as Markdown (the default), PDF, HTML or ENEX.
 
-WHAT COMES BACK DEPENDS ON THE NOTE. A note with no attachments exports as a
-single .md file; a note with them exports as a .zip holding the .md plus a
-files/ directory, so the images still resolve when you open it. --zip forces the
-archive form either way, which is what a script wants when it would rather
-handle one shape than two. The name comes from the server, so --output . writes
-whichever it turned out to be, correctly named, into the current directory.
+  --format markdown  a .md file, or a .zip holding the .md plus a files/
+                     directory when the note has attachments. --zip forces the
+                     archive form either way.
+  --format pdf       a .pdf, with embedded PDF attachments combined into it.
+                     Any attachment that could not be combined is reported.
+  --format html      one self-contained .html page that opens with no network:
+                     the stylesheet and every attachment are inlined.
+  --format enex      an Evernote .enex holding the note and its attachments.
 
-The Markdown is rendered on the server, so this needs a network connection even
-for a note you have already read. There is one Markdown renderer in Harbor and
-it lives there; a second one in each client is how five clients end up
-disagreeing about the same note.
+The file is saved under the name the server gives it, in the current directory
+unless --output says otherwise. --output takes a file path, a directory (the
+server's name, there), or - for stdout.
 
-Encrypted notes cannot be exported: the server stores only ciphertext for them
-and cannot render what it cannot read.
+Everything is rendered on the server, so this needs a network connection even
+for a note you have already read.
+
+Encrypted notes cannot be exported in any format: the server stores only
+ciphertext for them. The command fails and writes no file.
 
 This is not the way to fetch a body to edit. The file carries YAML front matter
 and the title as a heading, so writing it back with 'notes update' would put all
 of that INTO the note. Use 'harbor notes get <id> --format markdown' for that.`,
-	Example: `  harbor notes export 9c2e... --output note.md
-  harbor notes export 9c2e... --output .          # server's own filename, here
+	Example: `  harbor notes export 9c2e...                     # Markdown, server's filename, here
+  harbor notes export 9c2e... --format pdf
+  harbor notes export 9c2e... --format html --output ~/Downloads
+  harbor notes export 9c2e... --format enex --output backup.enex
   harbor notes export 9c2e... --zip --output bundle.zip
   harbor notes export 9c2e... --output -          # stream to stdout`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// The flags are checked before the credentials so a typo answers the typo.
 		// Loading first means a logged-out user is told to log in, fixes that, and
 		// only then finds out the format was never going to work.
-		if _, err := notesExportFormat(cmd); err != nil {
+		format, err := notesExportFormat(cmd)
+		if err != nil {
 			return err
+		}
+		zip := boolFlag(cmd, "zip")
+		if zip && format != "markdown" {
+			return errors.New("--zip only applies to --format markdown")
 		}
 		out := stringFlag(cmd, "output")
 		if out == "" {
-			return errors.New("--output is required (use - for stdout, or a directory to take the server's filename)")
+			out = "."
 		}
 		c, _, err := loadClientFromConfig()
 		if err != nil {
 			return err
 		}
 
-		resp, err := c.ExportNoteMarkdown(args[0], boolFlag(cmd, "zip"))
+		resp, err := notesExportRequest(c, args[0], format, zip)
 		if err != nil {
 			return mapNoteError(err)
 		}
 		defer resp.Body.Close()
 
-		// Read the header BEFORE draining the body: the same endpoint answers
+		// The server answers a one-note ENEX with 200 even when it skipped the
+		// note as encrypted, and the body is then an export with nothing in it.
+		// Checked before anything is created, so no empty file is left behind.
+		if format == "enex" && importExportSkipCount(resp.Header.Get("X-Skipped-Encrypted")) > 0 {
+			return mapNoteError(&client.APIError{Status: http.StatusUnprocessableEntity, Code: "encrypted_not_exportable", RequestID: c.LastRequestID})
+		}
+
+		// Read the header BEFORE draining the body: the Markdown endpoint answers
 		// .md or .zip, and the response is the only thing that knows which.
 		filename := filenameFromContentDisposition(resp.Header.Get("Content-Disposition"))
-		path := accountExportOutputPath(out, filename)
-		if filename == "" && path != "-" {
-			// Without a name from the response there is nothing to put in a
-			// directory. os.Create would report "is a directory", which reads like
-			// the user's path was wrong when it was the header.
-			if info, serr := os.Stat(path); serr == nil && info.IsDir() {
-				return fmt.Errorf("the server did not name the file, so %s is all there is to go on — give --output a filename instead of a directory", path)
-			}
+		if filename == "" {
+			filename = notesExportFallbackName(format, resp.Header.Get("Content-Type"))
 		}
+		path := accountExportOutputPath(out, filename)
 		n, err := writeOutput(path, resp.Body)
 		if err != nil {
 			return err
 		}
 		if path != "-" {
 			fmt.Printf("Wrote %s to %s\n", bytesHuman(float64(n)), path)
+		}
+		// On stderr, so it never lands inside a file piped from --output -.
+		if format == "pdf" {
+			if skipped := importExportSkipCount(resp.Header.Get("X-Skipped-Attachments")); skipped > 0 {
+				fmt.Fprintf(os.Stderr, "%s %d %s could not be combined into the PDF\n",
+					amberWarn("warning:"), skipped, pluralize(skipped, "attachment", "attachments"))
+			}
 		}
 		return nil
 	},
@@ -534,7 +583,11 @@ func mapNoteError(err error) error {
 		case "append_not_supported_encrypted":
 			return errors.New("cannot append to an encrypted note")
 		case "encrypted_not_exportable":
-			return errors.New("encrypted notes cannot be exported as Markdown — the server stores only ciphertext for them, so it cannot render one. Decrypt the note first ('harbor notes decrypt <id>') if you want a file of it")
+			// Still an APIError, so --json reports the server's code. The message
+			// is the same sentence every Harbor app shows.
+			friendly := *apiErr
+			friendly.Message = "Encrypted notes can't be exported."
+			return &friendly
 		case "cannot_move_plaintext_into_encrypted":
 			// The server's own backstop on this CLI's move guard. Nothing was written
 			// and no usn was spent, so re-running is always the fix — but WHY the local
@@ -695,9 +748,9 @@ func init() {
 	notesDeleteCmd.Flags().Bool("permanent", false, "Expunge permanently instead of trashing")
 	notesDeleteCmd.Flags().Bool("yes", false, "Skip the --permanent confirmation prompt (required in --json/non-interactive use)")
 
-	notesExportCmd.Flags().StringP("output", "o", "", "Where to write it: a path, a directory to take the server's filename, or - for stdout (required)")
-	notesExportCmd.Flags().String("format", "markdown", "Export format")
-	notesExportCmd.Flags().Bool("zip", false, "Always produce a ZIP, even when the note has no attachments")
+	notesExportCmd.Flags().StringP("output", "o", "", "Where to write it: a path, a directory to take the server's filename, or - for stdout (default: the current directory)")
+	notesExportCmd.Flags().String("format", "markdown", "Export format: markdown|pdf|html|enex")
+	notesExportCmd.Flags().Bool("zip", false, "Markdown only: always produce a ZIP, even when the note has no attachments")
 
 	notesCmd.AddCommand(notesListCmd, notesGetCmd, notesCreateCmd, notesUpdateCmd, notesAppendCmd, notesDeleteCmd, notesExportCmd)
 	rootCmd.AddCommand(notesCmd)

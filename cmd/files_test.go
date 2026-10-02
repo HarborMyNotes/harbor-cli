@@ -58,6 +58,56 @@ func TestWriteOutputToFileAndStdout(t *testing.T) {
 	}
 }
 
+// TestWriteOutputRemovesAPartialFile drops a download that broke part way, so
+// a truncated file is never left looking like a finished one.
+func TestWriteOutputRemovesAPartialFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out.bin")
+	broken := io.MultiReader(strings.NewReader("half a file"), iotestErrReader{})
+
+	if _, err := writeOutput(path, broken); err == nil {
+		t.Fatal("a failed stream was reported as written")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("the partial file is still there (stat err = %v)", err)
+	}
+}
+
+// TestWriteOutputKeepsASymlinkOnFailure leaves a symlink at the output path in
+// place when the download breaks. The user made that link; only a plain file
+// the download itself produced is ours to clean up.
+func TestWriteOutputKeepsASymlinkOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.bin")
+	if err := os.WriteFile(target, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.bin")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable here: %v", err)
+	}
+	broken := io.MultiReader(strings.NewReader("half a file"), iotestErrReader{})
+
+	if _, err := writeOutput(link, broken); err == nil {
+		t.Fatal("a failed stream was reported as written")
+	}
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("the symlink was removed: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("the path is no longer a symlink (mode %v)", info.Mode())
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Errorf("the symlink's target was removed: %v", err)
+	}
+}
+
+// iotestErrReader fails every read, standing in for a dropped connection.
+type iotestErrReader struct{}
+
+// Read always fails.
+func (iotestErrReader) Read([]byte) (int, error) { return 0, errors.New("connection reset") }
+
 // TestFilenameFromContentDisposition covers the shapes the header actually
 // arrives in.
 //
@@ -87,6 +137,9 @@ func TestFilenameFromContentDisposition(t *testing.T) {
 		// row above — note titles are whatever the user typed.
 		`attachment; filename*=UTF-8''%E5%9B%9B%E5%8D%8A%E6%9C%9F.md`: "四半期.md",
 		`attachment; filename="Plan 🚢.md"`:                            "Plan 🚢.md",
+		// What the server sends today: an ASCII stand-in AND the exact name.
+		// The exact one wins, emoji and all.
+		`attachment; filename="Welcome to Harbor _.html"; filename*=UTF-8''Welcome%20to%20Harbor%20%F0%9F%91%8B.html`: "Welcome to Harbor 👋.html",
 	}
 	for in, want := range cases {
 		if got := filenameFromContentDisposition(in); got != want {

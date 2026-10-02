@@ -174,7 +174,7 @@ Run `harbor <command> --help` for full flags and examples on any command.
 | `harbor notes links <id>` | Outgoing links. |
 | `harbor notes backlinks <id>` | Incoming links. |
 | `harbor notes audit <id>` | Per-note change audit log. |
-| `harbor notes export <id>` | Export one note to a file: Markdown, or a ZIP when it has attachments (`--output`, `--zip`). |
+| `harbor notes export <id>` | Export one note to a file under the server's name, in the current directory unless `--output` says otherwise. `--format markdown` (default; a ZIP when it has attachments, or always with `--zip`), `pdf`, `html` (one self-contained page) or `enex`. Encrypted notes can't be exported. |
 
 ### Tags
 | Command | Description |

@@ -167,6 +167,7 @@ harbor notes export "$NOTE_ID" --output note.md   # no attachments -> a .md
 harbor notes export "$NOTE_ID" --output .         # server names it; .md OR .zip
 harbor notes export "$NOTE_ID" --zip --output .   # always the archive
 harbor notes export "$NOTE_ID" --output -         # stream to stdout
+harbor notes export "$NOTE_ID" --format pdf       # also: --format html | enex
 ```
 
 The same command returns `text/markdown` for a note with no attachments and
