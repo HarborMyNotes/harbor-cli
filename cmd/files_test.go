@@ -164,6 +164,7 @@ func TestMapFileError(t *testing.T) {
 		"file_too_large":   "maximum upload size",
 		"unsupported_type": "not allowed",
 		"blob_missing":     "not stored",
+		"not_found":        "no file with that hash",
 	}
 	for code, sub := range cases {
 		if got := mapFileError(apiErr(code)); !strings.Contains(got.Error(), sub) {
@@ -634,5 +635,146 @@ func TestMapFileErrorKeepsTheAPIError(t *testing.T) {
 	}
 	if original.Message != "file exceeds the configured maximum" {
 		t.Errorf("mapFileError mutated the caller's error: %q", original.Message)
+	}
+}
+
+// ===========================================================================
+// Rename
+// ===========================================================================
+
+// renameHash is a well-formed sha256 for the rename tests.
+const renameHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// renameMock builds a stub API for the rename command: the lookup that reports
+// the stored name, plus a rename route that answers with the given reply.
+func renameMock(t *testing.T, stored string, rename mockReply) *apiMock {
+	t.Helper()
+	return newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/files/" + renameHash:   {Status: 200, Body: `{"download_url":"https://s3/x","mime":"application/pdf","size":10,"filename":"` + stored + `"}`},
+		"PATCH /api/v1/files/" + renameHash: rename,
+	})
+}
+
+// The split must match the server's, because the server judges a rename by it:
+// a client that reads ".bashrc" as an extension would add it to every new name.
+func TestFileExtension(t *testing.T) {
+	cases := map[string]string{
+		"invoice.pdf": ".pdf",
+		"Scan.PDF":    ".PDF",
+		"a.tar.gz":    ".gz",
+		"clip.mp4":    ".mp4",
+		".bashrc":     "",
+		"README":      "",
+		"notes.":      "",
+		"Dr. Smith":   "",
+		"v1.2-final":  "",
+		"résumé.docx": ".docx",
+		"photo.jpé":   "",
+		"":            "",
+	}
+	for in, want := range cases {
+		if got := fileExtension(in); got != want {
+			t.Errorf("fileExtension(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// A name typed without the extension gets the stored one; a name that already
+// ends with it is sent as typed.
+func TestWithStoredExtension(t *testing.T) {
+	cases := []struct{ name, stored, want string }{
+		{"Scan 2015-01-06", "scan0001.pdf", "Scan 2015-01-06.pdf"},
+		{"Scan 2015-01-06.pdf", "scan0001.pdf", "Scan 2015-01-06.pdf"},
+		// The case of a typed extension is the server's to settle, so it is not
+		// doubled up here.
+		{"invoice.pdf", "Scan.PDF", "invoice.pdf"},
+		{"invoice", "Scan.PDF", "invoice.PDF"},
+		// A dot in the typed name is not an extension of its own.
+		{"Scan v1.2", "scan0001.pdf", "Scan v1.2.pdf"},
+		{"report.docx", "scan0001.pdf", "report.docx.pdf"},
+		{"pdf", "scan0001.pdf", "pdf.pdf"},
+		{"  Scan  ", "scan0001.pdf", "Scan.pdf"},
+		{"backup", "a.tar.gz", "backup.gz"},
+		// A file with no extension takes the name as typed.
+		{"notes.txt", "README", "notes.txt"},
+		{"profile", ".bashrc", "profile"},
+		{"Scan", "", "Scan"},
+		// A multi-byte name shorter than the extension must not be sliced.
+		{"é", "scan0001.jpeg", "é.jpeg"},
+	}
+	for _, tc := range cases {
+		if got := withStoredExtension(tc.name, tc.stored); got != tc.want {
+			t.Errorf("withStoredExtension(%q, %q) = %q, want %q", tc.name, tc.stored, got, tc.want)
+		}
+	}
+}
+
+// The command reads the stored name first, then sends the full new name.
+func TestFilesRenameKeepsTheExtension(t *testing.T) {
+	m := renameMock(t, "scan0001.pdf", mockReply{Status: 200, Body: `{"hash":"` + renameHash + `","filename":"Scan 2015-01-06.pdf","mime":"application/pdf","size":10}`})
+
+	out, err := runCLI(t, m, "files", "rename", renameHash, "Scan 2015-01-06")
+	if err != nil {
+		t.Fatalf("files rename: %v", err)
+	}
+	if got := m.bodyOf(t, "PATCH /api/v1/files/"+renameHash)["filename"]; got != "Scan 2015-01-06.pdf" {
+		t.Errorf("sent filename = %v, want the typed name plus the stored extension", got)
+	}
+	if !strings.Contains(out, "Scan 2015-01-06.pdf") {
+		t.Errorf("the new name is missing from the output:\n%s", out)
+	}
+}
+
+// A file whose bytes are missing has no readable stored name, but it can still
+// be renamed: the name goes out as typed and the server judges it.
+func TestFilesRenameSendsTheNameAsTypedWhenTheBytesAreMissing(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/files/" + renameHash:   {Status: 404, Body: apiErrorBody("blob_missing", "The file's bytes are missing.")},
+		"PATCH /api/v1/files/" + renameHash: {Status: 200, Body: `{"hash":"` + renameHash + `","filename":"invoice.pdf"}`},
+	})
+
+	if _, err := runCLI(t, m, "files", "rename", renameHash, "invoice.pdf"); err != nil {
+		t.Fatalf("files rename: %v", err)
+	}
+	if got := m.bodyOf(t, "PATCH /api/v1/files/"+renameHash)["filename"]; got != "invoice.pdf" {
+		t.Errorf("sent filename = %v, want the name as typed", got)
+	}
+}
+
+// An unknown hash stops at the lookup: nothing is renamed, and the message says
+// what a hash has to look like.
+func TestFilesRenameUnknownHash(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/files/abc123": {Status: 404, Body: apiErrorBody("not_found", "The requested resource was not found.")},
+	})
+
+	_, err := runCLI(t, m, "files", "rename", "abc123", "invoice")
+	if err == nil {
+		t.Fatal("expected an error for an unknown hash")
+	}
+	if !strings.Contains(err.Error(), "no file with that hash") {
+		t.Errorf("error = %q, want it to name the hash as the problem", err.Error())
+	}
+	for _, call := range m.calls() {
+		if strings.HasPrefix(call, "PATCH") {
+			t.Errorf("an unknown hash still sent %s", call)
+		}
+	}
+}
+
+// The server's reason for refusing a name must reach the user: it lives in the
+// error's details, which only the typed error carries to the renderer.
+func TestFilesRenameShowsTheServersRefusal(t *testing.T) {
+	refusal := `{"error":{"code":"validation_failed","message":"The request failed validation.","details":{"filename":"must not contain /, \\ or control characters"}}}`
+	m := renameMock(t, "scan0001.pdf", mockReply{Status: 422, Body: refusal})
+
+	_, err := runCLI(t, m, "files", "rename", renameHash, "a/b")
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("refusal must keep the API error shape, got %T: %v", err, err)
+	}
+	want := `filename: must not contain /, \ or control characters`
+	if lines := apiErr.DetailLines(); len(lines) != 1 || lines[0] != want {
+		t.Errorf("detail lines = %v, want [%s]", lines, want)
 	}
 }

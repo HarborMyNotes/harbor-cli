@@ -380,6 +380,7 @@ Content-addressed (sha256) blobs.
 | `harbor files get <hash>` | Presigned URL + metadata (no bytes) | |
 | `harbor files check` | Does a blob exist? | `--hash` (+`--size`) or `--file` (hash computed locally) |
 | `harbor files download <hash>` | Download bytes | `--output` (`-` = stdout), `--raw`, `--ciphertext` |
+| `harbor files rename <hash> <new-name>` | Rename a file (one name for the whole account, shown in every note that holds it) | |
 
 **Encrypted attachments.** `files upload --encrypted` seals the bytes on this
 machine (HRBC2 binary envelope, master key) before uploading — it needs
@@ -389,6 +390,15 @@ passphrase is set; without it the download is refused, and `--ciphertext` writes
 the raw envelope instead. Filename and MIME stay plaintext on the record; the
 stored size is 33 bytes larger than the original, and `files check --file` can
 never match an encrypted upload because the content hash covers the ciphertext.
+
+**Renaming.** `files rename` cannot change the extension. Give the new name with
+or without it: `harbor files rename "$HASH" "Scan 2015-01-06"` on a PDF stores
+`Scan 2015-01-06.pdf`, and so does `... "Scan 2015-01-06.pdf"`. A name that does
+not end with the file's extension gets it added, so `report.docx` on a PDF
+becomes `report.docx.pdf`. `<hash>` is the full 64-character hash from
+`files list --json`. The name (without the extension) can be 1–200 characters
+and cannot hold `/`, `\` or control characters. Encrypted files rename the same
+way.
 
 ---
 

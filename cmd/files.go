@@ -32,7 +32,7 @@ import (
 var filesCmd = &cobra.Command{
 	Use:     "files",
 	Aliases: []string{"file"},
-	Short:   "Manage file attachments (list, check, upload, download)",
+	Short:   "Manage file attachments (list, check, upload, download, rename)",
 	GroupID: groupSync,
 	Long: `Work with content-addressed file attachments. Upload uses the direct
 multipart endpoint (the server computes the sha256); download follows a
@@ -291,6 +291,97 @@ between machines).`,
 	},
 }
 
+// filesRenameCmd renames a file, keeping its extension.
+var filesRenameCmd = &cobra.Command{
+	Use:   "rename <hash> <new-name>",
+	Short: "Rename a file (the extension is kept)",
+	Args:  cobra.ExactArgs(2),
+	Long: `Give a file a new name. A file has one name for the whole account, so the new
+name shows in every note that holds the file.
+
+The extension cannot change. Type the name with or without it: when the name
+does not already end with the file's extension, the extension is added for you.
+
+<hash> is the full 64-character hash ('harbor files list --json' shows it).`,
+	Example: `  harbor files rename e3b0c442...b855 "Scan 2015-01-06"
+  harbor files rename e3b0c442...b855 invoice-march.pdf`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		c, _, err := loadClientFromConfig()
+		if err != nil {
+			return err
+		}
+		hash := args[0]
+		stored, err := storedFilename(c, hash)
+		if err != nil {
+			return mapFileError(err)
+		}
+		data, err := c.RenameFile(hash, withStoredExtension(args[1], stored))
+		if err != nil {
+			return mapFileError(err)
+		}
+		printResult(data, displayResource)
+		return nil
+	},
+}
+
+// storedFilename returns the name a file has now, which a rename needs to know
+// the extension it must keep.
+//
+// The lookup also checks that the bytes are in storage, and a file whose bytes
+// are missing can still be renamed. That one failure returns an empty name, so
+// the new name goes to the server as typed.
+func storedFilename(c *client.Client, hash string) (string, error) {
+	meta, err := c.GetFileDownload(hash)
+	if err != nil {
+		var apiErr *client.APIError
+		if errors.As(err, &apiErr) && apiErr.Code == "blob_missing" {
+			return "", nil
+		}
+		return "", err
+	}
+	return str(parseJSON(meta), "filename"), nil
+}
+
+// withStoredExtension returns the name to send for a rename: name as typed when
+// it already ends with the stored file's extension (ignoring case), otherwise
+// with that extension added.
+//
+// A dot in the typed name is not read as an extension of its own, because a
+// name such as "Scan v1.2" has one that is not: for a PDF it becomes
+// "Scan v1.2.pdf".
+func withStoredExtension(name, stored string) string {
+	name = strings.TrimSpace(name)
+	ext := fileExtension(stored)
+	if ext == "" {
+		return name
+	}
+	if cut := len(name) - len(ext); cut >= 0 && strings.EqualFold(name[cut:], ext) {
+		return name
+	}
+	return name + ext
+}
+
+// fileExtension returns a filename's extension, dot included, or "" when it has
+// none. The extension is the text from the last dot, when that dot is not the
+// first character and only ASCII letters or digits follow it: "a.tar.gz" has
+// ".gz", while ".bashrc", "README", "notes." and "Dr. Smith" have none.
+//
+// This is the server's rule, which filepath.Ext does not follow (it calls
+// ".bashrc" and ". Smith" extensions), and the two must agree on what a rename
+// has to keep.
+func fileExtension(name string) string {
+	i := strings.LastIndexByte(name, '.')
+	if i <= 0 || i == len(name)-1 {
+		return ""
+	}
+	for _, r := range name[i+1:] {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9') {
+			return ""
+		}
+	}
+	return name[i:]
+}
+
 // filesKey unlocks the master key for an encrypted upload, turning the two
 // sentinel unlock failures into actionable refusals. It fails closed on purpose:
 // the alternative is uploading a file in the clear while stamping the resource
@@ -397,6 +488,8 @@ func mapFileError(err error) error {
 		friendly = "that media type is not allowed by the server policy"
 	case "blob_missing":
 		friendly = "the blob bytes are not stored"
+	case "not_found":
+		friendly = "no file with that hash — pass the full 64-character hash ('harbor files list --json' shows it)"
 	default:
 		return err
 	}
@@ -656,6 +749,6 @@ func init() {
 	filesDownloadCmd.Flags().Bool("raw", false, "Stream through the API instead of following a presigned URL")
 	filesDownloadCmd.Flags().Bool("ciphertext", false, "Write an encrypted file's raw envelope instead of decrypting it")
 
-	filesCmd.AddCommand(filesListCmd, filesCheckCmd, filesUploadCmd, filesGetCmd, filesDownloadCmd)
+	filesCmd.AddCommand(filesListCmd, filesCheckCmd, filesUploadCmd, filesGetCmd, filesDownloadCmd, filesRenameCmd)
 	rootCmd.AddCommand(filesCmd)
 }
