@@ -194,6 +194,7 @@ Run `harbor <command> --help` for full flags and examples on any command.
 | `harbor files upload <path>` | Upload a file (multipart; server computes the hash). |
 | `harbor files get <hash>` | Show the presigned download URL + metadata. |
 | `harbor files download <hash>` | Download bytes (`--output`, `--raw`). |
+| `harbor files rename <hash> <new-name>` | Rename a file. The extension is kept; type the name with or without it. |
 
 ### Search
 | Command | Description |

@@ -4,6 +4,7 @@
 package client
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -123,6 +124,26 @@ func TestGetFileDownloadAndRaw(t *testing.T) {
 	resp.Body.Close()
 	if rec.Path != "/files/h1/raw" {
 		t.Errorf("raw path = %s", rec.Path)
+	}
+}
+
+// A rename is a PATCH on the file's own path that carries only the new name.
+func TestRenameFile(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 200, `{"hash":"h1","filename":"Scan 2015-01-06.pdf"}`)
+	defer srv.Close()
+	if _, err := testClient(srv.URL).RenameFile("h1", "Scan 2015-01-06.pdf"); err != nil {
+		t.Fatalf("RenameFile error: %v", err)
+	}
+	if rec.Method != "PATCH" || rec.Path != "/files/h1" {
+		t.Errorf("request = %s %s, want PATCH /files/h1", rec.Method, rec.Path)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body, &body); err != nil {
+		t.Fatalf("body not JSON: %v (%s)", err, rec.Body)
+	}
+	if len(body) != 1 || body["filename"] != "Scan 2015-01-06.pdf" {
+		t.Errorf("body = %s, want only filename", rec.Body)
 	}
 }
 

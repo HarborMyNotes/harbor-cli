@@ -128,6 +128,13 @@ func (c *Client) GetFileDownload(hash string) ([]byte, error) {
 	return c.doGet("/files/"+hash, nil)
 }
 
+// RenameFile gives a file a new name and returns the bare resource object.
+// filename is the full name, extension included: the server refuses one that
+// does not end with the file's current extension.
+func (c *Client) RenameFile(hash, filename string) ([]byte, error) {
+	return c.doPatch("/files/"+hash, map[string]any{"filename": filename})
+}
+
 // RawDownload streams the blob bytes straight through the API (the caller must
 // close the response body). Used when a presigned URL cannot be followed.
 func (c *Client) RawDownload(hash string) (*http.Response, error) {

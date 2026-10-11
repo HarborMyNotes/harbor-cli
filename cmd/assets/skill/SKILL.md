@@ -404,6 +404,7 @@ harbor history revert "$NOTE_ID" "$VERSION_ID" --json
 HASH=$(harbor files upload ./diagram.png --json | jq -r '.data.hash // .hash')
 harbor files list --mime image/ --json
 harbor files download "$HASH" --output ./diagram.png
+harbor files rename "$HASH" "Architecture sketch"   # extension is kept → "Architecture sketch.png"
 ```
 
 Uploaded files are content-addressed by sha256. To **show** an image inside a
@@ -543,7 +544,7 @@ has copy-paste recipes and the full allowlist.
 | Share | `harbor share publish \| unpublish <id>` |
 | Trash / restore | `harbor notes delete <id>` · `harbor trash restore <id>` |
 | History | `harbor history list \| show \| revert <id>` |
-| Files | `harbor files upload \| list \| download` |
+| Files | `harbor files upload \| list \| download \| rename` |
 | Links | `harbor notes links \| backlinks <id>` |
 | Plan limits / usage | `harbor usage` · `harbor plan \| plan list` |
 | Anything else | `harbor <cmd> --help` or read `reference.md` |
