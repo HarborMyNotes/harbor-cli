@@ -13,77 +13,68 @@ renders results as styled tables (via [go-pretty](https://github.com/jedib0t/go-
 or raw JSON (`--json`). It is a thin, well-tested client: business logic lives
 in the API; the CLI's job is ergonomics, output, and auth.
 
-## 🚫 NEVER create an account on production
+## 🚫 All development testing runs on STAGING
 
-**Do not sign up for a Harbor account on `app.harbor.my`. Ever.** Not through the web
-signup form, not through the API, not through the CLI, not through a native app, not
-through a browser-automation session, and not "just one to check something."
+**`https://staging.harbor.my` is where development testing happens.** Every API probe,
+every browser-automation session, every UI walkthrough, every screenshot run.
 
-This is not a style preference. Production is Spicer's live product with real paying
-customers in it. Agent-created signups have already piled up dozens of junk accounts
-there — `testuser_explore123@example.com`, `newuser_harbor_test@example.com`,
-`test_unique_12345@example.com`, a wall of "John Doe" and "Test User" rows — which pollute
-the admin account list, distort counts, sit in the billing and entitlement tables, and
-have to be cleaned up by hand. Every one of them came from an agent that needed somewhere
-to test and picked the easiest target.
+**Production `app.harbor.my` is off limits. Ask Spicer first — every time.** It is his live
+product with real paying customers in it. Do not sign in, do not sign up, do not read,
+query, screenshot or export it, and do not point a dev build at it, whatever the reason
+looks like. That includes a "before" screenshot: staging runs `main`, so it shows the same
+thing. If you think you genuinely need production, say what you are testing and why staging
+cannot cover it, and wait for an answer. Reaching for it and mentioning it afterwards is not
+the same thing.
 
-### Where to test instead — in this order
+### Where to test — in this order
 
-1. **A PR-preview sprite. This is the default and it is what you should reach for
-   first.** Every PR against `HarborMyNotes/app.harbor.my` provisions its own throwaway
-   sandbox (`harbor-pr-<PR#>` on sprites.app) with its own database. **If you need an
-   environment to test against, open a DRAFT PR on `app.harbor.my` and use its sprite.**
-   The authoritative URL, a one-click login link, and the seeded accounts are in the
-   sticky **"🚢 Harbor preview"** comment on the PR — read it rather than hardcoding a
-   host. Seeded accounts (all password `foobar123`):
+1. **Staging — the default.** `https://staging.harbor.my`, with this repo's own QA
+   account (below). Create, edit, break and delete whatever you need. Point the CLI at it with
+   `HARBOR_API_URL=https://staging.harbor.my/api/v1` or `--api-url`.
+
+2. **A PR-preview sprite**, when you need a database that starts from a known state or you
+   want to break something without anyone else noticing. Every PR against
+   `HarborMyNotes/app.harbor.my` provisions its own throwaway sandbox
+   (`harbor-pr-<PR#>` on sprites.app). The authoritative URL, a one-click login link and
+   the seeded accounts are in the sticky **"🚢 Harbor preview"** comment on the PR — read
+   it rather than hardcoding a host. Seeded accounts (all password `foobar123`):
    - `test@harbor.my` — starts empty → general verification
    - `seeded@harbor.my` — the Contractors ENEX corpus → anything needing real data
    - `empty@harbor.my` — deliberately empty → first-run / empty-state checks
 
-   Create, edit, break and delete whatever you like there. The sprite is disposable and
-   nothing in it is real.
+3. **A local instance**, when the change doesn't need the hosted stack.
 
-2. **A local instance**, when the change doesn't need the hosted stack.
+### The QA account
 
-3. **`dev-cli@harbor.my` — this repo's own production QA account.** Every Harbor client repo has
-   one (app.harbor.my#995) so that concurrent agents stop colliding in a shared account:
-   client testing is destructive by nature (shortcuts, bulk delete, empty-trash), and when
-   every repo shared `dev@harbor.my` a real note was trashed twice by two different
-   clients' testing. **For day-to-day testing, this repo's account is the preferred
-   method.** Create, update and delete whatever you need in it.
+**`dev-cli@harbor.my` on staging** is this repo's account. Every Harbor client repo has its own so
+concurrent agents stop colliding — client testing is destructive by nature (bulk delete,
+empty-trash), and a shared account means one agent's cleanup is another's lost fixture.
 
-   | Account | Repo |
-   |---|---|
-   | `dev-apple@harbor.my` | cloudmanic/harbor-swift |
-   | `dev-android@harbor.my` | cloudmanic/harbor-android |
-   | `dev-windows@harbor.my` | cloudmanic/harbor-windows |
-   | `dev-cli@harbor.my` | cloudmanic/harbor-cli |
-   | `dev-web@harbor.my` | HarborMyNotes/app.harbor.my (web) |
-   | `dev-clipper@harbor.my` | cloudmanic/harbor-webclipper |
+| Account | Repo |
+|---|---|
+| `dev-apple@harbor.my` | HarborMyNotes/harbor-swift |
+| `dev-android@harbor.my` | HarborMyNotes/harbor-android |
+| `dev-windows@harbor.my` | HarborMyNotes/harbor-windows |
+| `dev-cli@harbor.my` | HarborMyNotes/harbor-cli |
+| `dev-web@harbor.my` | HarborMyNotes/app.harbor.my |
+| `dev-clipper@harbor.my` | HarborMyNotes/harbor-webclipper |
 
-   All six share one password — 1Password, **Autumn** vault, item
-   **`Harbor Test Accounts Password`**. Each is email-verified and has **no two-factor**,
-   so a password grant returns a token bundle directly — no 2FA challenge to handle in
-   a scripted login. Fetch the password with the service-account token; never hardcode
-   it, and never print it into a commit, issue, PR or log:
-   ```bash
-   export OP_SERVICE_ACCOUNT_TOKEN=$(jq -r .service_account_token ~/.config/1password.json)
-   op item get "Harbor Test Accounts Password" --vault Autumn --fields label=password --reveal
-   ```
-   - **Never change the password.** It is shared, so rotating it locks out five other repos.
-   - **If you cannot log in, STOP and ask Spicer** — do not reset it, do not create a
-     replacement account, do not switch to a different account.
-   - **Use a sprite for anything destructive**, or whenever you need to keep moving and
-     this account is in the way.
-   - `dev@harbor.my` remains the **general-purpose** QA account (1Password item
-     "Harbor Dev Account") for work not tied to one client.
-
-   Each account carries a small, disposable seed corpus (a notebook, tags, an attachment
-   and five notes, including a unique `SEEDFIXTURE-…` search marker). Trash it freely —
-   `tools/dev-accounts/seed.py` in app.harbor.my re-seeds it.
-
-   Reach production explicitly (e.g. `-HarborAPIBaseURL https://app.harbor.my`, or the
-   client's equivalent) rather than by accident.
+All six share one password — 1Password, **Autumn** vault, item
+**`Harbor Test Accounts Password`**. None has two-factor. Fetch it with the service-account
+token; never hardcode it, and never print it into a commit, issue, PR or log:
+```bash
+export OP_SERVICE_ACCOUNT_TOKEN=$(jq -r .service_account_token ~/.config/1password.json)
+op item get "Harbor Test Accounts Password" --vault Autumn --fields label=password --reveal
+```
+- **Never change the password.** It is shared, so rotating it locks out five other repos.
+- **If you cannot log in, STOP and ask Spicer** — do not reset it, do not create a
+  replacement account, do not switch to a different account.
+- **Leave the account as you found it.** A test that creates notes deletes them; a test
+  that publishes a note revokes it. Residue accumulates against the plan's limits until a
+  later run cannot create anything at all.
+- **A new staging account needs a real reason** — the account itself is what you are
+  testing (sign-up, first run, plan limits). Say so in the PR and delete the account when
+  the PR merges.
 
 ### Accounts you must never touch
 
@@ -93,13 +84,6 @@ to test and picked the easiest target.
   as far as you are concerned: never create, edit or delete anything in it.
 - **Another repo's `dev-*` account.** They exist precisely so that testing does not
   collide; signing into someone else's defeats the point.
-- **Any other production account.** If it isn't `dev-cli@harbor.my` or `dev@harbor.my`, it isn't yours.
-
-### If you genuinely need a new production account
-
-**Stop and ask Spicer.** Explain what you're testing and why a sprite, a local instance,
-`dev-cli@harbor.my` and `dev@harbor.my` can't cover it. He may say yes — that's his call to make,
-and it takes one message. Creating one and mentioning it afterwards is not the same thing.
 
 ## Layout
 
