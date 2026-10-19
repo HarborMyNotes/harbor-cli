@@ -365,7 +365,7 @@ Recoverable recycle bin.
 | `harbor trash list` | Notes in the bin | paging |
 | `harbor trash restore <id>` | Restore to live | |
 | `harbor trash expunge <id>` | Permanently delete one | |
-| `harbor trash empty` | Permanently delete ALL | `--yes` (required non-interactively) |
+| `harbor trash empty` | Permanently delete ALL. Over 200 notes, it waits for the server job to finish; `--json` then adds the finished `job` beside `expunged` | `--yes` (required non-interactively) |
 
 ---
 

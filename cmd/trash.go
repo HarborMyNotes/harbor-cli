@@ -4,11 +4,19 @@
 package cmd
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/signal"
+	"time"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 // trashCmd is the parent for the recycle bin — list, restore, expunge, and
@@ -106,7 +114,11 @@ var trashEmptyCmd = &cobra.Command{
 	Args:  cobra.NoArgs,
 	Long: `Empty the recycle bin: permanently delete EVERY note currently in it. This
 cannot be undone. You will be asked to confirm by typing "yes" unless you pass
---yes. In --json or non-interactive use, --yes is required.`,
+--yes. In --json or non-interactive use, --yes is required.
+
+A big trash (more than 200 notes) is emptied by a job on the server. The
+command waits for that job to finish, shows progress on a terminal, and only
+then says the trash is empty. Ctrl-C stops the waiting, not the emptying.`,
 	Example: `  harbor trash empty
   harbor trash empty --yes
   harbor trash empty --yes --json`,
@@ -122,8 +134,14 @@ cannot be undone. You will be asked to confirm by typing "yes" unless you pass
 		if err != nil {
 			return mapTrashError(err)
 		}
+		data, err = trashFinishEmpty(c, data)
+		// On a failed or unfinished job only --json prints: a script still gets the
+		// job as far as it got, while a person reads the error alone.
+		if err != nil && !jsonOutput {
+			return err
+		}
 		printResult(data, displayEmptyTrash)
-		return nil
+		return err
 	},
 }
 
@@ -178,6 +196,250 @@ func mapTrashError(err error) error {
 }
 
 // ===========================================================================
+// Waiting for a big Empty Trash
+// ===========================================================================
+
+// trashEmptyPollInterval is how long the wait pauses between job checks. A
+// variable so tests can run the loop without spending real seconds in it.
+var trashEmptyPollInterval = time.Second
+
+// trashEmptyRetryWindow is how long checks may keep failing before the wait gives
+// up. A failed check does not mean a failed job — the job runs on the server
+// either way — so a short outage or a deploy is waited out. It is a span of
+// time, not a count, because one check can take the client's full timeout to
+// fail. A variable so tests can shorten it.
+var trashEmptyRetryWindow = 2 * time.Minute
+
+// trashEmptyFailedFallback is shown when the server marks the job failed but
+// sends no sentence of its own.
+const trashEmptyFailedFallback = "Some notes are still in the trash. Run 'harbor trash empty' again."
+
+// errTrashStoppedWaiting is the Ctrl-C answer. It says what kept going, because
+// the person pressing Ctrl-C may think they stopped the delete.
+var errTrashStoppedWaiting = errors.New("Stopped waiting. The trash is still being emptied on the server.")
+
+// stderrIsInteractive reports whether stderr is a terminal, where a progress
+// line can be redrawn in place. A variable so a test can take that branch.
+var stderrIsInteractive = func() bool { return term.IsTerminal(int(os.Stderr.Fd())) }
+
+// trashFinishEmpty waits for the job a big Empty Trash answers with and returns
+// the answer with that job as it last stood. A small trash has no job and comes
+// back unchanged. The error is non-nil when the job failed or the wait ended
+// before the job did.
+func trashFinishEmpty(c *client.Client, data []byte) ([]byte, error) {
+	if trashEmptyJobOf(data) == nil {
+		return data, nil
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	data, err := trashWaitForEmpty(ctx, c.GetTrashEmptyJob, data, newTrashEmptyProgress())
+	if err != nil {
+		return data, err
+	}
+	return data, trashEmptyJobFailure(data)
+}
+
+// trashWaitForEmpty polls the job in an Empty Trash answer until it completes
+// or fails, keeping the answer's "expunged" and swapping in each new copy of the
+// job. It stops early on Ctrl-C (ctx), on a check that cannot succeed by
+// retrying, or when checks have kept failing for trashEmptyRetryWindow. The
+// progress line is erased on every way out, so the next line printed starts
+// clean.
+func trashWaitForEmpty(ctx context.Context, fetch func(id string) ([]byte, error), data []byte, progress *trashEmptyProgress) ([]byte, error) {
+	defer progress.clear()
+	job := trashEmptyJobOf(data)
+	id := str(job, "id")
+	var failingSince time.Time
+	for !trashEmptyJobDone(str(job, "status")) {
+		if id == "" {
+			return data, errors.New("the server is emptying the trash in the background but sent no job to follow — run 'harbor trash list' to see what is left")
+		}
+		progress.show(job, !failingSince.IsZero())
+		started := time.Now()
+		raw, err := trashPollOnce(ctx, func() ([]byte, error) { return fetch(id) })
+		if ctx.Err() != nil {
+			return data, errTrashStoppedWaiting
+		}
+		if err == nil && parseJSON(client.UnwrapData(raw)) == nil {
+			err = errors.New("the server sent a job that could not be read")
+		}
+		if err != nil {
+			if failingSince.IsZero() {
+				failingSince = started
+			}
+			if !trashPollRetryable(err) || time.Since(failingSince) >= trashEmptyRetryWindow {
+				return data, trashPollFailed(err)
+			}
+			continue
+		}
+		failingSince = time.Time{}
+		data = trashEmptyWithJob(data, client.UnwrapData(raw))
+		job = trashEmptyJobOf(data)
+	}
+	return data, nil
+}
+
+// trashPollOnce waits one poll interval, then fetches the job. Both halves give
+// way to Ctrl-C at once, so a request that hangs cannot hold the terminal for
+// its full timeout. The fetch's result channel is buffered, so an abandoned
+// fetch can still finish and exit.
+func trashPollOnce(ctx context.Context, fetch func() ([]byte, error)) ([]byte, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(trashEmptyPollInterval):
+	}
+	type result struct {
+		data []byte
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		d, err := fetch()
+		done <- result{d, err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-done:
+		return r.data, r.err
+	}
+}
+
+// trashEmptyJobOf returns the job in an Empty Trash answer, or nil when there is
+// none — the small-trash answer, whose notes are already gone.
+func trashEmptyJobOf(data []byte) map[string]any {
+	job, _ := parseJSON(data)["job"].(map[string]any)
+	return job
+}
+
+// trashEmptyJobDone reports whether a job status is final. Any other status,
+// including one this binary does not know, means keep waiting.
+func trashEmptyJobDone(status string) bool {
+	return status == "completed" || status == "failed"
+}
+
+// trashEmptyWithJob returns the Empty Trash answer with its job replaced by a
+// newer copy. Every other field, "expunged" included, is kept, so --json prints
+// the same shape the server first sent.
+func trashEmptyWithJob(data, job []byte) []byte {
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return data
+	}
+	doc["job"] = json.RawMessage(job)
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return data
+	}
+	return out
+}
+
+// trashEmptyJobFailure turns a failed job into the command's error, using the
+// server's sentence. Any other status is not a failure.
+func trashEmptyJobFailure(data []byte) error {
+	job := trashEmptyJobOf(data)
+	if str(job, "status") != "failed" {
+		return nil
+	}
+	msg := str(job, "error")
+	if msg == "" {
+		msg = trashEmptyFailedFallback
+	}
+	return &client.APIError{Code: "trash_empty_failed", Message: msg}
+}
+
+// trashPollRetryable reports whether a failed check is worth repeating: the
+// network dropped, the server was busy, or it hit a server error. Anything else
+// (signed out, no such job) will fail the same way again.
+func trashPollRetryable(err error) bool {
+	if isNetworkError(err) {
+		return true
+	}
+	var apiErr *client.APIError
+	return errors.As(err, &apiErr) && (apiErr.Status >= 500 || apiErr.Status == http.StatusTooManyRequests)
+}
+
+// trashWaitError ends the wait without an answer from the job. It carries the
+// exit code of the check that failed but not the error itself, so the error
+// printer shows this message rather than only the bare API error.
+type trashWaitError struct {
+	msg  string
+	code int
+}
+
+// Error returns the message shown to the user.
+func (e *trashWaitError) Error() string { return e.msg }
+
+// ExitCode keeps the failed check's exit code, so a network failure still exits
+// 3 and a script can retry. A retry is safe: it joins the running job.
+func (e *trashWaitError) ExitCode() int { return e.code }
+
+// trashPollFailed builds the error for a wait that could not check on the job.
+// It says the trash may still be emptying, because the job does not depend on
+// this process.
+func trashPollFailed(err error) error {
+	return &trashWaitError{
+		msg: fmt.Sprintf("Stopped waiting: could not check on the trash (%v). It may still be emptying on the server — "+
+			"run 'harbor trash list' to see what is left.", err),
+		code: exitCodeFor(err),
+	}
+}
+
+// trashEmptyProgress draws "Emptying the trash… X of Y notes" on stderr,
+// redrawn in place. It is off under --json and off a terminal, so a pipe or a
+// log gets only the result.
+type trashEmptyProgress struct {
+	w    io.Writer
+	on   bool
+	last string
+}
+
+// newTrashEmptyProgress returns a progress line for this run's stderr.
+func newTrashEmptyProgress() *trashEmptyProgress {
+	return &trashEmptyProgress{w: os.Stderr, on: !jsonOutput && stderrIsInteractive()}
+}
+
+// show redraws the line for job, noting when the last check failed and is
+// being retried. It writes nothing when the text has not changed, so an idle
+// poll does not flicker.
+func (p *trashEmptyProgress) show(job map[string]any, retrying bool) {
+	if !p.on {
+		return
+	}
+	line := trashEmptyProgressLine(job, retrying)
+	if line == p.last {
+		return
+	}
+	p.last = line
+	fmt.Fprint(p.w, "\r\033[K"+dim(line))
+}
+
+// clear erases the progress line, if one was drawn.
+func (p *trashEmptyProgress) clear() {
+	if p.last == "" {
+		return
+	}
+	fmt.Fprint(p.w, "\r\033[K")
+	p.last = ""
+}
+
+// trashEmptyProgressLine is the progress text for one copy of the job. The
+// retry note keeps a wait on a dead connection from looking frozen.
+func trashEmptyProgressLine(job map[string]any, retrying bool) string {
+	line := "Emptying the trash…"
+	if total := int64(num(job, "total_notes")); total > 0 {
+		done := int64(num(job, "processed_notes"))
+		line = fmt.Sprintf("Emptying the trash… %s of %s %s",
+			commaNum(done), commaNum(total), pluralize(int(total), "note", "notes"))
+	}
+	if retrying {
+		line += " (retrying…)"
+	}
+	return line
+}
+
+// ===========================================================================
 // Display
 // ===========================================================================
 
@@ -224,7 +486,8 @@ func displayRestoredNote(data []byte) {
 }
 
 // displayEmptyTrash prints how many notes were expunged when the trash was
-// emptied (the bare {"expunged": N} response).
+// emptied. It reads only "expunged", so it serves both the small-trash answer
+// and a big trash's answer once its job has completed.
 func displayEmptyTrash(data []byte) {
 	root := parseJSON(data)
 	n := int64(num(root, "expunged"))
@@ -232,7 +495,7 @@ func displayEmptyTrash(data []byte) {
 		fmt.Println("Emptied the trash — 1 note permanently deleted.")
 		return
 	}
-	fmt.Printf("Emptied the trash — %d notes permanently deleted.\n", n)
+	fmt.Printf("Emptied the trash — %s notes permanently deleted.\n", commaNum(n))
 }
 
 func init() {
