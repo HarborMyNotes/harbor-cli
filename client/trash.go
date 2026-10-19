@@ -26,8 +26,22 @@ func (c *Client) ExpungeNote(id string) ([]byte, error) {
 	return c.doPost("/notes/"+id+"/expunge", nil)
 }
 
-// EmptyTrash expunges every note currently in the trash. It returns the bare
-// {"expunged": N} object reporting how many notes were permanently deleted.
+// EmptyTrash expunges every note currently in the trash. The server answers in
+// one of two bare shapes:
+//
+//   - 200 {"expunged": N} for a small trash: the notes are already gone.
+//   - 202 {"expunged": N, "job": {...}} for a big one: a background job deletes
+//     them, and N is how many it WILL delete. Poll the job with
+//     GetTrashEmptyJob until its status is completed or failed. If an Empty
+//     Trash is already running, the answer is that job; no second one starts.
 func (c *Client) EmptyTrash() ([]byte, error) {
 	return c.doDelete("/trash", nil)
+}
+
+// GetTrashEmptyJob returns one background Empty Trash job, data-wrapped:
+// {"data": {id, status, total_notes, processed_notes, error, ...}}. status is
+// queued, running, completed or failed; error is the sentence to show when it
+// failed.
+func (c *Client) GetTrashEmptyJob(id string) ([]byte, error) {
+	return c.doGet("/trash/empty-jobs/"+id, nil)
 }

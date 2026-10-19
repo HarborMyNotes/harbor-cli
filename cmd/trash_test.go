@@ -4,8 +4,18 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"os"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestDisplayTrash checks the trash list renders titles and the paging footer.
@@ -55,6 +65,15 @@ func TestDisplayEmptyTrash(t *testing.T) {
 	one := captureStdout(t, func() { displayEmptyTrash([]byte(`{"expunged":1}`)) })
 	if !strings.Contains(one, "1 note permanently deleted") {
 		t.Errorf("expected singular count, got:\n%s", one)
+	}
+}
+
+// TestDisplayEmptyTrashUsesThousandsSeparators checks a big count reads the way
+// the progress line does.
+func TestDisplayEmptyTrashUsesThousandsSeparators(t *testing.T) {
+	out := captureStdout(t, func() { displayEmptyTrash([]byte(`{"expunged":15843}`)) })
+	if out != "Emptied the trash — 15,843 notes permanently deleted.\n" {
+		t.Errorf("output = %q", out)
 	}
 }
 
@@ -311,5 +330,608 @@ func TestTrashEmptyRunEReportsAPIFailureAsAnError(t *testing.T) {
 	}
 	if strings.Contains(out, "Emptied the trash") {
 		t.Errorf("stdout claimed success after a 500:\n%s", out)
+	}
+}
+
+// ===========================================================================
+// A big trash: waiting for the background job
+// ===========================================================================
+//
+// More than 200 notes come back as 202 with a job. The notes are still there
+// at that point, so the success line must wait for the job to complete.
+
+// trashJobRoute is the poll the wait makes for job j1.
+const trashJobRoute = "GET /api/v1/trash/empty-jobs/j1"
+
+// bigTrashAccepted is the 202 answer for a trash of 15,843 notes.
+const bigTrashAccepted = `{"expunged":15843,"job":{"id":"j1","status":"queued","workspace":"","total_notes":15843,"processed_notes":0,"error":"","created_at":1750000000000,"updated_at":1750000000000}}`
+
+// jobReply is one poll answer: the job at a status and progress.
+func jobReply(status string, processed int) mockReply {
+	return mockReply{Status: 200, Body: fmt.Sprintf(
+		`{"data":{"id":"j1","status":%q,"workspace":"","total_notes":15843,"processed_notes":%d,"error":""}}`,
+		status, processed)}
+}
+
+// failedJobReply is a poll answer for a job that failed with the given sentence.
+func failedJobReply(sentence string) mockReply {
+	return mockReply{Status: 200, Body: fmt.Sprintf(
+		`{"data":{"id":"j1","status":"failed","workspace":"","total_notes":15843,"processed_notes":4000,"error":%q}}`,
+		sentence)}
+}
+
+// bigTrashMock answers the Empty Trash with bigTrashAccepted and each poll with
+// the next reply in order, repeating the last one.
+func bigTrashMock(t *testing.T, replies ...mockReply) *apiMock {
+	t.Helper()
+	m := newAPIMock(t, nil)
+	n := 0
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case emptyTrashRoute:
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(bigTrashAccepted))
+		case trashJobRoute:
+			reply := replies[min(n, len(replies)-1)]
+			n++
+			w.WriteHeader(reply.Status)
+			_, _ = w.Write([]byte(reply.Body))
+		default:
+			t.Errorf("unrouted request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}
+	return m
+}
+
+// fastTrashPoll makes the wait poll every millisecond for this test.
+func fastTrashPoll(t *testing.T) {
+	t.Helper()
+	orig := trashEmptyPollInterval
+	t.Cleanup(func() { trashEmptyPollInterval = orig })
+	trashEmptyPollInterval = time.Millisecond
+}
+
+// shortRetryWindow shortens how long failed checks are retried for this test.
+func shortRetryWindow(t *testing.T, d time.Duration) {
+	t.Helper()
+	orig := trashEmptyRetryWindow
+	t.Cleanup(func() { trashEmptyRetryWindow = orig })
+	trashEmptyRetryWindow = d
+}
+
+// stderrTerminal makes stderr read as a terminal (or not) for this test.
+func stderrTerminal(t *testing.T, on bool) {
+	t.Helper()
+	orig := stderrIsInteractive
+	t.Cleanup(func() { stderrIsInteractive = orig })
+	stderrIsInteractive = func() bool { return on }
+}
+
+// countCalls counts the recorded requests matching "METHOD /path".
+func countCalls(m *apiMock, route string) int {
+	n := 0
+	for _, c := range m.calls() {
+		if c == route {
+			n++
+		}
+	}
+	return n
+}
+
+// TestTrashEmptyRunESmallTrashIsUnchanged pins the 200 path: the same line as
+// before, and no request after the delete.
+func TestTrashEmptyRunESmallTrashIsUnchanged(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		emptyTrashRoute: {Status: 200, Body: `{"expunged":3}`},
+	})
+
+	out, err := runCLI(t, m, "trash", "empty", "--yes")
+	if err != nil {
+		t.Fatalf("trash empty: %v", err)
+	}
+	if out != "Emptied the trash — 3 notes permanently deleted.\n" {
+		t.Errorf("output = %q", out)
+	}
+	if calls := m.calls(); len(calls) != 1 || calls[0] != emptyTrashRoute {
+		t.Errorf("calls = %v, want exactly [%s]", calls, emptyTrashRoute)
+	}
+}
+
+// TestTrashEmptyRunEWaitsForABigTrash checks a 202 is polled until the job
+// completes, and only then prints the success line.
+func TestTrashEmptyRunEWaitsForABigTrash(t *testing.T) {
+	fastTrashPoll(t)
+	m := bigTrashMock(t, jobReply("queued", 0), jobReply("running", 1200), jobReply("completed", 15843))
+
+	out, err := runCLI(t, m, "trash", "empty", "--yes")
+	if err != nil {
+		t.Fatalf("trash empty: %v", err)
+	}
+	if got := countCalls(m, trashJobRoute); got != 3 {
+		t.Errorf("polled %d times, want 3 (until completed, then stop): %v", got, m.calls())
+	}
+	if out != "Emptied the trash — 15,843 notes permanently deleted.\n" {
+		t.Errorf("output = %q", out)
+	}
+}
+
+// TestTrashEmptyRunENoPollWhenTheJobIsAlreadyDone covers a 202 whose job has
+// already finished: there is nothing to wait for.
+func TestTrashEmptyRunENoPollWhenTheJobIsAlreadyDone(t *testing.T) {
+	done := strings.Replace(bigTrashAccepted, `"status":"queued"`, `"status":"completed"`, 1)
+	m := newAPIMock(t, map[string]mockReply{emptyTrashRoute: {Status: 202, Body: done}})
+
+	out, err := runCLI(t, m, "trash", "empty", "--yes")
+	if err != nil {
+		t.Fatalf("trash empty: %v", err)
+	}
+	if calls := m.calls(); len(calls) != 1 {
+		t.Errorf("calls = %v, want only the delete", calls)
+	}
+	if !strings.Contains(out, "15,843 notes permanently deleted") {
+		t.Errorf("output = %q", out)
+	}
+}
+
+// TestTrashEmptyRunEJobAlreadyFailed covers a 202 whose job failed before the
+// answer was sent (the server could not start it): no poll, and a non-zero exit.
+func TestTrashEmptyRunEJobAlreadyFailed(t *testing.T) {
+	const sentence = "We couldn’t start emptying the Trash. Please try again."
+	failed := strings.Replace(bigTrashAccepted, `"status":"queued"`, `"status":"failed"`, 1)
+	failed = strings.Replace(failed, `"error":""`, `"error":"`+sentence+`"`, 1)
+	m := newAPIMock(t, map[string]mockReply{emptyTrashRoute: {Status: 202, Body: failed}})
+
+	out, err := runCLI(t, m, "trash", "empty", "--yes")
+	if err == nil || !strings.Contains(err.Error(), sentence) {
+		t.Errorf("err = %v, want the job's sentence", err)
+	}
+	if calls := m.calls(); len(calls) != 1 {
+		t.Errorf("calls = %v, want only the delete", calls)
+	}
+	if out != "" {
+		t.Errorf("stdout should be empty, got %q", out)
+	}
+}
+
+// TestTrashEmptyRunEReportsAFailedJob checks a failed job prints the server's
+// sentence, exits non-zero, and never claims the trash is empty.
+func TestTrashEmptyRunEReportsAFailedJob(t *testing.T) {
+	fastTrashPoll(t)
+	const sentence = "Emptying the Trash stopped before it finished. Please try again."
+	m := bigTrashMock(t, jobReply("running", 2000), failedJobReply(sentence))
+
+	out, err := runCLI(t, m, "trash", "empty", "--yes")
+	if err == nil {
+		t.Fatal("a failed job exited zero")
+	}
+	if err.Error() != "trash_empty_failed: "+sentence {
+		t.Errorf("err = %q, want the job's own sentence", err.Error())
+	}
+	if exitCodeFor(err) == exitOK {
+		t.Error("a failed job must exit non-zero")
+	}
+	if out != "" {
+		t.Errorf("stdout should be empty on failure, got %q", out)
+	}
+}
+
+// TestTrashEmptyRunEFailedJobWithoutASentence falls back to a sentence of our
+// own rather than an empty error.
+func TestTrashEmptyRunEFailedJobWithoutASentence(t *testing.T) {
+	fastTrashPoll(t)
+	m := bigTrashMock(t, failedJobReply(""))
+
+	_, err := runCLI(t, m, "trash", "empty", "--yes")
+	if err == nil || !strings.Contains(err.Error(), trashEmptyFailedFallback) {
+		t.Errorf("err = %v, want the fallback sentence", err)
+	}
+}
+
+// TestTrashEmptyRunEJSONPrintsTheFinalJob checks --json waits the same way,
+// prints no progress even on a terminal, and prints the finished job beside
+// the count scripts already read.
+func TestTrashEmptyRunEJSONPrintsTheFinalJob(t *testing.T) {
+	fastTrashPoll(t)
+	stderrTerminal(t, true)
+	m := bigTrashMock(t, jobReply("running", 1200), jobReply("completed", 15843))
+
+	var out string
+	var err error
+	stderr := captureStderr(t, func() { out, err = runCLI(t, m, "trash", "empty", "--yes", "--json") })
+	if err != nil {
+		t.Fatalf("trash empty --json: %v", err)
+	}
+	if stderr != "" {
+		t.Errorf("--json must print no progress, stderr = %q", stderr)
+	}
+	var doc struct {
+		Expunged int `json:"expunged"`
+		Job      struct {
+			ID             string `json:"id"`
+			Status         string `json:"status"`
+			ProcessedNotes int    `json:"processed_notes"`
+		} `json:"job"`
+	}
+	if jerr := json.Unmarshal([]byte(out), &doc); jerr != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", jerr, out)
+	}
+	if doc.Expunged != 15843 || doc.Job.ID != "j1" || doc.Job.Status != "completed" || doc.Job.ProcessedNotes != 15843 {
+		t.Errorf("want the finished job beside expunged, got %+v", doc)
+	}
+}
+
+// TestTrashEmptyRunEJSONFailedJobStillPrintsTheJob checks a script gets the
+// failed job on stdout as well as a non-zero exit.
+func TestTrashEmptyRunEJSONFailedJobStillPrintsTheJob(t *testing.T) {
+	fastTrashPoll(t)
+	m := bigTrashMock(t, failedJobReply("The Trash could not be emptied completely. Please try again."))
+
+	out, err := runCLI(t, m, "trash", "empty", "--yes", "--json")
+	if err == nil {
+		t.Fatal("a failed job exited zero")
+	}
+	if !strings.Contains(out, `"status": "failed"`) {
+		t.Errorf("stdout should carry the failed job:\n%s", out)
+	}
+}
+
+// TestTrashEmptyRunEShowsProgressOnATerminal checks the progress line is drawn
+// in place on stderr, notes a retried check, and is erased before the success
+// line.
+func TestTrashEmptyRunEShowsProgressOnATerminal(t *testing.T) {
+	fastTrashPoll(t)
+	stderrTerminal(t, true)
+	m := bigTrashMock(t,
+		jobReply("running", 1200),
+		mockReply{Status: 503, Body: apiErrorBody("unavailable", "restarting")},
+		jobReply("completed", 15843),
+	)
+
+	var out string
+	var err error
+	stderr := captureStderr(t, func() { out, err = runCLI(t, m, "trash", "empty", "--yes") })
+	if err != nil {
+		t.Fatalf("trash empty: %v", err)
+	}
+	for _, want := range []string{
+		"\r\033[KEmptying the trash… 0 of 15,843 notes",
+		"\r\033[KEmptying the trash… 1,200 of 15,843 notes",
+		"\r\033[KEmptying the trash… 1,200 of 15,843 notes (retrying…)",
+	} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr is missing %q:\n%q", want, stderr)
+		}
+	}
+	if !strings.HasSuffix(stderr, "\r\033[K") {
+		t.Errorf("the progress line should be erased at the end, stderr = %q", stderr)
+	}
+	if !strings.Contains(out, "15,843 notes permanently deleted") {
+		t.Errorf("output = %q", out)
+	}
+}
+
+// TestTrashEmptyRunENoProgressOffATerminal keeps a pipe or a log free of
+// carriage returns.
+func TestTrashEmptyRunENoProgressOffATerminal(t *testing.T) {
+	fastTrashPoll(t)
+	stderrTerminal(t, false)
+	m := bigTrashMock(t, jobReply("running", 1200), jobReply("completed", 15843))
+
+	var err error
+	stderr := captureStderr(t, func() { _, err = runCLI(t, m, "trash", "empty", "--yes") })
+	if err != nil {
+		t.Fatalf("trash empty: %v", err)
+	}
+	if stderr != "" {
+		t.Errorf("stderr should be empty off a terminal, got %q", stderr)
+	}
+}
+
+// TestTrashEmptyRunERetriesAFailedCheck checks a server error during the wait is
+// waited out, since the job keeps running either way.
+func TestTrashEmptyRunERetriesAFailedCheck(t *testing.T) {
+	fastTrashPoll(t)
+	m := bigTrashMock(t,
+		mockReply{Status: 502, Body: apiErrorBody("bad_gateway", "upstream down")},
+		mockReply{Status: 429, Body: apiErrorBody("rate_limited", "Too many requests.")},
+		jobReply("completed", 15843),
+	)
+
+	out, err := runCLI(t, m, "trash", "empty", "--yes")
+	if err != nil {
+		t.Fatalf("trash empty: %v", err)
+	}
+	if got := countCalls(m, trashJobRoute); got != 3 {
+		t.Errorf("polled %d times, want 3", got)
+	}
+	if !strings.Contains(out, "15,843 notes permanently deleted") {
+		t.Errorf("output = %q", out)
+	}
+}
+
+// TestTrashEmptyRunEStopsOnAMissingJob checks an answer that will not change on
+// a retry ends the wait at once, says the trash may still be emptying, and
+// never claims success.
+func TestTrashEmptyRunEStopsOnAMissingJob(t *testing.T) {
+	fastTrashPoll(t)
+	m := bigTrashMock(t, mockReply{Status: 404, Body: apiErrorBody("not_found", "Not found.")})
+
+	out, err := runCLI(t, m, "trash", "empty", "--yes")
+	if err == nil {
+		t.Fatal("a wait that lost its job exited zero")
+	}
+	if !strings.Contains(err.Error(), "may still be emptying") || !strings.Contains(err.Error(), "not_found") {
+		t.Errorf("err = %q, want the cause and that the trash may still be emptying", err.Error())
+	}
+	if exitCodeFor(err) != exitError {
+		t.Errorf("exit code = %d, want %d", exitCodeFor(err), exitError)
+	}
+	if got := countCalls(m, trashJobRoute); got != 1 {
+		t.Errorf("polled %d times, want 1 (a 404 is not retried)", got)
+	}
+	if out != "" {
+		t.Errorf("stdout should be empty, got %q", out)
+	}
+}
+
+// TestTrashEmptyRunEGivesUpAfterRepeatedFailures checks retries stop once
+// checks have kept failing for the retry window.
+func TestTrashEmptyRunEGivesUpAfterRepeatedFailures(t *testing.T) {
+	fastTrashPoll(t)
+	shortRetryWindow(t, 30*time.Millisecond)
+	m := bigTrashMock(t, mockReply{Status: 500, Body: apiErrorBody("internal", "boom")})
+
+	_, err := runCLI(t, m, "trash", "empty", "--yes")
+	if err == nil {
+		t.Fatal("a wait that could never check the job exited zero")
+	}
+	if !strings.Contains(err.Error(), "may still be emptying") {
+		t.Errorf("err = %q", err.Error())
+	}
+	if got := countCalls(m, trashJobRoute); got < 2 {
+		t.Errorf("polled %d times, want it to retry before giving up", got)
+	}
+}
+
+// TestTrashEmptyRunEGoodCheckResetsTheRetryWindow checks a successful check
+// starts the window over, so failures spread across a long job do not add up.
+// The run of good checks lasts at least 60ms (one 1ms pause each), longer than
+// the 30ms window, so a window that never resets gives up at the second 500.
+func TestTrashEmptyRunEGoodCheckResetsTheRetryWindow(t *testing.T) {
+	fastTrashPoll(t)
+	shortRetryWindow(t, 30*time.Millisecond)
+	boom := mockReply{Status: 500, Body: apiErrorBody("internal", "boom")}
+	replies := []mockReply{boom}
+	for i := 0; i < 60; i++ {
+		replies = append(replies, jobReply("running", i*100))
+	}
+	replies = append(replies, boom, jobReply("completed", 15843))
+	m := bigTrashMock(t, replies...)
+
+	out, err := runCLI(t, m, "trash", "empty", "--yes")
+	if err != nil {
+		t.Fatalf("trash empty: %v", err)
+	}
+	if !strings.Contains(out, "15,843 notes permanently deleted") {
+		t.Errorf("output = %q", out)
+	}
+}
+
+// TestTrashEmptyRunECtrlCStopsOnlyTheWait sends a real SIGINT during a check,
+// so the signal wiring is tested along with the wait. The person must be told
+// the trash is still emptying, see no success line, and get a non-zero exit.
+func TestTrashEmptyRunECtrlCStopsOnlyTheWait(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Interrupt cannot be delivered to a process on Windows")
+	}
+	fastTrashPoll(t)
+	stderrTerminal(t, true)
+	m := newAPIMock(t, nil)
+	polls := 0
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method+" "+r.URL.Path == emptyTrashRoute {
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(bigTrashAccepted))
+			return
+		}
+		polls++
+		if polls == 2 {
+			if p, err := os.FindProcess(os.Getpid()); err == nil {
+				_ = p.Signal(os.Interrupt)
+			}
+			// Hold this check open so the signal, not the answer, ends the wait.
+			time.Sleep(150 * time.Millisecond)
+		}
+		reply := jobReply("running", polls*200)
+		w.WriteHeader(reply.Status)
+		_, _ = w.Write([]byte(reply.Body))
+	}
+
+	var out string
+	var err error
+	stderr := captureStderr(t, func() { out, err = runCLI(t, m, "trash", "empty", "--yes") })
+	if !errors.Is(err, errTrashStoppedWaiting) {
+		t.Fatalf("err = %v, want errTrashStoppedWaiting", err)
+	}
+	if err.Error() != "Stopped waiting. The trash is still being emptied on the server." {
+		t.Errorf("err = %q", err.Error())
+	}
+	if exitCodeFor(err) == exitOK {
+		t.Error("Ctrl-C must exit non-zero")
+	}
+	if out != "" {
+		t.Errorf("stdout should be empty, got %q", out)
+	}
+	if !strings.HasSuffix(stderr, "\r\033[K") {
+		t.Errorf("the progress line should be erased before the error, stderr = %q", stderr)
+	}
+}
+
+// TestTrashWaitForEmptyStopsOnCtrlC checks Ctrl-C ends the wait at once, even
+// in the middle of a check that never answers, and says the job keeps going.
+func TestTrashWaitForEmptyStopsOnCtrlC(t *testing.T) {
+	fastTrashPoll(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hang := make(chan struct{})
+	t.Cleanup(func() { close(hang) })
+	fetch := func(string) ([]byte, error) {
+		cancel() // Ctrl-C lands while this check is in flight
+		<-hang
+		return nil, errors.New("unreachable")
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := trashWaitForEmpty(ctx, fetch, []byte(bigTrashAccepted), &trashEmptyProgress{})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || err.Error() != "Stopped waiting. The trash is still being emptied on the server." {
+			t.Errorf("err = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Ctrl-C did not end the wait while a check hung")
+	}
+}
+
+// TestTrashWaitForEmptyCtrlCBeforeTheFirstCheck checks no request is sent once
+// Ctrl-C has landed.
+func TestTrashWaitForEmptyCtrlCBeforeTheFirstCheck(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	fetch := func(string) ([]byte, error) {
+		t.Error("a check was sent after Ctrl-C")
+		return nil, nil
+	}
+	data, err := trashWaitForEmpty(ctx, fetch, []byte(bigTrashAccepted), &trashEmptyProgress{})
+	if !errors.Is(err, errTrashStoppedWaiting) {
+		t.Errorf("err = %v, want errTrashStoppedWaiting", err)
+	}
+	if string(data) != bigTrashAccepted {
+		t.Errorf("data should be the last answer seen, got %s", data)
+	}
+}
+
+// TestTrashWaitForEmptyNeedsAJobID checks a running job with no id fails
+// instead of polling a path that cannot exist.
+func TestTrashWaitForEmptyNeedsAJobID(t *testing.T) {
+	noID := `{"expunged":450,"job":{"status":"queued","total_notes":450,"processed_notes":0}}`
+	fetch := func(string) ([]byte, error) {
+		t.Error("polled a job with no id")
+		return nil, nil
+	}
+	_, err := trashWaitForEmpty(context.Background(), fetch, []byte(noID), &trashEmptyProgress{})
+	if err == nil || !strings.Contains(err.Error(), "no job to follow") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+// TestTrashWaitForEmptyUnreadableJob checks a 200 that is not a job counts as a
+// failed check rather than a job that never finishes.
+func TestTrashWaitForEmptyUnreadableJob(t *testing.T) {
+	fastTrashPoll(t)
+	calls := 0
+	fetch := func(string) ([]byte, error) {
+		calls++
+		return []byte("<html>oops</html>"), nil
+	}
+	_, err := trashWaitForEmpty(context.Background(), fetch, []byte(bigTrashAccepted), &trashEmptyProgress{})
+	if err == nil || !strings.Contains(err.Error(), "could not be read") {
+		t.Errorf("err = %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("checked %d times, want 1", calls)
+	}
+}
+
+// TestTrashPollFailedKeepsTheNetworkExitCode checks a wait lost to the network
+// still exits 3, so a script knows a retry may work.
+func TestTrashPollFailedKeepsTheNetworkExitCode(t *testing.T) {
+	cause := &url.Error{Op: "Get", URL: "https://example.com", Err: errors.New("connection refused")}
+	err := trashPollFailed(cause)
+	if got := exitCodeFor(err); got != exitNetwork {
+		t.Errorf("exit code = %d, want %d", got, exitNetwork)
+	}
+	if !trashPollRetryable(cause) {
+		t.Error("a network failure should be retried")
+	}
+	if !strings.Contains(err.Error(), "connection refused") {
+		t.Errorf("err = %q, want the cause in it", err.Error())
+	}
+}
+
+// TestNewTrashEmptyProgressIsOffUnderJSON checks --json silences progress even
+// on a terminal.
+func TestNewTrashEmptyProgressIsOffUnderJSON(t *testing.T) {
+	stderrTerminal(t, true)
+	defer func() { jsonOutput = false }()
+
+	jsonOutput = true
+	if newTrashEmptyProgress().on {
+		t.Error("progress is on under --json")
+	}
+	jsonOutput = false
+	if !newTrashEmptyProgress().on {
+		t.Error("progress is off on a terminal without --json")
+	}
+}
+
+// TestTrashEmptyProgressRedrawsOnlyOnChange checks an idle poll writes nothing
+// and clear erases the line once.
+func TestTrashEmptyProgressRedrawsOnlyOnChange(t *testing.T) {
+	noColorFlag, colorReady = true, false
+	defer func() { noColorFlag, colorReady = false, false }()
+
+	var buf bytes.Buffer
+	p := &trashEmptyProgress{w: &buf, on: true}
+	job := map[string]any{"total_notes": float64(15843), "processed_notes": float64(1200)}
+	p.show(job, false)
+	p.show(job, false)
+	if buf.String() != "\r\033[KEmptying the trash… 1,200 of 15,843 notes" {
+		t.Errorf("after two identical shows: %q", buf.String())
+	}
+	buf.Reset()
+	p.clear()
+	p.clear()
+	if buf.String() != "\r\033[K" {
+		t.Errorf("clear should erase once, wrote %q", buf.String())
+	}
+}
+
+// TestTrashEmptyProgressLine checks the progress wording.
+func TestTrashEmptyProgressLine(t *testing.T) {
+	big := map[string]any{"total_notes": float64(15843), "processed_notes": float64(1200)}
+	cases := []struct {
+		job      map[string]any
+		retrying bool
+		want     string
+	}{
+		{big, false, "Emptying the trash… 1,200 of 15,843 notes"},
+		{big, true, "Emptying the trash… 1,200 of 15,843 notes (retrying…)"},
+		{map[string]any{"total_notes": float64(1), "processed_notes": float64(0)}, false, "Emptying the trash… 0 of 1 note"},
+		{map[string]any{}, false, "Emptying the trash…"},
+	}
+	for _, c := range cases {
+		if got := trashEmptyProgressLine(c.job, c.retrying); got != c.want {
+			t.Errorf("trashEmptyProgressLine(%v, %v) = %q, want %q", c.job, c.retrying, got, c.want)
+		}
+	}
+}
+
+// TestTrashEmptyWithJobKeepsExpunged checks swapping in a newer job keeps the
+// count beside it.
+func TestTrashEmptyWithJobKeepsExpunged(t *testing.T) {
+	out := trashEmptyWithJob([]byte(bigTrashAccepted), []byte(`{"id":"j1","status":"completed"}`))
+	root := parseJSON(out)
+	if num(root, "expunged") != 15843 {
+		t.Errorf("expunged lost: %s", out)
+	}
+	if str(trashEmptyJobOf(out), "status") != "completed" {
+		t.Errorf("job not replaced: %s", out)
 	}
 }

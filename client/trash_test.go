@@ -68,6 +68,40 @@ func TestEmptyTrash(t *testing.T) {
 	}
 }
 
+// TestEmptyTrashPassesTheJobThrough verifies the 202 answer for a big trash
+// reaches the caller whole, job included, so the command can wait on it.
+func TestEmptyTrashPassesTheJobThrough(t *testing.T) {
+	body := `{"expunged":450,"job":{"id":"j1","status":"queued","total_notes":450,"processed_notes":0,"error":""}}`
+	srv := newTestServer(t, nil, 202, body)
+	defer srv.Close()
+	data, err := testClient(srv.URL).EmptyTrash()
+	if err != nil {
+		t.Fatalf("EmptyTrash error: %v", err)
+	}
+	if string(data) != body {
+		t.Errorf("body = %s", data)
+	}
+}
+
+// TestGetTrashEmptyJob verifies the poll issues GET /trash/empty-jobs/:id and
+// returns the data-wrapped job unchanged.
+func TestGetTrashEmptyJob(t *testing.T) {
+	var rec recordedRequest
+	body := `{"data":{"id":"j1","status":"running","total_notes":450,"processed_notes":200,"error":""}}`
+	srv := newTestServer(t, &rec, 200, body)
+	defer srv.Close()
+	data, err := testClient(srv.URL).GetTrashEmptyJob("j1")
+	if err != nil {
+		t.Fatalf("GetTrashEmptyJob error: %v", err)
+	}
+	if rec.Method != "GET" || rec.Path != "/trash/empty-jobs/j1" {
+		t.Errorf("%s %s", rec.Method, rec.Path)
+	}
+	if string(data) != body {
+		t.Errorf("body = %s", data)
+	}
+}
+
 // TestRestoreNotInTrashReturnsAPIError verifies a 422 not_in_trash surfaces as a
 // typed *APIError so the cmd layer can map it.
 func TestRestoreNotInTrashReturnsAPIError(t *testing.T) {
