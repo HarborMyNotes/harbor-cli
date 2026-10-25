@@ -200,12 +200,14 @@ Run `harbor <command> --help` for full flags and examples on any command.
 ### Search
 | Command | Description |
 |---|---|
-| `harbor search "<query>"` | Full-text search across notes and attachments. |
+| `harbor search "<query>"` | Search notes, the text inside attachments, and attachment file names. |
 | `harbor search coordinates --resource-id …` | OCR highlight boxes for an attachment. |
 
 The query grammar supports `tag:`, `notebook:`, `intitle:`, `resource:`,
 `created:`/`updated:` date ranges, `meta:KEY=VALUE` / `meta:KEY` (metadata),
-`"exact phrases"`, `prefix*`, and `-negation`.
+`"exact phrases"`, `prefix*`, and `-negation`. A plain word or phrase also
+matches attachment file names, extension included, as a "contains" match:
+`harbor search xlsx` finds spreadsheets.
 See `harbor search --help`.
 
 ### Sync

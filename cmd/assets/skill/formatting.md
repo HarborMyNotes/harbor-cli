@@ -298,7 +298,7 @@ Rules that matter:
 
 ```bash
 # Find the target's id…
-TARGET=$(harbor search 'intitle:Roadmap' --json | jq -r '.data[0].id')
+TARGET=$(harbor search 'intitle:Roadmap' --json | jq -r '.data[0].note_id')
 
 # …and link to it from another note's body.
 harbor notes update "$NOTE_ID" --stdin --json <<MD

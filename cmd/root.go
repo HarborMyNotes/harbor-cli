@@ -143,7 +143,7 @@ Get started:
   harbor login                       Sign in through your browser
   harbor notebooks list              See your notebooks
   harbor notes create --stdin        Pipe Markdown straight into a new note
-  harbor search "tag:receipts pdf"   Full-text search
+  harbor search "tag:receipts pdf"   Search notes and attached files
   harbor notes list --json | jq .    Machine-readable output for agents
 
 Credentials are stored in ~/.config/harbor/credentials.json (0600) as a
