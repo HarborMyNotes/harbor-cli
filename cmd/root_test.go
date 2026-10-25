@@ -11,6 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -18,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
@@ -405,6 +408,29 @@ func TestOrdinaryFailuresKeepTheGenericExitCode(t *testing.T) {
 	}
 	if got := exitCodeFor(nil); got != exitOK {
 		t.Errorf("nil exit code = %d, want %d", got, exitOK)
+	}
+}
+
+// A disk or permission failure is local, so it keeps the generic code. The
+// operating system's error code has net.Error's methods, which used to give
+// such a failure the network code and tell a script to retry it.
+func TestLocalFileErrorsAreNotNetworkFailures(t *testing.T) {
+	for _, err := range []error{
+		&fs.PathError{Op: "open", Path: "out/x", Err: syscall.EACCES},
+		fmt.Errorf("cannot create a file in .: %w", syscall.ENOSPC),
+		&os.LinkError{Op: "rename", Old: "a", New: "b", Err: syscall.EXDEV},
+	} {
+		if isNetworkError(err) {
+			t.Errorf("%v was classified as a network failure", err)
+		}
+		if got := exitCodeFor(err); got != exitError {
+			t.Errorf("%v: exit code = %d, want %d", err, got, exitError)
+		}
+	}
+	// The transport's own wrapping still counts, with the same code inside it.
+	dial := &url.Error{Op: "Get", URL: "https://x", Err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}}
+	if !isNetworkError(dial) {
+		t.Error("a refused connection is a network failure")
 	}
 }
 

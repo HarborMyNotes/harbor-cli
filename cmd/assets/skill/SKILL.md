@@ -404,6 +404,7 @@ harbor history revert "$NOTE_ID" "$VERSION_ID" --json
 HASH=$(harbor files upload ./diagram.png --json | jq -r '.data.hash // .hash')
 harbor files list --mime image/ --json
 harbor files download "$HASH" --output ./diagram.png
+harbor files download --note "$NOTE_ID" --output-dir ./attachments   # every file of a note, real names
 harbor files rename "$HASH" "Architecture sketch"   # extension is kept → "Architecture sketch.png"
 ```
 

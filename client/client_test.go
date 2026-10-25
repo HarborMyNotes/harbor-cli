@@ -6,6 +6,7 @@ package client
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -13,12 +14,14 @@ import (
 	"go/token"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // recordedRequest captures what a handler received, for post-hoc assertions.
@@ -581,5 +584,158 @@ func TestPrettyJSONKeepsTheServersBytes(t *testing.T) {
 	}
 	if strings.HasSuffix(out, "\n") {
 		t.Errorf("output ends in a newline: %q", out)
+	}
+}
+
+// ===========================================================================
+// Streamed downloads and the stall timeout
+// ===========================================================================
+
+// trickleServer answers every request with chunks bytes, one every gap, so a
+// download takes about chunks*gap in all while never going quiet for long.
+func trickleServer(t *testing.T, chunks int, gap time.Duration) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher := w.(http.Flusher)
+		for i := 0; i < chunks; i++ {
+			_, _ = w.Write([]byte("x"))
+			flusher.Flush()
+			time.Sleep(gap)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// stallingServer sends the headers and one byte, then goes quiet until the
+// client gives up (or five seconds pass, so a broken test still ends).
+func stallingServer(t *testing.T, beforeHeaders bool) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !beforeHeaders {
+			_, _ = w.Write([]byte("x"))
+			w.(http.Flusher).Flush()
+		}
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// A download that keeps receiving bytes must outlive both the request timeout
+// and the stall timeout: each limits a wait, not the whole transfer. The
+// trickle takes about 360ms, well past both 150ms limits, with no gap longer
+// than 30ms.
+func TestStreamedDownloadsOutliveTheRequestTimeout(t *testing.T) {
+	srv := trickleServer(t, 12, 30*time.Millisecond)
+	c := testClient(srv.URL)
+	c.HTTPClient.Timeout = 150 * time.Millisecond
+	c.StallTimeout = 150 * time.Millisecond
+
+	for name, open := range map[string]func() (*http.Response, error){
+		"FetchURL": func() (*http.Response, error) { return c.FetchURL(srv.URL + "/blob?sig=1") },
+		"doGetRaw": func() (*http.Response, error) { return c.doGetRaw("/files/abc/raw", nil) },
+		"rawPost": func() (*http.Response, error) {
+			return c.rawPost(srv.URL+"/export/enex", []byte("{}"), "application/json")
+		},
+	} {
+		resp, err := open()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		got, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil || len(got) != 12 {
+			t.Errorf("%s: read %d bytes, err %v; want all 12 bytes of a slow but steady download", name, len(got), err)
+		}
+	}
+}
+
+// A download that goes quiet is given up after the stall timeout, with an error
+// that says so and counts as a network timeout (the CLI's exit code 3).
+func TestStreamedDownloadGivesUpOnAStall(t *testing.T) {
+	srv := stallingServer(t, false)
+	c := testClient(srv.URL)
+	c.StallTimeout = 100 * time.Millisecond
+
+	resp, err := c.FetchURL(srv.URL + "/blob?sig=1")
+	if err != nil {
+		t.Fatalf("FetchURL: %v", err)
+	}
+	defer resp.Body.Close()
+	start := time.Now()
+	_, err = io.ReadAll(resp.Body)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("the stall was noticed after %v, want about 100ms", elapsed)
+	}
+	var stall *StallError
+	if !errors.As(err, &stall) {
+		t.Fatalf("read error = %v (%T), want a *StallError", err, err)
+	}
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Errorf("a stall must count as a network timeout, got %v", err)
+	}
+	if want := "no data arrived for 100ms"; err.Error() != want {
+		t.Errorf("message = %q, want %q", err.Error(), want)
+	}
+}
+
+// A server that never sends its headers is a stall too, for the presigned path
+// and for a download streamed through the API.
+func TestStreamedDownloadGivesUpWaitingForHeaders(t *testing.T) {
+	srv := stallingServer(t, true)
+	c := testClient(srv.URL)
+	c.StallTimeout = 100 * time.Millisecond
+
+	if _, err := c.FetchURL(srv.URL + "/blob?sig=1"); !errors.As(err, new(*StallError)) {
+		t.Errorf("FetchURL error = %v, want a *StallError", err)
+	}
+	if _, err := c.doGetRaw("/files/abc/raw", nil); !errors.As(err, new(*StallError)) {
+		t.Errorf("doGetRaw error = %v, want a *StallError", err)
+	}
+}
+
+// Time the caller spends between reads is not a stall. A pipe into a pager can
+// hold a download still for as long as the reader likes. The body is far bigger
+// than the socket buffers, so most of it is still on the server during the
+// pause, and a timer that kept running would cut it off.
+func TestStreamedDownloadIgnoresASlowReader(t *testing.T) {
+	const size = 32 << 20
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		chunk := bytes.Repeat([]byte("x"), 64<<10)
+		for sent := 0; sent < size; sent += len(chunk) {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := testClient(srv.URL)
+	c.StallTimeout = 50 * time.Millisecond
+
+	resp, err := c.FetchURL(srv.URL + "/blob?sig=1")
+	if err != nil {
+		t.Fatalf("FetchURL: %v", err)
+	}
+	defer resp.Body.Close()
+	buf := make([]byte, 1)
+	if _, err := io.ReadFull(resp.Body, buf); err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	n, err := io.Copy(io.Discard, resp.Body)
+	if err != nil || n != size-1 {
+		t.Errorf("after a pause, read %d more bytes, err %v; want the other %d", n, err, size-1)
+	}
+}
+
+// The stall message names whole seconds the way a person would say them.
+func TestStallErrorMessage(t *testing.T) {
+	if got, want := (&StallError{After: defaultStallTimeout}).Error(), "no data arrived for 60 seconds"; got != want {
+		t.Errorf("Error() = %q, want %q", got, want)
 	}
 }
