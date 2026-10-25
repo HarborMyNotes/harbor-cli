@@ -197,6 +197,9 @@ Hierarchical (nested). A tag's parent is set with `--parent` (or `--top-level`).
 
 `harbor search '<query>' [--json]`
 
+Searches notes, the text inside attachments (OCR, transcripts), and attachment
+file names.
+
 | Operator | Meaning |
 |---|---|
 | `tag:VALUE` | carries this tag (`tag:"two words"` for spaces) |
@@ -210,6 +213,14 @@ Hierarchical (nested). A tag's parent is set with `--parent` (or `--top-level`).
 | `"exact phrase"` | consecutive, in-order words |
 | `term*` | prefix match |
 | `-token` | negate any token |
+
+A plain word or phrase also matches attachment file names, extension included,
+as a "contains" match: `harbor search xlsx` finds spreadsheets. In `--json`, an
+attachment hit carries `"match": "name"` when only its file name matched, or
+`"match": "text"` when it was found through its indexed text (OCR, transcript)
+or, for a query of only operators, by the filters alone. A name hit has an empty
+`snippet`, no `highlights`, and `score` 0. An attachment hit with no `match`
+field comes from an older server and is a text hit.
 
 Flags: `--notebook`, `--types note,attachment`, `--no-snippet`, paging.
 

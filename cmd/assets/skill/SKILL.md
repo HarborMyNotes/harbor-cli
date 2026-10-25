@@ -10,7 +10,7 @@ description: >-
   assistant.
 ---
 
-<!-- Harbor agent skill • v1.7.0 -->
+<!-- Harbor agent skill • v1.8.0 -->
 <!-- Copyright (c) 2026 Cloudmanic Labs, LLC. All rights reserved. Date: 2026-06-22 -->
 
 # Harbor CLI — managing notes from the terminal
@@ -270,6 +270,11 @@ harbor search 'report -draft intitle:weekly' --order -updated_at --json
 Operators: `tag:`, `notebook:`, `intitle:`, `resource:image|pdf|audio|application|any`,
 `created:YYYYMMDD..YYYYMMDD` (and `day-N`), `updated:…`, `"exact phrase"`,
 `prefix*`, `-negate`. Full grammar: `reference.md` → Search.
+
+Search reads notes, the text inside attachments, and attachment file names. A
+plain word or phrase also matches a file name, extension included, as a
+"contains" match: `harbor search xlsx` finds spreadsheets. A file found only by
+its name comes back with `"match": "name"` and an empty snippet.
 
 ### Reminders
 

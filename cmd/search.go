@@ -12,13 +12,14 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// searchCmd runs a full-text query.
+// searchCmd searches notes, the text inside attachments, and attachment file names.
 var searchCmd = &cobra.Command{
 	Use:     "search <query>",
-	Short:   "Full-text search across notes and attachments",
+	Short:   "Search notes, attachment text, and attachment file names",
 	GroupID: groupContent,
 	Args:    cobra.MinimumNArgs(1),
-	Long: `Search notes and OCR'd attachments with an Evernote-style query grammar.
+	Long: `Search notes, the text inside attachments (OCR and transcripts), and
+attachment file names, with an Evernote-style query grammar.
 
 Query operators (combine freely; multiple bare words AND together):
   tag:VALUE          note carries this tag (tag:"two words" for spaces)
@@ -31,8 +32,13 @@ Query operators (combine freely; multiple bare words AND together):
   meta:KEY           note metadata has KEY, whatever its value
   "exact phrase"     consecutive, in-order words
   term*              prefix match (recei* → receipt, receive…)
-  -token             negate any token (subtracts from the result set)`,
+  -token             negate any token (subtracts from the result set)
+
+A plain word or phrase also matches attachment file names, extension included,
+as a "contains" match: harbor search xlsx finds spreadsheets. A file found by
+its name has no snippet and a score of 0.`,
 	Example: `  harbor search budget
+  harbor search xlsx
   harbor search 'tag:finance resource:pdf "q3 plan"'
   harbor search 'report -draft' --order -updated_at
   harbor search 'meta:gallery=true -meta:draft'
@@ -123,7 +129,9 @@ func mapSearchError(err error) error {
 // Display
 // ===========================================================================
 
-// displaySearch renders mixed note/attachment hits as a unified table.
+// displaySearch renders mixed note/attachment hits as a unified table. An empty
+// snippet (a file found by its name, or --no-snippet) shows a dash so the column
+// never looks broken.
 func displaySearch(data []byte) {
 	items := client.CollectionItems(data)
 	headers := []string{"TYPE", "ID", "TITLE / FILENAME", "SNIPPET", "SCORE", "COORD"}
@@ -134,24 +142,53 @@ func displaySearch(data []byte) {
 		var id, label, coord string
 		if typ == "attachment" {
 			id = str(h, "resource_id")
-			label = str(h, "filename")
+			label = truncateFilename(str(h, "filename"), 28)
 			coord = boolMark(boolean(h, "has_coordinates"))
+			// Nothing inside a file found by its name matched, so there is no
+			// highlight to fetch, even when the file has OCR word boxes.
+			if isNameMatch(h) {
+				coord = dim("—")
+			}
 		} else {
 			id = str(h, "note_id")
-			label = str(h, "title")
+			label = truncate(str(h, "title"), 28)
 			coord = dim("—")
+		}
+		snippet := truncate(stripHTML(str(h, "snippet")), 44)
+		if strings.TrimSpace(snippet) == "" {
+			snippet = dim("—")
 		}
 		rows = append(rows, []string{
 			typ,
 			id,
-			truncate(label, 28),
-			truncate(stripHTML(str(h, "snippet")), 44),
+			label,
+			snippet,
 			fmt.Sprintf("%.2f", num(h, "score")),
 			coord,
 		})
 	}
 	printTable(headers, rows)
 	printPagingFooter(data)
+}
+
+// isNameMatch reports whether an attachment hit was found by its file name
+// rather than by its text. A hit with no match field comes from an older server
+// that only matched text.
+func isNameMatch(h map[string]any) bool {
+	return str(h, "match") == "name"
+}
+
+// truncateFilename shortens a file name to n characters like truncate, but
+// keeps the extension: for a file found by its name, the extension is often the
+// very part that matched (xlsx, pdf).
+func truncateFilename(name string, n int) string {
+	name = strings.ReplaceAll(strings.ReplaceAll(name, "\n", " "), "\r", "")
+	ext := fileExtension(name)
+	if len([]rune(name)) <= n || ext == "" || len(ext) > n/2 {
+		return truncate(name, n)
+	}
+	stem := []rune(strings.TrimSuffix(name, ext))
+	return string(stem[:n-len(ext)-1]) + "…" + ext
 }
 
 // displayCoordinates renders OCR highlight boxes per page.

@@ -3,7 +3,7 @@
 
 package client
 
-// Search runs a full-text query and returns mixed note/attachment hits
+// Search runs a search query and returns mixed note/attachment hits
 // (collection envelope). params carries q, types, notebook_id, order, snippet,
 // and the standard list params.
 func (c *Client) Search(params map[string]string) ([]byte, error) {
