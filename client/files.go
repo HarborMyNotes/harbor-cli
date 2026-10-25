@@ -167,12 +167,16 @@ func (e *DownloadError) Gone() bool {
 // credentials live in the query string), returning the live response for
 // streaming. The caller must close the body. A non-2xx reply comes back as a
 // *DownloadError carrying the status.
+//
+// It goes through the storage client, which has no overall timeout, because a
+// large file can take longer to arrive than any fixed limit. A download that
+// stops receiving bytes is given up after the stall timeout instead.
 func (c *Client) FetchURL(rawURL string) (*http.Response, error) {
 	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("invalid download URL: %w", err)
 	}
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.sendStreaming(c.storageClient(), req)
 	if err != nil {
 		return nil, fmt.Errorf("download failed: %w", err)
 	}

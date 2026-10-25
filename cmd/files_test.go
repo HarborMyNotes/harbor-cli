@@ -6,6 +6,7 @@ package cmd
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -380,8 +381,9 @@ func TestFilesKeyHappyPath(t *testing.T) {
 // TestRawDownloadKeepsTheServersNameInTheWorkingDirectory pins the other place a
 // filename arrives over the network.
 //
-// With no --output, the server's name IS the output path, so one holding ".."
-// writes outside the directory the command was run in.
+// With no --output, the server's name becomes the output path, so one holding
+// ".." must not write outside the directory the command was run in. The rule
+// turns each "/" into "_" and drops the leading dots.
 func TestRawDownloadKeepsTheServersNameInTheWorkingDirectory(t *testing.T) {
 	// Run two levels down inside the temp dir so the escape this asserts against
 	// has somewhere to land that the test still owns. Pointing "../.." at the
@@ -404,11 +406,86 @@ func TestRawDownloadKeepsTheServersNameInTheWorkingDirectory(t *testing.T) {
 		t.Fatalf("files download --raw: %v", err)
 	}
 
-	if _, err := os.Stat(filepath.Join(dir, "ESCAPED.txt")); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, "_.._ESCAPED.txt")); err != nil {
 		t.Errorf("the download did not land in the working directory: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(root, "ESCAPED.txt")); err == nil {
-		t.Error("the server's filename walked out of the working directory")
+	for _, outside := range []string{filepath.Join(root, "ESCAPED.txt"), filepath.Join(root, "a", "ESCAPED.txt")} {
+		if _, err := os.Stat(outside); err == nil {
+			t.Errorf("the server's filename walked out of the working directory to %s", outside)
+		}
+	}
+}
+
+// downloadHash is a well-formed sha256 for the single-file download tests.
+const downloadHash = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+
+// downloadMock serves one file for `files download <hash>`: its metadata, and its
+// bytes behind a presigned URL on the same server.
+func downloadMock(t *testing.T, filename, mimeType, content string) *apiMock {
+	t.Helper()
+	m := newAPIMock(t, map[string]mockReply{})
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/files/" + downloadHash:
+			_, _ = fmt.Fprintf(w, `{"download_url":%q,"filename":%q,"mime":%q,"size":%d}`,
+				m.srv.URL+"/blob", filename, mimeType, len(content))
+		case "/blob":
+			_, _ = w.Write([]byte(content))
+		default:
+			t.Errorf("unrouted request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}
+	return m
+}
+
+// With no --output, a download is saved under the real-name rule's name, not its
+// hash, and a second download of the same file never overwrites the first.
+func TestFilesDownloadSavesUnderTheRealName(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	m := downloadMock(t, "Report", "application/pdf", "pdf bytes")
+
+	out, err := runCLI(t, m, "files", "download", downloadHash)
+	if err != nil {
+		t.Fatalf("files download: %v", err)
+	}
+	if !strings.Contains(out, "to Report.pdf") {
+		t.Errorf("output = %q, want it to name Report.pdf", out)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Report.pdf"), []byte("edited"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runCLI(t, m, "files", "download", downloadHash); err != nil {
+		t.Fatalf("second download: %v", err)
+	}
+	for name, want := range map[string]string{"Report.pdf": "edited", "Report (2).pdf": "pdf bytes"} {
+		if b, err := os.ReadFile(filepath.Join(dir, name)); err != nil || string(b) != want {
+			t.Errorf("%s = %q (%v), want %q", name, b, err, want)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, downloadHash)); err == nil {
+		t.Error("the file was saved under its hash")
+	}
+}
+
+// --output names the file yourself, and still writes over what is there.
+func TestFilesDownloadOutputStillWins(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	m := downloadMock(t, "Report.pdf", "application/pdf", "new bytes")
+	if err := os.WriteFile(filepath.Join(dir, "mine.pdf"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := runCLI(t, m, "files", "download", downloadHash, "--output", "mine.pdf"); err != nil {
+		t.Fatalf("files download --output: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "mine.pdf")); string(b) != "new bytes" {
+		t.Errorf("mine.pdf = %q, want the download", b)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "Report.pdf")); err == nil {
+		t.Error("--output was ignored: the stored name was used too")
 	}
 }
 

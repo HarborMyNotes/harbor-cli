@@ -228,7 +228,7 @@ func (c *Client) rawPostWithRefresh(fullURL string, body []byte, contentType str
 	}
 	c.setCommonHeaders(req)
 
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.sendStreaming(c.streamClient(), req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}

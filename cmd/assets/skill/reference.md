@@ -380,6 +380,7 @@ Content-addressed (sha256) blobs.
 | `harbor files get <hash>` | Presigned URL + metadata (no bytes) | |
 | `harbor files check` | Does a blob exist? | `--hash` (+`--size`) or `--file` (hash computed locally) |
 | `harbor files download <hash>` | Download bytes | `--output` (`-` = stdout), `--raw`, `--ciphertext` |
+| `harbor files download --note <id>` | Save every file linked to a note | `--output-dir` (default `.`, created if missing), `--raw` |
 | `harbor files rename <hash> <new-name>` | Rename a file (one name for the whole account, shown in every note that holds it) | |
 
 **Encrypted attachments.** `files upload --encrypted` seals the bytes on this
@@ -390,6 +391,15 @@ passphrase is set; without it the download is refused, and `--ciphertext` writes
 the raw envelope instead. Filename and MIME stay plaintext on the record; the
 stored size is 33 bytes larger than the original, and `files check --file` can
 never match an encrypted upload because the content hash covers the ciphertext.
+
+**Saved names.** Without `--output`, a download is saved under the file's stored
+name, with only what a filesystem cannot hold changed (`/ \ : < > " | ? * # %` →
+`_`) and the type's extension added when it has none. Nothing is overwritten: a
+taken name becomes `name (2).ext`. `--note` saves each linked file once, prints
+`saved  <path>` / `skipped  <name>: <reason>` lines and `<k> of <n> attachments
+saved`, and exits 1 if any file was skipped (an encrypted file with no
+`HARBOR_PASSPHRASE` is skipped, never written as ciphertext). `--json` prints
+`{note_id, output_dir, total, saved[], skipped[]}`.
 
 **Renaming.** `files rename` cannot change the extension. Give the new name with
 or without it: `harbor files rename "$HASH" "Scan 2015-01-06"` on a PDF stores

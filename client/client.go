@@ -9,9 +9,11 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -33,16 +35,22 @@ type Client struct {
 	// empty for public endpoints (login, password reset, public share, ops).
 	AccessToken string
 
-	// HTTPClient performs the requests. Defaults to a 30s-timeout client.
+	// HTTPClient performs the requests. Defaults to a 30s-timeout client. A
+	// streamed download uses it without that timeout (see sendStreaming).
 	HTTPClient *http.Client
 
-	// StorageHTTPClient performs direct-to-storage transfers — today the
-	// presigned part PUTs of a large import. It is separate from HTTPClient
-	// because that one's 30-second timeout is sized for small JSON calls and a
-	// single 64 MiB chunk on an ordinary connection takes longer than that. It
-	// carries no overall timeout: a part upload is bounded by the request
-	// context (Ctrl-C) and by the presigned URL's own expiry.
+	// StorageHTTPClient performs direct-to-storage transfers: the presigned part
+	// PUTs of a large import, and presigned downloads (FetchURL). It is separate
+	// from HTTPClient because that one's 30-second timeout is sized for small
+	// JSON calls and a single 64 MiB chunk on an ordinary connection takes longer
+	// than that. It carries no overall timeout: a part upload is bounded by the
+	// request context (Ctrl-C) and by the presigned URL's own expiry, and a
+	// download by the stall timeout.
 	StorageHTTPClient *http.Client
+
+	// StallTimeout is how long a streamed download may wait for its response or
+	// its next bytes before it is given up. Zero means one minute.
+	StallTimeout time.Duration
 
 	// Verbose, when true, makes callers surface request ids / HTTP status.
 	Verbose bool
@@ -297,7 +305,7 @@ func (c *Client) rawRequest(method, fullURL string, allowRefresh bool) (*http.Re
 	}
 	c.setCommonHeaders(req)
 
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.sendStreaming(c.streamClient(), req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
@@ -317,6 +325,99 @@ func (c *Client) rawRequest(method, fullURL string, allowRefresh bool) (*http.Re
 		}
 	}
 	return nil, apiErr
+}
+
+// defaultStallTimeout is how long a streamed download may receive nothing before
+// it is given up. It limits a stall, not a size: a big file on a slow line keeps
+// going while bytes keep arriving.
+const defaultStallTimeout = 60 * time.Second
+
+// StallError is a streamed download that received nothing for the stall
+// timeout. It reports itself as a network timeout, so the CLI gives it the
+// network exit code: the same command can work on a better connection.
+type StallError struct {
+	After time.Duration
+}
+
+// Error says how long the download waited.
+func (e *StallError) Error() string {
+	if e.After >= time.Second && e.After%time.Second == 0 {
+		return fmt.Sprintf("no data arrived for %d seconds", int(e.After/time.Second))
+	}
+	return "no data arrived for " + e.After.String()
+}
+
+// Timeout reports true, which makes StallError a net.Error timeout.
+func (e *StallError) Timeout() bool { return true }
+
+// Temporary reports true: a stall says nothing about the request itself.
+func (e *StallError) Temporary() bool { return true }
+
+// streamClient returns HTTPClient without its overall timeout, for a response
+// that is read as a stream. That timeout is sized for small JSON calls and would
+// cut a large download off part way; sendStreaming bounds a stall instead.
+func (c *Client) streamClient() *http.Client {
+	hc := *c.HTTPClient
+	hc.Timeout = 0
+	return &hc
+}
+
+// sendStreaming sends req on hc and gives up when the response, or the next
+// bytes of its body, take longer than the stall timeout. Only time spent waiting
+// inside Read counts, so a slow reader (a pipe into a pager) never trips it.
+// The caller must close the body.
+func (c *Client) sendStreaming(hc *http.Client, req *http.Request) (*http.Response, error) {
+	after := c.StallTimeout
+	if after <= 0 {
+		after = defaultStallTimeout
+	}
+	stall := &StallError{After: after}
+	ctx, cancel := context.WithCancelCause(req.Context())
+	timer := time.AfterFunc(after, func() { cancel(stall) })
+
+	resp, err := hc.Do(req.WithContext(ctx))
+	timer.Stop()
+	if err != nil {
+		cancel(nil)
+		if errors.Is(context.Cause(ctx), stall) {
+			return nil, stall
+		}
+		return nil, err
+	}
+	resp.Body = &stallBody{body: resp.Body, ctx: ctx, cancel: cancel, timer: timer, after: after, stall: stall}
+	return resp, nil
+}
+
+// stallBody is a response body whose every Read must make progress within the
+// stall timeout. Its context is the request's, so cancelling it aborts the read.
+type stallBody struct {
+	body   io.ReadCloser
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	timer  *time.Timer
+	after  time.Duration
+	stall  *StallError
+}
+
+// Read starts the stall timer, reads, and stops it, so only the wait for the
+// network counts. A read the timer cut short returns the StallError rather than
+// a bare "context canceled".
+func (b *stallBody) Read(p []byte) (int, error) {
+	b.timer.Reset(b.after)
+	n, err := b.body.Read(p)
+	b.timer.Stop()
+	if err != nil && err != io.EOF && errors.Is(context.Cause(b.ctx), b.stall) {
+		return n, b.stall
+	}
+	return n, err
+}
+
+// Close stops the timer, closes the body and releases the request's context.
+func (b *stallBody) Close() error {
+	b.timer.Stop()
+	err := b.body.Close()
+	b.cancel(nil)
+	return err
 }
 
 // setCommonHeaders applies Accept, Authorization (when a token is present), and

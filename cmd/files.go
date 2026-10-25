@@ -218,69 +218,71 @@ var filesGetCmd = &cobra.Command{
 	},
 }
 
-// filesDownloadCmd downloads the blob bytes to a file or stdout.
+// filesDownloadCmd downloads one file's bytes, or every file of a note.
 var filesDownloadCmd = &cobra.Command{
-	Use:   "download <hash>",
-	Short: "Download a file's bytes",
-	Args:  cobra.ExactArgs(1),
-	Long: `Download a blob. By default it follows a presigned URL; --raw streams through
-the API instead. Writes to --output (default: the stored filename, or - for stdout).
+	Use:   "download {<hash> | --note <id>}",
+	Short: "Download a file's bytes, or every file of a note",
+	Args:  filesDownloadArgs,
+	Long: `Download a file by hash, or every file linked to a note with --note.
+
+Files are saved under their own names: the stored name, with only what a
+filesystem cannot hold changed (/ \ : < > " | ? * # % become _), and the type's
+extension added when the name has none. Nothing is overwritten: when the name is
+taken in the folder, the file is saved as "name (2).ext", then "name (3).ext".
+
+By default a download follows a presigned URL; --raw streams it through the API
+instead. --output names the file yourself (- for stdout); it writes over a file
+that is already there.
+
+--note <id> saves every file linked to the note, once each, into --output-dir
+(default: the current folder; created if missing). It prints one line per file
+and a summary, and exits 1 if any file was skipped.
 
 Encrypted files are decrypted automatically when HARBOR_PASSPHRASE is set. When
-it is not, the download is refused rather than writing ciphertext you cannot use
+it is not, one file is refused rather than written as ciphertext you cannot use
 — pass --ciphertext to write the raw envelope anyway (for backups or moving bytes
-between machines).`,
-	Example: `  harbor files download e3b0... --output diagram.png
+between machines). With --note an encrypted file is skipped instead, and the
+rest are still saved.`,
+	Example: `  harbor files download e3b0...
+  harbor files download e3b0... --output diagram.png
   harbor files download e3b0... --raw --output -
-  harbor files download e3b0... --ciphertext --output sealed.bin`,
+  harbor files download e3b0... --ciphertext --output sealed.bin
+  harbor files download --note 9c2e... --output-dir ./attachments`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c, creds, err := loadClientFromConfig()
 		if err != nil {
 			return err
 		}
+		if noteID := stringFlag(cmd, "note"); noteID != "" {
+			dir := stringFlag(cmd, "output-dir")
+			if dir == "" {
+				dir = "."
+			}
+			return saveNoteAttachments(c, creds, noteID, dir, boolFlag(cmd, "raw"))
+		}
+
 		hash := args[0]
 		out := stringFlag(cmd, "output")
-
-		var body io.ReadCloser
-		suggestedName := hash
-		if boolFlag(cmd, "raw") {
-			resp, derr := c.RawDownload(hash)
-			if derr != nil {
-				return derr
-			}
-			body = resp.Body
-			// Base, because this becomes the output path when --output is
-			// omitted and the name arrives over the network: one holding ".."
-			// would write outside the directory the command was run in.
-			if fn := filenameFromContentDisposition(resp.Header.Get("Content-Disposition")); fn != "" {
-				suggestedName = filepath.Base(fn)
-			}
-		} else {
-			meta, derr := c.GetFileDownload(hash)
-			if derr != nil {
-				return derr
-			}
-			info := parseJSON(meta)
-			url := str(info, "download_url")
-			if url == "" {
-				return errors.New("no download URL returned")
-			}
-			resp, ferr := c.FetchURL(url)
-			if ferr != nil {
-				return ferr
-			}
-			body = resp.Body
+		body, filename, mimeType, err := openFileDownload(c, hash, boolFlag(cmd, "raw"))
+		if err != nil {
+			return err
 		}
 		defer body.Close()
 
-		if out == "" {
-			out = suggestedName
-		}
 		content, err := decryptDownload(c, creds, body, boolFlag(cmd, "ciphertext"))
 		if err != nil {
 			return err
 		}
-		n, err := writeOutput(out, content)
+		var n int64
+		if out == "" {
+			used, terr := takenNames(".")
+			if terr != nil {
+				return terr
+			}
+			out, n, err = saveUnderRealName(".", used, filename, mimeType, content)
+		} else {
+			n, err = writeOutput(out, content)
+		}
 		if err != nil {
 			return err
 		}
@@ -289,6 +291,56 @@ between machines).`,
 		}
 		return nil
 	},
+}
+
+// filesDownloadArgs checks the two ways to call download: one hash, or --note
+// with no hash. Flags that only fit one of them are refused with the other, so
+// a mixed-up command fails before anything is fetched.
+func filesDownloadArgs(cmd *cobra.Command, args []string) error {
+	if stringFlag(cmd, "note") == "" {
+		if cmd.Flags().Changed("output-dir") {
+			return errors.New("--output-dir goes with --note; to name one file, use --output")
+		}
+		return cobra.ExactArgs(1)(cmd, args)
+	}
+	switch {
+	case len(args) > 0:
+		return errors.New("pass a file hash or --note, not both")
+	case cmd.Flags().Changed("output"):
+		return errors.New("--output names one file; with --note, choose the folder with --output-dir")
+	case boolFlag(cmd, "ciphertext"):
+		return errors.New("--ciphertext cannot be used with --note: saving a note's files never writes encrypted bytes")
+	}
+	return nil
+}
+
+// openFileDownload starts downloading one file and returns its body (the caller
+// closes it) with the stored name and type. The default path asks the API for a
+// presigned URL; raw streams the bytes through the API, and the name and type
+// then come from the response headers.
+func openFileDownload(c *client.Client, hash string, raw bool) (io.ReadCloser, string, string, error) {
+	if raw {
+		resp, err := c.RawDownload(hash)
+		if err != nil {
+			return nil, "", "", err
+		}
+		filename := filenameFromContentDisposition(resp.Header.Get("Content-Disposition"))
+		return resp.Body, filename, resp.Header.Get("Content-Type"), nil
+	}
+	meta, err := c.GetFileDownload(hash)
+	if err != nil {
+		return nil, "", "", err
+	}
+	info := parseJSON(meta)
+	url := str(info, "download_url")
+	if url == "" {
+		return nil, "", "", errors.New("no download URL returned")
+	}
+	resp, err := c.FetchURL(url)
+	if err != nil {
+		return nil, "", "", err
+	}
+	return resp.Body, str(info, "filename"), str(info, "mime"), nil
 }
 
 // filesRenameCmd renames a file, keeping its extension.
@@ -422,15 +474,11 @@ func filesKey(c *client.Client, creds *config.Credentials) ([]byte, error) {
 // wantCiphertext is the explicit opt-out for backups and moving bytes between
 // machines.
 func decryptDownload(c *client.Client, creds *config.Credentials, body io.Reader, wantCiphertext bool) (io.Reader, error) {
-	head := make([]byte, crypto.BinaryEnvelopeMinBytes)
-	n, err := io.ReadFull(body, head)
-	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+	rest, sealed, err := sniffEnvelope(body)
+	if err != nil {
 		return nil, err
 	}
-	head = head[:n]
-	rest := io.MultiReader(bytes.NewReader(head), body)
-
-	if !crypto.IsBinaryEnvelope(head) {
+	if !sealed {
 		return rest, nil
 	}
 	if wantCiphertext {
@@ -452,11 +500,11 @@ func decryptDownload(c *client.Client, creds *config.Credentials, body io.Reader
 		return nil, fmt.Errorf("this file is encrypted and the key could not be unlocked, so nothing was written: %w", err)
 	}
 
-	sealed, err := io.ReadAll(rest)
+	envelope, err := io.ReadAll(rest)
 	if err != nil {
 		return nil, err
 	}
-	plain, err := crypto.OpenBytes(key, sealed)
+	plain, err := crypto.OpenBytes(key, envelope)
 	if err != nil {
 		// Also reachable for a plaintext file that happens to begin with the
 		// ASCII bytes "HRBC2" — magic-sniffing cannot tell those apart, so name
@@ -465,6 +513,19 @@ func decryptDownload(c *client.Client, creds *config.Credentials, body io.Reader
 			"(if it was never encrypted, re-run with --ciphertext to write it as stored): %w", err)
 	}
 	return bytes.NewReader(plain), nil
+}
+
+// sniffEnvelope reads the start of a download to see whether it is an HRBC2
+// binary envelope, and returns a reader that still yields every byte. Only the
+// first few bytes are held, so a plain file keeps streaming.
+func sniffEnvelope(body io.Reader) (io.Reader, bool, error) {
+	head := make([]byte, crypto.BinaryEnvelopeMinBytes)
+	n, err := io.ReadFull(body, head)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return nil, false, err
+	}
+	head = head[:n]
+	return io.MultiReader(bytes.NewReader(head), body), crypto.IsBinaryEnvelope(head), nil
 }
 
 // mapFileError gives friendly messages for file-specific codes while keeping
@@ -745,7 +806,9 @@ func init() {
 	filesUploadCmd.Flags().String("filename", "", "Stored filename (defaults to the base name)")
 	filesUploadCmd.Flags().Bool("encrypted", false, "Encrypt the bytes on this machine before uploading (requires HARBOR_PASSPHRASE)")
 
-	filesDownloadCmd.Flags().String("output", "", "Output path, or - for stdout (default: the stored filename)")
+	filesDownloadCmd.Flags().String("output", "", "Output path, or - for stdout (default: the file's own name, never overwriting)")
+	filesDownloadCmd.Flags().String("note", "", "Save every file linked to this note id")
+	filesDownloadCmd.Flags().String("output-dir", "", "With --note: the folder to save into (default: the current folder)")
 	filesDownloadCmd.Flags().Bool("raw", false, "Stream through the API instead of following a presigned URL")
 	filesDownloadCmd.Flags().Bool("ciphertext", false, "Write an encrypted file's raw envelope instead of decrypting it")
 
