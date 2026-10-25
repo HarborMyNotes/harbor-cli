@@ -104,10 +104,7 @@ func saveNoteAttachments(c *client.Client, creds *config.Credentials, noteID, di
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("cannot create the folder %s: %w", dir, err)
 	}
-	used, err := takenNames(dir)
-	if err != nil {
-		return err
-	}
+	used := takenNames(dir)
 
 	body := noteBodyForOrder(c, creds, noteID, note)
 	for _, f := range orderAttachments(files, body) {
@@ -371,34 +368,47 @@ func attachmentLabel(f noteAttachment) string {
 }
 
 // takenNames returns the collisionKey of every entry already in dir, so a save
-// into it never takes a name that is there. A folder that does not exist yet
-// holds nothing.
-func takenNames(dir string) (map[string]bool, error) {
+// into it never takes a name that is there. A folder that does not exist yet, or
+// cannot be listed, counts as empty: the save still never overwrites, because
+// each file is put in place only where nothing has its name.
+func takenNames(dir string) map[string]bool {
 	used := map[string]bool{}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return used, nil
-		}
-		return nil, fmt.Errorf("cannot read the folder %s: %w", dir, err)
-	}
+	entries, _ := os.ReadDir(dir)
 	for _, e := range entries {
 		used[collisionKey(e.Name())] = true
 	}
-	return used, nil
+	return used
 }
 
-// saveUnderRealName writes r into dir under the real-name rule's name for the
-// file and returns the path and byte count. The file is created only if nothing
-// has that name, so even a file that appeared after the folder was read is never
-// overwritten: its name is marked taken and the next one is tried. If the write
-// fails, the partial file is removed and its name is given back, so a file that
-// was not saved never makes another one "(2)".
+// saveUnderRealName saves r into dir under the real-name rule's name for the
+// file and returns the path and byte count.
+//
+// The bytes go to a hidden temporary file first, and the file takes its name
+// only once it is complete. So a download that fails or is interrupted never
+// leaves a cut-off file under the real name, and never takes a name another file
+// then has to number around. The finished file is put in place only where
+// nothing has that name; a name that turns out to be there after all (another
+// program wrote it after the folder was read) is marked taken and the next one
+// is tried.
 func saveUnderRealName(dir string, used map[string]bool, filename, mimeType string, r io.Reader) (string, int64, error) {
+	tmp, err := createPartFile(dir)
+	if err != nil {
+		return "", 0, err
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+	n, err := io.Copy(tmp, r)
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return "", n, fmt.Errorf("download failed: %w", err)
+	}
+
 	for attempt := 0; attempt < maxNameAttempts; attempt++ {
 		name := realAttachmentName(used, filename, mimeType)
 		path := filepath.Join(dir, name)
-		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
+		err := placeFile(tmpPath, path)
 		if errors.Is(err, fs.ErrExist) {
 			continue
 		}
@@ -406,16 +416,60 @@ func saveUnderRealName(dir string, used map[string]bool, filename, mimeType stri
 			delete(used, collisionKey(name))
 			return "", 0, fmt.Errorf("cannot create %s: %w", path, err)
 		}
-		n, err := io.Copy(f, r)
-		if cerr := f.Close(); err == nil {
-			err = cerr
-		}
-		if err != nil {
-			_ = os.Remove(path)
-			delete(used, collisionKey(name))
-			return "", n, fmt.Errorf("cannot write %s: %w", path, err)
-		}
 		return path, n, nil
 	}
 	return "", 0, fmt.Errorf("could not find a free name for %q in %s", filename, dir)
+}
+
+// createPartFile creates the hidden file a download is written to before it
+// takes its name. It is created with the usual file mode, so the saved file gets
+// the same permissions any new file would.
+func createPartFile(dir string) (*os.File, error) {
+	for attempt := 0; attempt < maxNameAttempts; attempt++ {
+		suffix, err := crypto.NewUUIDv4()
+		if err != nil {
+			return nil, err
+		}
+		f, err := os.OpenFile(filepath.Join(dir, ".harbor-download-"+suffix+".part"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
+		if errors.Is(err, fs.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("cannot create a file in %s: %w", dir, err)
+		}
+		return f, nil
+	}
+	return nil, fmt.Errorf("cannot create a file in %s", dir)
+}
+
+// linkFile is os.Link, kept in a variable so a test can stand in a filesystem
+// without hard links.
+var linkFile = os.Link
+
+// placeFile puts the finished file at path, and never replaces a file there: it
+// returns an fs.ErrExist error instead. A hard link does this in one step. A
+// filesystem without hard links (FAT, exFAT, some network drives) gets an
+// exclusive create and a copy instead.
+func placeFile(tmpPath, path string) error {
+	err := linkFile(tmpPath, path)
+	if err == nil || errors.Is(err, fs.ErrExist) {
+		return err
+	}
+	src, err := os.Open(tmpPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	dst, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(dst, src)
+	if cerr := dst.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		_ = os.Remove(path)
+	}
+	return err
 }

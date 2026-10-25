@@ -5,6 +5,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -436,44 +437,13 @@ func TestCompareUTF16(t *testing.T) {
 	}
 }
 
-// The usage rules: one hash, or --note alone, and the flags that only fit one
-// of them. A mixed-up command is refused before anything is fetched.
-func TestFilesDownloadArgs(t *testing.T) {
-	cases := map[string]struct {
-		args []string
-		want string
-	}{
-		"no hash":                {[]string{"files", "download"}, "accepts 1 arg(s)"},
-		"hash and --note":        {[]string{"files", "download", "abc", "--note", saveAllNoteID}, "not both"},
-		"--note and --output":    {[]string{"files", "download", "--note", saveAllNoteID, "--output", "x"}, "--output-dir"},
-		"--note and ciphertext":  {[]string{"files", "download", "--note", saveAllNoteID, "--ciphertext"}, "never writes encrypted bytes"},
-		"--output-dir with hash": {[]string{"files", "download", "abc", "--output-dir", "x"}, "--output-dir goes with --note"},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			m := newAPIMock(t, map[string]mockReply{})
-			_, err := runCLI(t, m, tc.args...)
-			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("error = %v, want it to contain %q", err, tc.want)
-			}
-			if len(m.calls()) != 0 {
-				t.Errorf("a usage error still hit the network: %v", m.calls())
-			}
-		})
-	}
-}
-
 // A name already in the folder is never overwritten; the file gets "(2)".
 func TestSaveUnderRealNameNeverOverwrites(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "report.PDF"), []byte("old"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	used, err := takenNames(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	path, n, err := saveUnderRealName(dir, used, "Report.pdf", "application/pdf", strings.NewReader("new"))
+	path, n, err := saveUnderRealName(dir, takenNames(dir), "Report.pdf", "application/pdf", strings.NewReader("new"))
 	if err != nil || n != 3 || path != filepath.Join(dir, "Report (2).pdf") {
 		t.Fatalf("saveUnderRealName = %q, %d, %v; want Report (2).pdf", path, n, err)
 	}
@@ -499,21 +469,69 @@ func TestSaveUnderRealNameSkipsANameThatAppeared(t *testing.T) {
 	}
 }
 
-// A write that fails part way leaves no partial file and gives its name back, so
-// the next file with that name gets it.
-func TestSaveUnderRealNameGivesTheNameBackOnFailure(t *testing.T) {
+// A download that fails part way leaves nothing behind, not even its hidden
+// temporary file, and takes no name, so the next file with that name gets it.
+func TestSaveUnderRealNameLeavesNothingOnFailure(t *testing.T) {
 	dir := t.TempDir()
 	used := map[string]bool{}
 	broken := io.MultiReader(strings.NewReader("half"), iotestErrReader{})
-	if _, _, err := saveUnderRealName(dir, used, "a.txt", "text/plain", broken); err == nil {
-		t.Fatal("a failed stream was reported as saved")
+	_, _, err := saveUnderRealName(dir, used, "a.txt", "text/plain", broken)
+	if err == nil || !strings.HasPrefix(err.Error(), "download failed: ") {
+		t.Fatalf("error = %v, want a download failure", err)
 	}
 	if got := readSaved(t, dir); len(got) != 0 {
 		t.Errorf("a partial file was left behind: %v", got)
 	}
 	path, _, err := saveUnderRealName(dir, used, "a.txt", "text/plain", strings.NewReader("whole"))
 	if err != nil || path != filepath.Join(dir, "a.txt") {
-		t.Errorf("next save = %q, %v; want the freed name a.txt", path, err)
+		t.Errorf("next save = %q, %v; want the free name a.txt", path, err)
+	}
+	if got := readSaved(t, dir); !equalMaps(got, map[string]string{"a.txt": "whole"}) {
+		t.Errorf("folder = %v, want only a.txt (no temporary file)", got)
+	}
+}
+
+// While a download is still arriving, nothing has the real name yet: a cut-off
+// download (Ctrl-C) can never be mistaken for a saved file.
+func TestSaveUnderRealNameNamesTheFileOnlyWhenComplete(t *testing.T) {
+	dir := t.TempDir()
+	seen := map[string]string{}
+	probe := readerFunc(func(p []byte) (int, error) {
+		seen = readSaved(t, dir)
+		return 0, io.EOF
+	})
+	if _, _, err := saveUnderRealName(dir, map[string]bool{}, "a.txt", "text/plain", probe); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := seen["a.txt"]; ok || len(seen) != 1 {
+		t.Errorf("mid-download the folder held %v, want only the hidden temporary file", seen)
+	}
+}
+
+// readerFunc turns a function into an io.Reader.
+type readerFunc func([]byte) (int, error)
+
+// Read calls the function.
+func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
+
+// On a filesystem without hard links the file is copied into place instead, and
+// that path never overwrites either.
+func TestSaveUnderRealNameWithoutHardLinks(t *testing.T) {
+	orig := linkFile
+	t.Cleanup(func() { linkFile = orig })
+	linkFile = func(oldname, newname string) error {
+		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: errors.New("operation not supported")}
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("theirs"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path, _, err := saveUnderRealName(dir, map[string]bool{}, "a.txt", "text/plain", strings.NewReader("ours"))
+	if err != nil || path != filepath.Join(dir, "a (2).txt") {
+		t.Fatalf("saveUnderRealName = %q, %v; want a (2).txt", path, err)
+	}
+	if got := readSaved(t, dir); !equalMaps(got, map[string]string{"a.txt": "theirs", "a (2).txt": "ours"}) {
+		t.Errorf("folder = %v", got)
 	}
 }
 

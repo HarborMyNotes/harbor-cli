@@ -239,10 +239,11 @@ that is already there.
 and a summary, and exits 1 if any file was skipped.
 
 Encrypted files are decrypted automatically when HARBOR_PASSPHRASE is set. When
-it is not, one file is refused rather than written as ciphertext you cannot use
-— pass --ciphertext to write the raw envelope anyway (for backups or moving bytes
-between machines). With --note an encrypted file is skipped instead, and the
-rest are still saved.`,
+it is not, downloading an encrypted file fails rather than writing ciphertext you
+cannot use — pass --ciphertext to write the raw envelope anyway (for backups or
+moving bytes between machines). Without --output it is saved under the file's
+hash, so sealed bytes never take the real file's name. With --note an encrypted
+file is skipped instead, and the rest are still saved.`,
 	Example: `  harbor files download e3b0...
   harbor files download e3b0... --output diagram.png
   harbor files download e3b0... --raw --output -
@@ -274,14 +275,16 @@ rest are still saved.`,
 			return err
 		}
 		var n int64
-		if out == "" {
-			used, terr := takenNames(".")
-			if terr != nil {
-				return terr
-			}
-			out, n, err = saveUnderRealName(".", used, filename, mimeType, content)
-		} else {
+		switch {
+		case out != "":
 			n, err = writeOutput(out, content)
+		case boolFlag(cmd, "ciphertext"):
+			out, n, err = saveUnderRealName(".", takenNames("."), hash, "", content)
+		default:
+			if filename == "" {
+				filename, mimeType = storedNameAndType(c, hash, mimeType)
+			}
+			out, n, err = saveUnderRealName(".", takenNames("."), filename, mimeType, content)
 		}
 		if err != nil {
 			return err
@@ -316,8 +319,9 @@ func filesDownloadArgs(cmd *cobra.Command, args []string) error {
 
 // openFileDownload starts downloading one file and returns its body (the caller
 // closes it) with the stored name and type. The default path asks the API for a
-// presigned URL; raw streams the bytes through the API, and the name and type
-// then come from the response headers.
+// presigned URL, whose answer carries both. Raw streams the bytes through the
+// API, and the name and type come from the response headers; the server sends
+// no name there, so a caller that needs it asks storedNameAndType.
 func openFileDownload(c *client.Client, hash string, raw bool) (io.ReadCloser, string, string, error) {
 	if raw {
 		resp, err := c.RawDownload(hash)
@@ -341,6 +345,22 @@ func openFileDownload(c *client.Client, hash string, raw bool) (io.ReadCloser, s
 		return nil, "", "", err
 	}
 	return resp.Body, str(info, "filename"), str(info, "mime"), nil
+}
+
+// storedNameAndType looks up a file's stored name and type, for a --raw download
+// whose response did not name it. If the lookup fails, the type the download
+// reported is kept and the name stays empty, which the rule saves as
+// "attachment".
+func storedNameAndType(c *client.Client, hash, mimeType string) (string, string) {
+	meta, err := c.GetFileDownload(hash)
+	if err != nil {
+		return "", mimeType
+	}
+	info := parseJSON(meta)
+	if m := str(info, "mime"); m != "" {
+		mimeType = m
+	}
+	return str(info, "filename"), mimeType
 }
 
 // filesRenameCmd renames a file, keeping its extension.
@@ -810,7 +830,7 @@ func init() {
 	filesDownloadCmd.Flags().String("note", "", "Save every file linked to this note id")
 	filesDownloadCmd.Flags().String("output-dir", "", "With --note: the folder to save into (default: the current folder)")
 	filesDownloadCmd.Flags().Bool("raw", false, "Stream through the API instead of following a presigned URL")
-	filesDownloadCmd.Flags().Bool("ciphertext", false, "Write an encrypted file's raw envelope instead of decrypting it")
+	filesDownloadCmd.Flags().Bool("ciphertext", false, "Write an encrypted file's raw envelope instead of decrypting it (default name: the hash)")
 
 	filesCmd.AddCommand(filesListCmd, filesCheckCmd, filesUploadCmd, filesGetCmd, filesDownloadCmd, filesRenameCmd)
 	rootCmd.AddCommand(filesCmd)

@@ -388,7 +388,7 @@ machine (HRBC2 binary envelope, master key) before uploading — it needs
 `HARBOR_PASSPHRASE` and refuses rather than uploading in the clear. `files
 download` detects an encrypted blob and decrypts it automatically when the
 passphrase is set; without it the download is refused, and `--ciphertext` writes
-the raw envelope instead. Filename and MIME stay plaintext on the record; the
+the raw envelope instead (under the file's hash unless `--output` names it). Filename and MIME stay plaintext on the record; the
 stored size is 33 bytes larger than the original, and `files check --file` can
 never match an encrypted upload because the content hash covers the ciphertext.
 

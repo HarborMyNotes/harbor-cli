@@ -625,13 +625,15 @@ func stallingServer(t *testing.T, beforeHeaders bool) *httptest.Server {
 	return srv
 }
 
-// A download that keeps receiving bytes must outlive the request timeout. That
-// timeout is sized for JSON calls; a big file on a slow line takes far longer.
+// A download that keeps receiving bytes must outlive both the request timeout
+// and the stall timeout: each limits a wait, not the whole transfer. The
+// trickle takes about 360ms, well past both 150ms limits, with no gap longer
+// than 30ms.
 func TestStreamedDownloadsOutliveTheRequestTimeout(t *testing.T) {
-	srv := trickleServer(t, 8, 40*time.Millisecond)
+	srv := trickleServer(t, 12, 30*time.Millisecond)
 	c := testClient(srv.URL)
-	c.HTTPClient.Timeout = 100 * time.Millisecond
-	c.StallTimeout = time.Second
+	c.HTTPClient.Timeout = 150 * time.Millisecond
+	c.StallTimeout = 150 * time.Millisecond
 
 	for name, open := range map[string]func() (*http.Response, error){
 		"FetchURL": func() (*http.Response, error) { return c.FetchURL(srv.URL + "/blob?sig=1") },
@@ -646,8 +648,8 @@ func TestStreamedDownloadsOutliveTheRequestTimeout(t *testing.T) {
 		}
 		got, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if err != nil || len(got) != 8 {
-			t.Errorf("%s: read %d bytes, err %v; want all 8 bytes of a slow but steady download", name, len(got), err)
+		if err != nil || len(got) != 12 {
+			t.Errorf("%s: read %d bytes, err %v; want all 12 bytes of a slow but steady download", name, len(got), err)
 		}
 	}
 }
@@ -698,9 +700,20 @@ func TestStreamedDownloadGivesUpWaitingForHeaders(t *testing.T) {
 }
 
 // Time the caller spends between reads is not a stall. A pipe into a pager can
-// hold a download still for as long as the reader likes.
+// hold a download still for as long as the reader likes. The body is far bigger
+// than the socket buffers, so most of it is still on the server during the
+// pause, and a timer that kept running would cut it off.
 func TestStreamedDownloadIgnoresASlowReader(t *testing.T) {
-	srv := trickleServer(t, 3, 0)
+	const size = 32 << 20
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		chunk := bytes.Repeat([]byte("x"), 64<<10)
+		for sent := 0; sent < size; sent += len(chunk) {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
 	c := testClient(srv.URL)
 	c.StallTimeout = 50 * time.Millisecond
 
@@ -713,10 +726,10 @@ func TestStreamedDownloadIgnoresASlowReader(t *testing.T) {
 	if _, err := io.ReadFull(resp.Body, buf); err != nil {
 		t.Fatalf("first read: %v", err)
 	}
-	time.Sleep(200 * time.Millisecond)
-	rest, err := io.ReadAll(resp.Body)
-	if err != nil || len(rest) != 2 {
-		t.Errorf("after a pause, read %d more bytes, err %v; want the last 2 bytes", len(rest), err)
+	time.Sleep(300 * time.Millisecond)
+	n, err := io.Copy(io.Discard, resp.Body)
+	if err != nil || n != size-1 {
+		t.Errorf("after a pause, read %d more bytes, err %v; want the other %d", n, err, size-1)
 	}
 }
 

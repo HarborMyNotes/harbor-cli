@@ -855,3 +855,81 @@ func TestFilesRenameShowsTheServersRefusal(t *testing.T) {
 		t.Errorf("detail lines = %v, want [%s]", lines, want)
 	}
 }
+
+// The usage rules: one hash, or --note alone, and the flags that only fit one
+// of them. A mixed-up command is refused before anything is fetched.
+func TestFilesDownloadArgs(t *testing.T) {
+	cases := map[string]struct {
+		args []string
+		want string
+	}{
+		"no hash":                {[]string{"files", "download"}, "accepts 1 arg(s)"},
+		"hash and --note":        {[]string{"files", "download", "abc", "--note", saveAllNoteID}, "not both"},
+		"--note and --output":    {[]string{"files", "download", "--note", saveAllNoteID, "--output", "x"}, "--output-dir"},
+		"--note and ciphertext":  {[]string{"files", "download", "--note", saveAllNoteID, "--ciphertext"}, "never writes encrypted bytes"},
+		"--output-dir with hash": {[]string{"files", "download", "abc", "--output-dir", "x"}, "--output-dir goes with --note"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			m := newAPIMock(t, map[string]mockReply{})
+			_, err := runCLI(t, m, tc.args...)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want it to contain %q", err, tc.want)
+			}
+			if len(m.calls()) != 0 {
+				t.Errorf("a usage error still hit the network: %v", m.calls())
+			}
+		})
+	}
+}
+
+// The real server's /raw stream names no file, so a --raw download looks up the
+// stored name and type rather than saving every file as "attachment".
+func TestFilesDownloadRawUsesTheStoredName(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	m := newAPIMock(t, map[string]mockReply{})
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/files/" + downloadHash + "/raw":
+			// What the server sends: a type and a length, no Content-Disposition.
+			w.Header().Set("Content-Type", "application/vnd.ms-excel")
+			_, _ = w.Write([]byte("sheet"))
+		case "/api/v1/files/" + downloadHash:
+			_, _ = fmt.Fprintf(w, `{"download_url":"https://s3.invalid/x","filename":"Q3 Budget.xlsx","mime":"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}`)
+		default:
+			t.Errorf("unrouted request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}
+
+	if _, err := runCLI(t, m, "files", "download", downloadHash, "--raw"); err != nil {
+		t.Fatalf("files download --raw: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "Q3 Budget.xlsx")); err != nil || string(b) != "sheet" {
+		t.Errorf("Q3 Budget.xlsx = %q (%v), want the download under its stored name", b, err)
+	}
+}
+
+// --ciphertext without --output saves the sealed bytes under the file's hash, so
+// an envelope never sits under a name like "secret.pdf" that promises the file.
+func TestFilesDownloadCiphertextKeepsTheHashName(t *testing.T) {
+	lockedSession(t)
+	dir := t.TempDir()
+	t.Chdir(dir)
+	sealed, err := crypto.SealBytes(newMasterKey(t), []byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := downloadMock(t, "secret.pdf", "application/pdf", string(sealed))
+
+	if _, err := runCLI(t, m, "files", "download", downloadHash, "--ciphertext"); err != nil {
+		t.Fatalf("files download --ciphertext: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, downloadHash)); err != nil || string(b) != string(sealed) {
+		t.Errorf("the envelope was not saved under the hash (%v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "secret.pdf")); err == nil {
+		t.Error("the sealed bytes took the real file's name")
+	}
+}
