@@ -5,16 +5,18 @@ package cmd
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
 	"github.com/HarborMyNotes/harbor-cli/crypto"
@@ -514,24 +516,60 @@ type readerFunc func([]byte) (int, error)
 // Read calls the function.
 func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
 
-// On a filesystem without hard links the file is copied into place instead, and
-// that path never overwrites either.
-func TestSaveUnderRealNameWithoutHardLinks(t *testing.T) {
-	orig := linkFile
-	t.Cleanup(func() { linkFile = orig })
-	linkFile = func(oldname, newname string) error {
-		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: errors.New("operation not supported")}
+// When the last step fails, nothing is left behind (not the empty file that
+// reserved the name, not the part file) and the name is given back.
+func TestSaveUnderRealNameGivesTheNameBackWhenPlacingFails(t *testing.T) {
+	orig := renameFile
+	t.Cleanup(func() { renameFile = orig })
+	renameFile = func(oldpath, newpath string) error {
+		return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: syscall.EIO}
 	}
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("theirs"), 0o644); err != nil {
+	used := map[string]bool{}
+
+	_, _, err := saveUnderRealName(dir, used, "a.txt", "text/plain", strings.NewReader("ours"))
+	if err == nil || err.Error() != "cannot create "+filepath.Join(dir, "a.txt")+": "+syscall.EIO.Error() {
+		t.Fatalf("error = %v", err)
+	}
+	if got := readSaved(t, dir); len(got) != 0 {
+		t.Errorf("a failed save left %v behind", got)
+	}
+	if used[collisionKey("a.txt")] {
+		t.Error("a file that was not saved kept its name")
+	}
+}
+
+// Ctrl-C during a download removes the part file and ends the run as an
+// interrupt does, rather than leaving the part file behind for good.
+func TestRemoveOnInterrupt(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a process cannot send itself an interrupt on Windows")
+	}
+	orig := interruptExit
+	t.Cleanup(func() { interruptExit = orig })
+	exited := make(chan int, 1)
+	interruptExit = func(code int) { exited <- code }
+
+	path := filepath.Join(t.TempDir(), ".harbor-download-x.part")
+	if err := os.WriteFile(path, []byte("half"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	path, _, err := saveUnderRealName(dir, map[string]bool{}, "a.txt", "text/plain", strings.NewReader("ours"))
-	if err != nil || path != filepath.Join(dir, "a (2).txt") {
-		t.Fatalf("saveUnderRealName = %q, %v; want a (2).txt", path, err)
+	stop := removeOnInterrupt(path)
+	defer stop()
+	self, _ := os.FindProcess(os.Getpid())
+	if err := self.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
 	}
-	if got := readSaved(t, dir); !equalMaps(got, map[string]string{"a.txt": "theirs", "a (2).txt": "ours"}) {
-		t.Errorf("folder = %v", got)
+	select {
+	case code := <-exited:
+		if code != exitInterrupted {
+			t.Errorf("exit code = %d, want %d", code, exitInterrupted)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the interrupt was not handled")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("the part file is still there (stat err = %v)", err)
 	}
 }
 

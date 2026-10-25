@@ -190,7 +190,7 @@ func readAll(t *testing.T, r io.Reader) []byte {
 func TestDecryptDownloadPassesPlaintextThrough(t *testing.T) {
 	lockedSession(t)
 	for _, body := range []string{"", "x", "hello", "just a normal file, not encrypted at all", strings.Repeat("z", 5000)} {
-		got, err := decryptDownload(nil, nil, strings.NewReader(body), false)
+		got, _, err := decryptDownload(nil, nil, strings.NewReader(body), false)
 		if err != nil {
 			t.Fatalf("decryptDownload(%d bytes): %v", len(body), err)
 		}
@@ -211,7 +211,7 @@ func TestDecryptDownloadDecryptsEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SealBytes: %v", err)
 	}
-	got, err := decryptDownload(nil, nil, bytes.NewReader(sealed), false)
+	got, _, err := decryptDownload(nil, nil, bytes.NewReader(sealed), false)
 	if err != nil {
 		t.Fatalf("decryptDownload: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestDecryptDownloadRefusesWhenLocked(t *testing.T) {
 	}
 	lockedSession(t)
 
-	got, err := decryptDownload(nil, nil, bytes.NewReader(sealed), false)
+	got, _, err := decryptDownload(nil, nil, bytes.NewReader(sealed), false)
 	if err == nil {
 		t.Fatalf("expected a refusal, got %q", readAll(t, got))
 	}
@@ -252,12 +252,15 @@ func TestDecryptDownloadCiphertextOptOut(t *testing.T) {
 	}
 	lockedSession(t)
 
-	got, err := decryptDownload(nil, nil, bytes.NewReader(sealed), true)
+	got, kept, err := decryptDownload(nil, nil, bytes.NewReader(sealed), true)
 	if err != nil {
 		t.Fatalf("decryptDownload(--ciphertext): %v", err)
 	}
 	if out := readAll(t, got); !bytes.Equal(out, sealed) {
 		t.Fatalf("--ciphertext altered the envelope: %d bytes, want %d", len(out), len(sealed))
+	}
+	if !kept {
+		t.Error("the envelope was handed back without saying it is still sealed")
 	}
 }
 
@@ -270,7 +273,7 @@ func TestDecryptDownloadWrongKey(t *testing.T) {
 	}
 	unlockedSession(t, make([]byte, 32)) // a different, all-zero key
 
-	if _, err := decryptDownload(nil, nil, bytes.NewReader(sealed), false); err == nil {
+	if _, _, err := decryptDownload(nil, nil, bytes.NewReader(sealed), false); err == nil {
 		t.Fatal("expected a decrypt failure")
 	} else if !strings.Contains(err.Error(), "nothing was written") {
 		t.Errorf("error should say nothing was written: %v", err)
@@ -908,6 +911,91 @@ func TestFilesDownloadRawUsesTheStoredName(t *testing.T) {
 	}
 	if b, err := os.ReadFile(filepath.Join(dir, "Q3 Budget.xlsx")); err != nil || string(b) != "sheet" {
 		t.Errorf("Q3 Budget.xlsx = %q (%v), want the download under its stored name", b, err)
+	}
+}
+
+// rawMock serves a --raw download the way the real server does: the bytes with a
+// Content-Type and no name. meta answers GET /files/:hash; an empty one fails it.
+func rawMock(t *testing.T, contentType, meta string) *apiMock {
+	t.Helper()
+	m := newAPIMock(t, map[string]mockReply{})
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/files/" + downloadHash + "/raw":
+			w.Header().Set("Content-Type", contentType)
+			_, _ = w.Write([]byte("bytes"))
+		case "/api/v1/files/" + downloadHash:
+			if meta == "" {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(apiErrorBody("internal", "boom")))
+				return
+			}
+			_, _ = w.Write([]byte(meta))
+		default:
+			t.Errorf("unrouted request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}
+	return m
+}
+
+// The stored type beats the stream's generic one, so a name with no extension
+// still gets the right one.
+func TestFilesDownloadRawUsesTheStoredType(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	m := rawMock(t, "application/octet-stream", `{"download_url":"https://s3.invalid/x","filename":"Report","mime":"application/pdf"}`)
+
+	if _, err := runCLI(t, m, "files", "download", downloadHash, "--raw"); err != nil {
+		t.Fatalf("files download --raw: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "Report.pdf")); err != nil {
+		t.Errorf("want Report.pdf: %v", err)
+	}
+}
+
+// If the name cannot be looked up, the download is still saved, under the rule's
+// fallback name and the stream's type.
+func TestFilesDownloadRawWhenTheLookupFails(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	m := rawMock(t, "image/png", "")
+
+	if _, err := runCLI(t, m, "files", "download", downloadHash, "--raw"); err != nil {
+		t.Fatalf("files download --raw: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "attachment.png")); err != nil || string(b) != "bytes" {
+		t.Errorf("attachment.png = %q (%v)", b, err)
+	}
+}
+
+// Without --raw the presigned answer already names the file, so a file with no
+// stored name is not looked up a second time.
+func TestFilesDownloadLooksUpTheNameOnlyForRaw(t *testing.T) {
+	t.Chdir(t.TempDir())
+	m := downloadMock(t, "", "image/png", "png bytes")
+
+	if _, err := runCLI(t, m, "files", "download", downloadHash); err != nil {
+		t.Fatalf("files download: %v", err)
+	}
+	if n := countCalls(m, "GET /api/v1/files/"+downloadHash); n != 1 {
+		t.Errorf("the file was looked up %d times, want once", n)
+	}
+}
+
+// A file that is not encrypted keeps its own name under --ciphertext: there is
+// no envelope to keep away from it.
+func TestFilesDownloadCiphertextOnAPlainFileKeepsItsName(t *testing.T) {
+	lockedSession(t)
+	dir := t.TempDir()
+	t.Chdir(dir)
+	m := downloadMock(t, "Notes.txt", "text/plain", "plain words")
+
+	if _, err := runCLI(t, m, "files", "download", downloadHash, "--ciphertext"); err != nil {
+		t.Fatalf("files download --ciphertext: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "Notes.txt")); err != nil || string(b) != "plain words" {
+		t.Errorf("Notes.txt = %q (%v)", b, err)
 	}
 }
 

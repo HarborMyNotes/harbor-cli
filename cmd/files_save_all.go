@@ -11,10 +11,12 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"unicode/utf16"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
@@ -396,13 +398,22 @@ func saveUnderRealName(dir string, used map[string]bool, filename, mimeType stri
 		return "", 0, err
 	}
 	tmpPath := tmp.Name()
-	defer func() { _ = os.Remove(tmpPath) }()
-	n, err := io.Copy(tmp, r)
+	stopGuard := removeOnInterrupt(tmpPath)
+	defer func() {
+		stopGuard()
+		_ = os.Remove(tmpPath)
+	}()
+
+	src := &readErrTracker{r: r}
+	n, err := io.Copy(tmp, src)
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
-		return "", n, fmt.Errorf("download failed: %w", err)
+		if src.err != nil {
+			return "", n, fmt.Errorf("download failed: %w", src.err)
+		}
+		return "", n, fmt.Errorf("cannot write into %s: %w", dir, osCause(err))
 	}
 
 	for attempt := 0; attempt < maxNameAttempts; attempt++ {
@@ -414,11 +425,42 @@ func saveUnderRealName(dir string, used map[string]bool, filename, mimeType stri
 		}
 		if err != nil {
 			delete(used, collisionKey(name))
-			return "", 0, fmt.Errorf("cannot create %s: %w", path, err)
+			return "", 0, fmt.Errorf("cannot create %s: %w", path, osCause(err))
 		}
 		return path, n, nil
 	}
 	return "", 0, fmt.Errorf("could not find a free name for %q in %s", filename, dir)
+}
+
+// readErrTracker remembers the error its reader returned, so a failed copy can
+// say whether the download or the disk was at fault.
+type readErrTracker struct {
+	r   io.Reader
+	err error
+}
+
+// Read reads from the wrapped reader and keeps any error other than io.EOF.
+func (t *readErrTracker) Read(p []byte) (int, error) {
+	n, err := t.r.Read(p)
+	if err != nil && err != io.EOF {
+		t.err = err
+	}
+	return n, err
+}
+
+// osCause drops the path from a filesystem error, so a message names the
+// folder and the reason ("no space left on device") rather than the hidden
+// temporary file.
+func osCause(err error) error {
+	var pathErr *fs.PathError
+	if errors.As(err, &pathErr) {
+		return pathErr.Err
+	}
+	var linkErr *os.LinkError
+	if errors.As(err, &linkErr) {
+		return linkErr.Err
+	}
+	return err
 }
 
 // createPartFile creates the hidden file a download is written to before it
@@ -435,41 +477,64 @@ func createPartFile(dir string) (*os.File, error) {
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("cannot create a file in %s: %w", dir, err)
+			return nil, fmt.Errorf("cannot create a file in %s: %w", dir, osCause(err))
 		}
 		return f, nil
 	}
 	return nil, fmt.Errorf("cannot create a file in %s", dir)
 }
 
-// linkFile is os.Link, kept in a variable so a test can stand in a filesystem
-// without hard links.
-var linkFile = os.Link
+// renameFile is os.Rename, kept in a variable so a test can make the last step
+// of a save fail.
+var renameFile = os.Rename
 
 // placeFile puts the finished file at path, and never replaces a file there: it
-// returns an fs.ErrExist error instead. A hard link does this in one step. A
-// filesystem without hard links (FAT, exFAT, some network drives) gets an
-// exclusive create and a copy instead.
+// returns an fs.ErrExist error instead. An empty file is first made at path with
+// an exclusive create, which fails when anything has that name, and the
+// finished file is then renamed over it. A rename within one folder needs no
+// extra space and works on every filesystem.
 func placeFile(tmpPath, path string) error {
-	err := linkFile(tmpPath, path)
-	if err == nil || errors.Is(err, fs.ErrExist) {
-		return err
-	}
-	src, err := os.Open(tmpPath)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
 	if err != nil {
 		return err
 	}
-	defer src.Close()
-	dst, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
-	if err != nil {
-		return err
-	}
-	_, err = io.Copy(dst, src)
-	if cerr := dst.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
+	if err := f.Close(); err != nil {
 		_ = os.Remove(path)
+		return err
 	}
-	return err
+	if err := renameFile(tmpPath, path); err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	return nil
+}
+
+// exitInterrupted is the exit code of a program ended by Ctrl-C: 128 plus
+// SIGINT's number, as a shell reports it.
+const exitInterrupted = 130
+
+// interruptExit is os.Exit, kept in a variable so a test can see the interrupt
+// handler run without ending the test binary.
+var interruptExit = os.Exit
+
+// removeOnInterrupt deletes path and ends the program if Ctrl-C (or a
+// termination signal) arrives before the returned stop function is called. A
+// signal ends the process without running deferred cleanup, so without this an
+// interrupted download would leave its part file behind for good.
+func removeOnInterrupt(path string) (stop func()) {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-sig:
+			_ = os.Remove(path)
+			interruptExit(exitInterrupted)
+		case <-done:
+		}
+	}()
+	return func() {
+		signal.Stop(sig)
+		close(done)
+	}
 }

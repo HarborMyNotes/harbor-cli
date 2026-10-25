@@ -242,7 +242,8 @@ Encrypted files are decrypted automatically when HARBOR_PASSPHRASE is set. When
 it is not, downloading an encrypted file fails rather than writing ciphertext you
 cannot use — pass --ciphertext to write the raw envelope anyway (for backups or
 moving bytes between machines). Without --output it is saved under the file's
-hash, so sealed bytes never take the real file's name. With --note an encrypted
+hash, so sealed bytes never take the real file's name; a file that is not
+encrypted keeps its own name. With --note an encrypted
 file is skipped instead, and the rest are still saved.`,
 	Example: `  harbor files download e3b0...
   harbor files download e3b0... --output diagram.png
@@ -264,13 +265,14 @@ file is skipped instead, and the rest are still saved.`,
 
 		hash := args[0]
 		out := stringFlag(cmd, "output")
-		body, filename, mimeType, err := openFileDownload(c, hash, boolFlag(cmd, "raw"))
+		raw := boolFlag(cmd, "raw")
+		body, filename, mimeType, err := openFileDownload(c, hash, raw)
 		if err != nil {
 			return err
 		}
 		defer body.Close()
 
-		content, err := decryptDownload(c, creds, body, boolFlag(cmd, "ciphertext"))
+		content, keptSealed, err := decryptDownload(c, creds, body, boolFlag(cmd, "ciphertext"))
 		if err != nil {
 			return err
 		}
@@ -278,10 +280,10 @@ file is skipped instead, and the rest are still saved.`,
 		switch {
 		case out != "":
 			n, err = writeOutput(out, content)
-		case boolFlag(cmd, "ciphertext"):
+		case keptSealed:
 			out, n, err = saveUnderRealName(".", takenNames("."), hash, "", content)
 		default:
-			if filename == "" {
+			if raw && filename == "" {
 				filename, mimeType = storedNameAndType(c, hash, mimeType)
 			}
 			out, n, err = saveUnderRealName(".", takenNames("."), filename, mimeType, content)
@@ -492,47 +494,48 @@ func filesKey(c *client.Client, creds *config.Credentials) ([]byte, error) {
 // unlocked) — those are bugs on those clients, not a different design, so
 // refusing here is the parity-correct behaviour rather than a deviation.
 // wantCiphertext is the explicit opt-out for backups and moving bytes between
-// machines.
-func decryptDownload(c *client.Client, creds *config.Credentials, body io.Reader, wantCiphertext bool) (io.Reader, error) {
+// machines; keptSealed then reports whether the bytes handed back are an
+// envelope, so the caller does not save them under the real file's name.
+func decryptDownload(c *client.Client, creds *config.Credentials, body io.Reader, wantCiphertext bool) (content io.Reader, keptSealed bool, err error) {
 	rest, sealed, err := sniffEnvelope(body)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if !sealed {
-		return rest, nil
+		return rest, false, nil
 	}
 	if wantCiphertext {
 		fmt.Fprintln(os.Stderr, dim("This file is encrypted; writing the raw envelope as asked (--ciphertext)."))
-		return rest, nil
+		return rest, true, nil
 	}
 
 	key, err := unlockMasterKey(c, creds)
 	if err != nil {
 		switch {
 		case errors.Is(err, errPassphraseNotSet):
-			return nil, fmt.Errorf("this file is encrypted and %s is not set, so nothing was written.\n\n"+
+			return nil, false, fmt.Errorf("this file is encrypted and %s is not set, so nothing was written.\n\n"+
 				"  export %s=$(op read \"op://Vault/Harbor/passphrase\")\n\n"+
 				"Re-run with --ciphertext to write the sealed bytes instead",
 				passphraseEnv, passphraseEnv)
 		case errors.Is(err, errNoKeystore):
-			return nil, errors.New("this file is encrypted but this account has no encryption keys cached — run 'harbor crypto sync' first, or re-run with --ciphertext to write the sealed bytes")
+			return nil, false, errors.New("this file is encrypted but this account has no encryption keys cached — run 'harbor crypto sync' first, or re-run with --ciphertext to write the sealed bytes")
 		}
-		return nil, fmt.Errorf("this file is encrypted and the key could not be unlocked, so nothing was written: %w", err)
+		return nil, false, fmt.Errorf("this file is encrypted and the key could not be unlocked, so nothing was written: %w", err)
 	}
 
 	envelope, err := io.ReadAll(rest)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	plain, err := crypto.OpenBytes(key, envelope)
 	if err != nil {
 		// Also reachable for a plaintext file that happens to begin with the
 		// ASCII bytes "HRBC2" — magic-sniffing cannot tell those apart, so name
 		// the escape hatch rather than insisting the key is wrong.
-		return nil, fmt.Errorf("this file did not decrypt with your key, so nothing was written "+
+		return nil, false, fmt.Errorf("this file did not decrypt with your key, so nothing was written "+
 			"(if it was never encrypted, re-run with --ciphertext to write it as stored): %w", err)
 	}
-	return bytes.NewReader(plain), nil
+	return bytes.NewReader(plain), false, nil
 }
 
 // sniffEnvelope reads the start of a download to see whether it is an HRBC2
@@ -830,7 +833,7 @@ func init() {
 	filesDownloadCmd.Flags().String("note", "", "Save every file linked to this note id")
 	filesDownloadCmd.Flags().String("output-dir", "", "With --note: the folder to save into (default: the current folder)")
 	filesDownloadCmd.Flags().Bool("raw", false, "Stream through the API instead of following a presigned URL")
-	filesDownloadCmd.Flags().Bool("ciphertext", false, "Write an encrypted file's raw envelope instead of decrypting it (default name: the hash)")
+	filesDownloadCmd.Flags().Bool("ciphertext", false, "Write an encrypted file's raw envelope instead of decrypting it (saved under the hash)")
 
 	filesCmd.AddCommand(filesListCmd, filesCheckCmd, filesUploadCmd, filesGetCmd, filesDownloadCmd, filesRenameCmd)
 	rootCmd.AddCommand(filesCmd)

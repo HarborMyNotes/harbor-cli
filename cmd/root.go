@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"runtime/debug"
 	"strings"
+	"syscall"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
 	"github.com/HarborMyNotes/harbor-cli/config"
@@ -350,13 +351,23 @@ func exitCodeFor(err error) int {
 // connection, an unresolvable host, a TLS failure, and a client-side timeout.
 // An HTTP error response is a *client.APIError instead and is deliberately NOT
 // caught here — the server did answer.
+//
+// An operating-system error code (syscall.Errno) also has the methods of
+// net.Error, so a bare one is not taken as proof: a full disk or a folder that
+// cannot be written is a local failure, and retrying will not fix it. A real
+// network failure arrives wrapped in *url.Error or *net.OpError, which match
+// first.
 func isNetworkError(err error) bool {
 	var urlErr *url.Error
 	if errors.As(err, &urlErr) {
 		return true
 	}
 	var netErr net.Error
-	return errors.As(err, &netErr)
+	if !errors.As(err, &netErr) {
+		return false
+	}
+	_, isErrno := netErr.(syscall.Errno)
+	return !isErrno
 }
 
 // resolveBaseURL picks the API base URL with this precedence: --api-url flag,
