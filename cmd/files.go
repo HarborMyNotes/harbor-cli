@@ -746,10 +746,12 @@ func boolStr(b bool) string {
 // Display
 // ===========================================================================
 
-// displayFiles renders a file collection with a linked-note count.
+// displayFiles renders a file collection with a linked-note count. The TEXT
+// column is the file's ocr_status: it covers the words read from Office and
+// text files too, so it is not labelled OCR.
 func displayFiles(data []byte) {
 	items := client.CollectionItems(data)
-	headers := []string{"HASH", "MIME", "SIZE", "OCR", "THUMB", "FILENAME", "NOTES"}
+	headers := []string{"HASH", "MIME", "SIZE", "TEXT", "THUMB", "FILENAME", "NOTES"}
 	rows := make([][]string, 0, len(items))
 	for _, raw := range items {
 		f := parseJSON(raw)
@@ -781,7 +783,7 @@ func displayResource(data []byte) {
 		{"MIME", str(r, "mime")},
 		{"Size", bytesHuman(num(r, "size"))},
 		{"Encrypted", boolMark(boolean(r, "is_encrypted"))},
-		{"OCR status", colorizeStatus(str(r, "ocr_status"))},
+		{"Text status", colorizeStatus(str(r, "ocr_status"))},
 		{"Thumbnail status", colorizeStatus(str(r, "thumb_status"))},
 		{"USN", str(r, "usn")},
 		{"Created", epochMS(num(r, "created_at"))},
@@ -817,7 +819,7 @@ func init() {
 	addPagingFlags(filesListCmd)
 	filesListCmd.Flags().String("mime", "", "Filter by exact MIME or a type/ prefix (e.g. image/)")
 	filesListCmd.Flags().String("note-id", "", "Only files linked to this note id")
-	filesListCmd.Flags().String("ocr-status", "", "Filter by OCR status")
+	filesListCmd.Flags().String("ocr-status", "", "Filter by text status: pending|processing|done|failed|skipped_encrypted|skipped_unsupported")
 	filesListCmd.Flags().String("updated-since", "", "Only files updated at or after this epoch-ms")
 	filesListCmd.Flags().Bool("encrypted", false, "Filter by encryption state (use =true/=false)")
 

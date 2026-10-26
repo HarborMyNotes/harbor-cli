@@ -18,8 +18,11 @@ var searchCmd = &cobra.Command{
 	Short:   "Search notes, attachment text, and attachment file names",
 	GroupID: groupContent,
 	Args:    cobra.MinimumNArgs(1),
-	Long: `Search notes, the text inside attachments (OCR and transcripts), and
-attachment file names, with an Evernote-style query grammar.
+	Long: `Search notes, the words inside attachments, and attachment file names,
+with an Evernote-style query grammar. The words inside an attachment are the
+text read from images and PDFs, the contents of Word, Excel and PowerPoint
+files (.docx, .xlsx, .pptx) and text files (.txt, .md, .csv), and recording
+transcripts and summaries.
 
 Query operators (combine freely; multiple bare words AND together):
   tag:VALUE          note carries this tag (tag:"two words" for spaces)

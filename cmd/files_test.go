@@ -158,6 +158,40 @@ func TestDisplayFiles(t *testing.T) {
 	if !strings.Contains(out, "2") { // notes count
 		t.Errorf("notes count missing:\n%s", out)
 	}
+	// The status column covers Office and text files too, so it is not "OCR".
+	if !strings.Contains(out, "TEXT") || strings.Contains(out, "OCR") {
+		t.Errorf("status column should be TEXT, not OCR:\n%s", out)
+	}
+}
+
+// TestDisplayResourceSaysTextStatus checks a single file's details label its
+// ocr_status as the text status, not OCR.
+func TestDisplayResourceSaysTextStatus(t *testing.T) {
+	data := []byte(`{"hash":"e3b0c44298fc","filename":"Budget.xlsx","mime":"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet","size":2048,"ocr_status":"done","thumb_status":"skipped_unsupported","usn":7,"created_at":1750000000000}`)
+	out := captureStdout(t, func() { displayResource(data) })
+	if !strings.Contains(out, "Text status") || !strings.Contains(out, "done") {
+		t.Errorf("details should show the text status:\n%s", out)
+	}
+	if strings.Contains(out, "OCR") {
+		t.Errorf("details should not say OCR:\n%s", out)
+	}
+}
+
+// TestFilesListOCRStatusFlagHelp checks --ocr-status keeps its name but is
+// described as the text status, with the values the server accepts.
+func TestFilesListOCRStatusFlagHelp(t *testing.T) {
+	f := filesListCmd.Flags().Lookup("ocr-status")
+	if f == nil {
+		t.Fatal("--ocr-status flag is missing")
+	}
+	if !strings.HasPrefix(f.Usage, "Filter by text status: ") {
+		t.Errorf("--ocr-status usage = %q", f.Usage)
+	}
+	values := strings.Split(strings.TrimPrefix(f.Usage, "Filter by text status: "), "|")
+	want := []string{"pending", "processing", "done", "failed", "skipped_encrypted", "skipped_unsupported"}
+	if strings.Join(values, "|") != strings.Join(want, "|") {
+		t.Errorf("--ocr-status values = %v, want %v", values, want)
+	}
 }
 
 func TestMapFileError(t *testing.T) {

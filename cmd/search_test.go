@@ -160,6 +160,59 @@ func TestSearchHelpMentionsFileNames(t *testing.T) {
 	}
 }
 
+// TestSearchHelpListsFileKinds checks the search help and the skill's Search
+// section name every kind of file whose words search reads, not only OCR and
+// transcripts, while the coordinates help stays about OCR word boxes.
+func TestSearchHelpListsFileKinds(t *testing.T) {
+	ref, err := skillFS.ReadFile(skillSourceDir + "/reference.md")
+	if err != nil {
+		t.Fatalf("embedded reference.md unreadable: %v", err)
+	}
+	// Join the text onto one line so a phrase that wraps still matches.
+	flat := func(s string) string { return strings.Join(strings.Fields(s), " ") }
+	help := flat(searchCmd.Long)
+	section := string(ref)
+	if i := strings.Index(section, "## Search"); i >= 0 {
+		section = section[i:]
+		if j := strings.Index(section, "\n---"); j >= 0 {
+			section = section[:j]
+		}
+	} else {
+		t.Fatal("reference.md has no Search section")
+	}
+	section = flat(section)
+
+	for _, want := range []string{
+		"text read from images and PDFs",
+		"Word, Excel and PowerPoint files (.docx, .xlsx, .pptx)",
+		"text files (.txt, .md, .csv)",
+		"recording transcripts and summaries",
+	} {
+		if !strings.Contains(help, want) {
+			t.Errorf("search --help should say %q:\n%s", want, searchCmd.Long)
+		}
+		if !strings.Contains(section, want) {
+			t.Errorf("reference.md Search section should say %q", want)
+		}
+	}
+	if !strings.Contains(section, "a Word, Excel, PowerPoint or text file, or a recording's transcript or summary") {
+		t.Errorf(`reference.md should say a "match": "text" hit covers Office and text files and recordings`)
+	}
+	for _, old := range []string{"(OCR and transcripts)", "(OCR, transcripts)", "(OCR, transcript)"} {
+		if strings.Contains(help, old) || strings.Contains(section, old) {
+			t.Errorf("old wording %q is still present", old)
+		}
+	}
+
+	if searchCoordinatesCmd.Short != "OCR highlight coordinates for an attachment (best paired with --json)" ||
+		!strings.Contains(searchCoordinatesCmd.Long, "bounding boxes of matched OCR words") {
+		t.Errorf("search coordinates help should still describe OCR word boxes: %q / %q", searchCoordinatesCmd.Short, searchCoordinatesCmd.Long)
+	}
+	if !strings.Contains(section, "returns OCR highlight boxes") {
+		t.Errorf("reference.md should still say search coordinates returns OCR highlight boxes")
+	}
+}
+
 func TestDisplayCoordinates(t *testing.T) {
 	data := []byte(`{"data":{"resource_id":"0f9c","mime":"application/pdf","page_count":3,"terms":["budget"],"truncated":false,"pages":[
 		{"page":0,"page_width":1700,"page_height":2200,"matches":[{"term":"budget","word":"Budget","word_index":42,"box":{"x":510,"y":880,"w":120,"h":28},"confidence":0.98}]}

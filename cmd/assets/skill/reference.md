@@ -197,8 +197,11 @@ Hierarchical (nested). A tag's parent is set with `--parent` (or `--top-level`).
 
 `harbor search '<query>' [--json]`
 
-Searches notes, the text inside attachments (OCR, transcripts), and attachment
-file names.
+Searches notes, the words inside attachments, and attachment file names. The
+words inside an attachment are the text read from images and PDFs, the contents
+of Word, Excel and PowerPoint files (.docx, .xlsx, .pptx) and text files (.txt,
+.md, .csv), and recording transcripts and summaries. An old .doc, .xls or .ppt
+file is not read, so only its name is searchable.
 
 | Operator | Meaning |
 |---|---|
@@ -217,10 +220,12 @@ file names.
 A plain word or phrase also matches attachment file names, extension included,
 as a "contains" match: `harbor search xlsx` finds spreadsheets. In `--json`, an
 attachment hit carries `"match": "name"` when only its file name matched, or
-`"match": "text"` when it was found through its indexed text (OCR, transcript)
-or, for a query of only operators, by the filters alone. A name hit has an empty
-`snippet`, no `highlights`, and `score` 0. An attachment hit with no `match`
-field comes from an older server and is a text hit.
+`"match": "text"` when it was found through the words inside it (text read from
+an image or PDF, the contents of a Word, Excel, PowerPoint or text file, or a
+recording's transcript or summary) or, for a query of only operators, by the
+filters alone. A name hit has an empty `snippet`, no `highlights`, and `score`
+0. An attachment hit with no `match` field comes from an older server and is a
+text hit.
 
 Flags: `--notebook`, `--types note,attachment`, `--no-snippet`, paging.
 

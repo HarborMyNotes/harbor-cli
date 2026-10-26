@@ -40,7 +40,8 @@ func (c *Client) CheckFile(hash string, size int64) ([]byte, error) {
 // When the caller does not pin a mimeType, we detect one from the file and send
 // it as the `mime` form field. This matters: the server records that MIME, and
 // without it the upload would be stored as application/octet-stream — which
-// skips the thumbnail and OCR pipelines (those run only for image/* and PDFs).
+// skips thumbnails and OCR for images and PDFs, since the server picks those by
+// MIME.
 // The `mime` field is also necessary because Go's multipart CreateFormFile
 // always stamps the file part's Content-Type as application/octet-stream.
 func (c *Client) UploadFile(path, mimeType, filename string, isEncrypted bool) ([]byte, error) {
