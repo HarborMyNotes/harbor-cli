@@ -10,7 +10,7 @@ description: >-
   assistant.
 ---
 
-<!-- Harbor agent skill • v1.8.1 -->
+<!-- Harbor agent skill • v1.9.0 -->
 <!-- Copyright (c) 2026 Cloudmanic Labs, LLC. All rights reserved. Date: 2026-06-22 -->
 
 # Harbor CLI — managing notes from the terminal
@@ -228,6 +228,10 @@ harbor notes update "$NOTE_ID" --notebook "$ARCHIVE_NB" --json   # move to anoth
 > or **collapsed outline sections** (`data-collapsed`), **round-trip via HTML**
 > (fetch `--format html`, edit, update `--format html`) so you don't silently drop
 > them. See `formatting.md`.
+>
+> **A picture's size goes the same way.** A Markdown read turns each picture into
+> a plain-text label, so a Markdown round-trip loses the picture and the size it
+> was dragged to (`width`). Round-trip via HTML to keep both.
 >
 > **The fold is the one the CLI warns you about.** Markdown has nowhere to store a
 > fold, so a Markdown update un-folds the whole note. When that is about to happen

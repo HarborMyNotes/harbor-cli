@@ -253,8 +253,10 @@ HTML
 | `resource` | a `sha256:<hash>` reference to an uploaded blob (for content-addressed types) |
 | `src` | an external URL (for `video`/`bookmark`) |
 | `title` | optional caption / accessible label |
-| `width`, `height` | optional dimensions |
+| `width` | a picture's shown width in whole pixels — see *Picture size* below |
+| `height` | not used — don't set it |
 | `align` | optional alignment |
+| `data-view` | optional "View as" mode; leave it off for the default. PDF: `all` (every page) or `title` (collapsed file card). Picture: `title` (collapsed filename bar). Video: `title` (header strip only). |
 
 A plain `<img src="https://…">` with an `http(s)` URL is also tolerated (good for
 images that already live on the web):
@@ -274,6 +276,32 @@ Here's the latest diagram:
 …and the notes below it.
 MD
 ```
+
+### Picture size (`width`)
+
+In Harbor, a person can drag a picture's corner to make it bigger or smaller.
+The size is saved as `width` on the picture's embed:
+
+```html
+<harbor-embed type="image" resource="sha256:${HASH}" width="420"></harbor-embed>
+```
+
+- **`width` is the shown width in pixels.** A whole number from 1 to 99999,
+  digits only, no unit: `width="420"`.
+- **No `width` means natural size.** Remove the attribute to put a picture back
+  to its natural size. Don't write a `width` equal to the natural width; leave
+  it off instead. `harbor files list --note-id "$NOTE_ID" --json` gives each
+  picture's natural `width` and `height`.
+- **Never wider than the note.** A picture is never shown wider than the note,
+  whatever `width` says.
+- **The shape is always kept.** The height follows the width, so don't set
+  `height` on a picture.
+- **The server strips any other value.** `0`, `050`, `50%`, `420px` and `123456`
+  are all removed when the note is saved. The picture stays, at natural size.
+- **A Markdown read loses it.** A Markdown write keeps the `width` on an inline
+  `<harbor-embed>`. But a Markdown read turns the picture into a plain-text
+  label, so writing that text back loses the picture and its size. To edit a
+  note with pictures, read *and* write with `--format html`.
 
 ---
 
@@ -354,6 +382,7 @@ harbor notes append "$NOTE_ID" --format html --content '<p style="color:#1e8e3e;
 | Font weight/size/family | `style="font-…"` | ✅ |
 | Semantic classes | `class="…"` | ✅ |
 | Embedded uploaded file/image | `<harbor-embed type=… resource="sha256:…">` | ✅ |
+| Picture size | `width="420"` on `<harbor-embed type="image">` (whole pixels, 1–99999) | ✅ read back with `--format html` |
 | External image | `<img src="https://…">` | ✅ |
 | Scripts / JS / event handlers | `<script>`, `onclick=…`, `javascript:` URLs | ❌ stripped |
 | Arbitrary CSS (`position`, `margin`, …) | inline `style` outside the allowlist | ❌ stripped |

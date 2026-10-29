@@ -492,3 +492,57 @@ func TestSkillVersionMatchesTheShippedMarker(t *testing.T) {
 		t.Errorf("SKILL.md's marker says v%s but skillVersion is %s — bump both together", marker[1], skillVersion)
 	}
 }
+
+// TestGuideDescribesPictureWidth checks the bundled guide says what `width` on a
+// picture means, never offers `height` for a picture, and tells the reader to
+// round-trip through HTML so a picture's size is kept.
+func TestGuideDescribesPictureWidth(t *testing.T) {
+	// Join the text onto one line so a phrase that wraps still matches.
+	flat := func(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+	formatting, err := skillFS.ReadFile(skillSourceDir + "/formatting.md")
+	if err != nil {
+		t.Fatalf("embedded formatting.md unreadable: %v", err)
+	}
+	guide := flat(string(formatting))
+	for _, want := range []string{
+		"### Picture size (`width`)",
+		`width="420"`,
+		"A whole number from 1 to 99999, digits only, no unit",
+		"No `width` means natural size.",
+		"Don't write a `width` equal to the natural width",
+		`harbor files list --note-id "$NOTE_ID" --json`,
+		"A picture is never shown wider than the note",
+		"don't set `height` on a picture",
+		"`0`, `050`, `50%`, `420px` and `123456` are all removed",
+		"A Markdown write keeps the `width`",
+		"read *and* write with `--format html`",
+	} {
+		if !strings.Contains(guide, want) {
+			t.Errorf("formatting.md should say %q", want)
+		}
+	}
+	if !strings.Contains(guide, "| `height` | not used — don't set it |") {
+		t.Error("formatting.md's attribute table should say `height` is not used")
+	}
+
+	// The advice sits in a blockquote; drop the `>` markers so its lines join up.
+	skill := flat(regexp.MustCompile(`(?m)^>`).ReplaceAllString(string(embeddedSkillMD(t)), ""))
+	if !strings.Contains(skill, "a Markdown round-trip loses the picture and the size it was dragged to (`width`). Round-trip via HTML to keep both.") {
+		t.Error("SKILL.md should say to round-trip through HTML to keep a picture's size")
+	}
+
+	// No example anywhere in the guide may give a picture a height.
+	embedTag := regexp.MustCompile(`<harbor-embed\b[^>]*>`)
+	for _, name := range []string{"SKILL.md", "formatting.md", "reference.md"} {
+		doc, err := skillFS.ReadFile(skillSourceDir + "/" + name)
+		if err != nil {
+			t.Fatalf("embedded %s unreadable: %v", name, err)
+		}
+		for _, tag := range embedTag.FindAllString(string(doc), -1) {
+			if strings.Contains(tag, `type="image"`) && strings.Contains(tag, "height=") {
+				t.Errorf("%s gives a picture a height: %s", name, tag)
+			}
+		}
+	}
+}
