@@ -501,7 +501,8 @@ Account preferences (NOT synced; last-write-wins). `set` is a partial update.
 `--editor-font-size`, `--editor-font-family sans\|serif\|mono`,
 `--editor-autosave`, `--editor-spellcheck`, `--editor-show-word-count`,
 `--editor-show-list-guides`, `--editor-hide-checked` (hide ticked checklist
-items in the note editor). Turn a switch off with `=false`
+items in the note editor; they stay in the note, and `notes get` and exports
+still return them). Turn a switch off with `=false`
 (e.g. `--editor-show-list-guides=false`).
 
 ---
