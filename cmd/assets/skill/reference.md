@@ -500,7 +500,8 @@ Account preferences (NOT synced; last-write-wins). `set` is a partial update.
 `--email-product-news`, `--email-reminders`, `--push-reminders`,
 `--editor-font-size`, `--editor-font-family sans\|serif\|mono`,
 `--editor-autosave`, `--editor-spellcheck`, `--editor-show-word-count`,
-`--editor-show-list-guides`. Turn a switch off with `=false`
+`--editor-show-list-guides`, `--editor-hide-checked` (hide ticked checklist
+items in the note editor). Turn a switch off with `=false`
 (e.g. `--editor-show-list-guides=false`).
 
 ---

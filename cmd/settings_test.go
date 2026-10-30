@@ -27,6 +27,7 @@ func settingsTestCmd() *cobra.Command {
 	c.Flags().Int("editor-autosave", 0, "")
 	c.Flags().Bool("editor-show-word-count", false, "")
 	c.Flags().Bool("editor-show-list-guides", false, "")
+	c.Flags().Bool("editor-hide-checked", false, "")
 	c.Flags().Bool("email-reminders", false, "")
 	c.Flags().Bool("email-product-news", false, "")
 	c.Flags().Bool("push-reminders", false, "")
@@ -73,7 +74,7 @@ func TestSettingsBuildSetBodyPartial(t *testing.T) {
 	if len(editor) != 1 || editor["font_size"] != 16+2 {
 		t.Errorf("editor_prefs = %v, want only {font_size:18}", editor)
 	}
-	for _, k := range []string{"font_family", "spellcheck", "autosave_seconds", "show_word_count", "show_list_guides"} {
+	for _, k := range []string{"font_family", "spellcheck", "autosave_seconds", "show_word_count", "show_list_guides", "hide_checked"} {
 		if _, ok := editor[k]; ok {
 			t.Errorf("editor_prefs.%s should be absent, got %v", k, editor)
 		}
@@ -220,6 +221,77 @@ func TestDisplaySettingsListGuides(t *testing.T) {
 			}
 			if !strings.Contains(line, tc.mark) {
 				t.Errorf("row = %q, want mark %q", line, tc.mark)
+			}
+		})
+	}
+}
+
+// TestSettingsSetHideCheckedWireBody runs the real 'settings set' against a mock
+// API and pins the exact PUT body. The server rejects anything but a JSON
+// boolean for this key, so the body must carry true/false, never a string.
+func TestSettingsSetHideCheckedWireBody(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"bare flag turns it on", []string{"--editor-hide-checked"}, `{"editor_prefs":{"hide_checked":true}}`},
+		{"explicit true", []string{"--editor-hide-checked=true"}, `{"editor_prefs":{"hide_checked":true}}`},
+		{"explicit false sends false", []string{"--editor-hide-checked=false"}, `{"editor_prefs":{"hide_checked":false}}`},
+		{"not passed sends nothing for it", []string{"--theme", "dark"}, `{"theme":"dark"}`},
+		{"other editor pref leaves it out", []string{"--editor-show-list-guides"}, `{"editor_prefs":{"show_list_guides":true}}`},
+		{"sent beside another editor pref", []string{"--editor-hide-checked", "--editor-show-word-count=false"}, `{"editor_prefs":{"hide_checked":true,"show_word_count":false}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newAPIMock(t, map[string]mockReply{
+				"PUT /api/v1/settings": {Status: 200, Body: `{"data":{"editor_prefs":{}}}`},
+			})
+			args := append([]string{"settings", "set"}, tc.args...)
+			if _, err := runCLI(t, m, args...); err != nil {
+				t.Fatalf("settings set: %v", err)
+			}
+			if got := m.rawBodyOf(t, "PUT /api/v1/settings"); got != tc.want {
+				t.Errorf("body = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDisplaySettingsHideChecked verifies the "Hide checked items" row follows
+// the stored value and sits right after "Show list guide lines".
+func TestDisplaySettingsHideChecked(t *testing.T) {
+	cases := []struct {
+		name   string
+		editor string
+		mark   string
+	}{
+		{"on", `{"hide_checked":true}`, "✓"},
+		{"off", `{"hide_checked":false}`, "·"},
+		{"missing reads as off", `{}`, "·"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := []byte(`{"data":{"theme":"system","editor_prefs":` + tc.editor + `}}`)
+			out := captureStdout(t, func() { displaySettings(data) })
+			lines := strings.Split(out, "\n")
+			row, guides := -1, -1
+			for i, l := range lines {
+				if strings.Contains(l, "Hide checked items") {
+					row = i
+				}
+				if strings.Contains(l, "Show list guide lines") {
+					guides = i
+				}
+			}
+			if row == -1 {
+				t.Fatalf("no \"Hide checked items\" row:\n%s", out)
+			}
+			if guides == -1 || row != guides+1 {
+				t.Errorf("row %d should come right after \"Show list guide lines\" (row %d):\n%s", row, guides, out)
+			}
+			if !strings.Contains(lines[row], tc.mark) {
+				t.Errorf("row = %q, want mark %q", lines[row], tc.mark)
 			}
 		})
 	}

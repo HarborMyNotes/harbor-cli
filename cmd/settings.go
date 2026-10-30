@@ -71,6 +71,7 @@ The security-email preference cannot be disabled, so there is no flag for it.`,
 	Example: `  harbor settings set --theme dark
   harbor settings set --editor-font-size 18 --editor-show-word-count
   harbor settings set --editor-show-list-guides=false
+  harbor settings set --editor-hide-checked
   harbor settings set --default-notebook 5b1f2c9a-... --default-sort title
   harbor settings set --clear-default-notebook --email-product-news=false`,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -134,6 +135,7 @@ func settingsBuildSetBody(cmd *cobra.Command) map[string]any {
 	addIntIfChanged(cmd, editor, "editor-autosave", "autosave_seconds")
 	addBoolIfChanged(cmd, editor, "editor-show-word-count", "show_word_count")
 	addBoolIfChanged(cmd, editor, "editor-show-list-guides", "show_list_guides")
+	addBoolIfChanged(cmd, editor, "editor-hide-checked", "hide_checked")
 	if len(editor) > 0 {
 		body["editor_prefs"] = editor
 	}
@@ -183,6 +185,7 @@ func displaySettings(data []byte) {
 			[2]string{"  Autosave (seconds)", str(e, "autosave_seconds")},
 			[2]string{"  Show word count", boolMark(boolean(e, "show_word_count"))},
 			[2]string{"  Show list guide lines", boolMark(boolean(e, "show_list_guides"))},
+			[2]string{"  Hide checked items", boolMark(boolean(e, "hide_checked"))},
 		)
 	}
 
@@ -215,6 +218,7 @@ func init() {
 	settingsSetCmd.Flags().Int("editor-autosave", 0, "Editor autosave interval in seconds (1–60)")
 	settingsSetCmd.Flags().Bool("editor-show-word-count", false, "Show the editor word count")
 	settingsSetCmd.Flags().Bool("editor-show-list-guides", false, "Show list guide lines beside nested list items")
+	settingsSetCmd.Flags().Bool("editor-hide-checked", false, "Hide ticked checklist items in the note editor")
 
 	// set — notification preferences (email_security is omitted on purpose).
 	settingsSetCmd.Flags().Bool("email-reminders", false, "Email me about reminders")
