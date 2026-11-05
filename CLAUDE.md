@@ -189,7 +189,8 @@ Say the API gains `GET /api/v1/widgets` and `POST /api/v1/widgets`.
        return c.doPost("/widgets", body)
    }
    ```
-   Use `doGet/doPost/doPatch/doPut/doDelete`, `doMultipart` (uploads), or
+   Use `doGet/doPost/doPatch/doPut/doDelete`, `doMultipart` (a small
+   multipart form; file uploads go straight to storage, see `client/files.go`), or
    `doGetRaw` (streamed downloads). Need the HTTP status (e.g. 201-vs-200)?
    mirror `AttachTag` in `client/note_tags.go` (`requestWithStatus`).
 

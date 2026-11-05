@@ -40,16 +40,16 @@ type Client struct {
 	HTTPClient *http.Client
 
 	// StorageHTTPClient performs direct-to-storage transfers: the presigned part
-	// PUTs of a large import, and presigned downloads (FetchURL). It is separate
-	// from HTTPClient because that one's 30-second timeout is sized for small
-	// JSON calls and a single 64 MiB chunk on an ordinary connection takes longer
-	// than that. It carries no overall timeout: a part upload is bounded by the
-	// request context (Ctrl-C) and by the presigned URL's own expiry, and a
-	// download by the stall timeout.
+	// PUTs of a large import, presigned file uploads, and presigned downloads
+	// (FetchURL). It is separate from HTTPClient because that one's 30-second
+	// timeout is sized for small JSON calls and a big file on an ordinary
+	// connection takes longer than that. It carries no overall timeout: a part
+	// upload is bounded by the request context (Ctrl-C) and by the presigned URL's
+	// own expiry, and a file upload or a download by the stall timeout.
 	StorageHTTPClient *http.Client
 
-	// StallTimeout is how long a streamed download may wait for its response or
-	// its next bytes before it is given up. Zero means one minute.
+	// StallTimeout is how long a streamed transfer may go without moving a byte
+	// before it is given up. Zero means one minute.
 	StallTimeout time.Duration
 
 	// Verbose, when true, makes callers surface request ids / HTTP status.
@@ -200,7 +200,8 @@ func (c *Client) doJSON(method, path string, body any) ([]byte, error) {
 
 // doMultipart performs a multipart/form-data POST: extra text fields plus one
 // file part. The whole body is buffered so the request can be safely retried
-// after a transparent token refresh. Used by file upload.
+// after a transparent token refresh, which is why it only carries an empty file
+// (see uploadEmpty). Anything with real bytes goes straight to storage.
 func (c *Client) doMultipart(path string, fields map[string]string, fileField, filename string, fileContent io.Reader) ([]byte, error) {
 	full, err := c.buildURL(path, nil)
 	if err != nil {
@@ -327,24 +328,32 @@ func (c *Client) rawRequest(method, fullURL string, allowRefresh bool) (*http.Re
 	return nil, apiErr
 }
 
-// defaultStallTimeout is how long a streamed download may receive nothing before
-// it is given up. It limits a stall, not a size: a big file on a slow line keeps
-// going while bytes keep arriving.
+// defaultStallTimeout is how long a streamed transfer may move nothing before it
+// is given up. It limits a stall, not a size: a big file on a slow line keeps
+// going while bytes keep moving.
 const defaultStallTimeout = 60 * time.Second
 
-// StallError is a streamed download that received nothing for the stall
-// timeout. It reports itself as a network timeout, so the CLI gives it the
-// network exit code: the same command can work on a better connection.
+// StallError is a streamed transfer that moved nothing for the stall timeout.
+// It reports itself as a network timeout, so the CLI gives it the network exit
+// code: the same command can work on a better connection.
 type StallError struct {
 	After time.Duration
+
+	// Upload is true when the stalled request was sending a body, so the
+	// message does not talk about data arriving.
+	Upload bool
 }
 
-// Error says how long the download waited.
+// Error says how long the transfer waited.
 func (e *StallError) Error() string {
-	if e.After >= time.Second && e.After%time.Second == 0 {
-		return fmt.Sprintf("no data arrived for %d seconds", int(e.After/time.Second))
+	what := "no data arrived for "
+	if e.Upload {
+		what = "no data moved for "
 	}
-	return "no data arrived for " + e.After.String()
+	if e.After >= time.Second && e.After%time.Second == 0 {
+		return fmt.Sprintf("%s%d seconds", what, int(e.After/time.Second))
+	}
+	return what + e.After.String()
 }
 
 // Timeout reports true, which makes StallError a net.Error timeout.
@@ -362,20 +371,37 @@ func (c *Client) streamClient() *http.Client {
 	return &hc
 }
 
-// sendStreaming sends req on hc and gives up when the response, or the next
-// bytes of its body, take longer than the stall timeout. Only time spent waiting
-// inside Read counts, so a slow reader (a pipe into a pager) never trips it.
-// The caller must close the body.
+// sendStreaming sends req on hc and gives up when the transfer stops moving for
+// the stall timeout. Only time spent waiting inside Read counts, so a slow reader
+// (a pipe into a pager) never trips it.
+//
+// A request body (an upload) counts too: every read the transport makes from it
+// restarts the timer, and the last one gives the server the full stall timeout to
+// answer. When the network stops taking bytes the transport stops reading, and
+// the timer fires. The caller must close the response body.
 func (c *Client) sendStreaming(hc *http.Client, req *http.Request) (*http.Response, error) {
 	after := c.StallTimeout
 	if after <= 0 {
 		after = defaultStallTimeout
 	}
-	stall := &StallError{After: after}
+	hasBody := req.Body != nil && req.Body != http.NoBody
+	stall := &StallError{After: after, Upload: hasBody}
 	ctx, cancel := context.WithCancelCause(req.Context())
 	timer := time.AfterFunc(after, func() { cancel(stall) })
 
-	resp, err := hc.Do(req.WithContext(ctx))
+	sent := req.WithContext(ctx)
+	var upload *stallUpload
+	if hasBody {
+		upload = &stallUpload{body: sent.Body, timer: timer, after: after}
+		sent.Body = upload
+		// A rewound body from GetBody would bypass the timer. Without it the
+		// transport cannot resend on its own; the caller retries instead.
+		sent.GetBody = nil
+	}
+	resp, err := hc.Do(sent)
+	if upload != nil {
+		upload.finish()
+	}
 	timer.Stop()
 	if err != nil {
 		cancel(nil)
@@ -386,6 +412,43 @@ func (c *Client) sendStreaming(hc *http.Client, req *http.Request) (*http.Respon
 	}
 	resp.Body = &stallBody{body: resp.Body, ctx: ctx, cancel: cancel, timer: timer, after: after, stall: stall}
 	return resp, nil
+}
+
+// stallUpload is a request body whose every read restarts the stall timer.
+//
+// The transport can still read from it after the response has arrived (a
+// server may answer before the whole body is sent). finish stops that from
+// re-arming a timer the response body now owns, which is why the reset and the
+// flag share a lock.
+type stallUpload struct {
+	body  io.ReadCloser
+	timer *time.Timer
+	after time.Duration
+
+	mu       sync.Mutex
+	finished bool
+}
+
+// Read passes the read through and restarts the timer, because the transport
+// only reads when the network has taken the bytes it already had.
+func (u *stallUpload) Read(p []byte) (int, error) {
+	n, err := u.body.Read(p)
+	u.mu.Lock()
+	if !u.finished {
+		u.timer.Reset(u.after)
+	}
+	u.mu.Unlock()
+	return n, err
+}
+
+// Close closes the underlying body.
+func (u *stallUpload) Close() error { return u.body.Close() }
+
+// finish stops later reads from touching the timer.
+func (u *stallUpload) finish() {
+	u.mu.Lock()
+	u.finished = true
+	u.mu.Unlock()
 }
 
 // stallBody is a response body whose every Read must make progress within the

@@ -136,9 +136,10 @@ func TestDoGetSetsHeadersAndQuery(t *testing.T) {
 // The three request-building sites in this package are covered: requestWithStatus
 // (every doGet/doPost/doPatch/doPut/doDelete/doJSON/doMultipart), rawRequest
 // (doGetRaw and the file downloads), and rawPostWithRefresh (the ENEX export
-// stream). The remaining two, FetchURL and putImportPart, hit presigned
-// non-Harbor URLs and must NOT carry the header — that is pinned by
-// TestFetchURLSkipsHarborHeaders and TestUploadImportPartSkipsHarborHeaders.
+// stream). The remaining three, FetchURL, putImportPart and putPresigned, hit
+// presigned non-Harbor URLs and must NOT carry the header — that is pinned by
+// TestFetchURLSkipsHarborHeaders, TestUploadImportPartSkipsHarborHeaders and
+// TestUploadFileUsesThePresignedFlow.
 func TestPlatformHeaderOnEveryTransport(t *testing.T) {
 	// enex is the streaming ENEX export body; it is not a JSON envelope, so it
 	// stands in for any raw response the client streams back.
@@ -293,11 +294,12 @@ func TestPlatformHeaderSurvivesRefreshRetry(t *testing.T) {
 // exemptRequestBuilders is the deliberate, documented exception list — adding to
 // it should be a conscious decision made in review, which is the point.
 func TestEveryRequestBuilderSetsCommonHeaders(t *testing.T) {
-	// Both exemptions target a presigned storage URL whose credentials live in
+	// Every exemption targets a presigned storage URL whose credentials live in
 	// the query string — a download for FetchURL, an import chunk for
-	// putImportPart. Neither is a Harbor API endpoint, so they must send neither
-	// the bearer token nor the platform header.
-	exemptRequestBuilders := map[string]bool{"FetchURL": true, "putImportPart": true}
+	// putImportPart, a file upload for putPresigned. None is a Harbor API
+	// endpoint, so they must send neither the bearer token nor the platform
+	// header.
+	exemptRequestBuilders := map[string]bool{"FetchURL": true, "putImportPart": true, "putPresigned": true}
 
 	fset := token.NewFileSet()
 
@@ -733,9 +735,13 @@ func TestStreamedDownloadIgnoresASlowReader(t *testing.T) {
 	}
 }
 
-// The stall message names whole seconds the way a person would say them.
+// The stall message names whole seconds the way a person would say them, and
+// an upload's does not talk about data arriving.
 func TestStallErrorMessage(t *testing.T) {
 	if got, want := (&StallError{After: defaultStallTimeout}).Error(), "no data arrived for 60 seconds"; got != want {
 		t.Errorf("Error() = %q, want %q", got, want)
+	}
+	if got, want := (&StallError{After: defaultStallTimeout, Upload: true}).Error(), "no data moved for 60 seconds"; got != want {
+		t.Errorf("upload Error() = %q, want %q", got, want)
 	}
 }

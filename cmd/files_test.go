@@ -5,6 +5,9 @@ package cmd
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/HarborMyNotes/harbor-cli/client"
 	"github.com/HarborMyNotes/harbor-cli/crypto"
@@ -329,55 +333,50 @@ func TestFilesKeyRefusals(t *testing.T) {
 	}
 }
 
-// TestUploadEncryptedSendsEnvelopeNotPlaintext is the regression guard for the
-// bug this feature replaced: an upload that stamped the resource is_encrypted
-// while putting the file on the server in the clear. It asserts against the
-// actual multipart body on the wire, so reverting to a plaintext upload fails
-// here even though every other test would still pass.
+// TestUploadEncryptedSendsEnvelopeNotPlaintext is the regression guard for an
+// upload that stamps the resource is_encrypted while putting the file on the
+// server in the clear. It asserts against the bytes actually sent to storage,
+// so reverting to a plaintext upload fails here even though every other test
+// would still pass.
 func TestUploadEncryptedSendsEnvelopeNotPlaintext(t *testing.T) {
 	const marker = "ATTACHMENT-PLAINTEXT-MARKER-12345"
-
-	var body []byte
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ = io.ReadAll(r.Body)
-		if r.URL.Path != "/files/upload" {
-			t.Errorf("path = %s", r.URL.Path)
-		}
-		_, _ = w.Write([]byte(`{"hash":"abc","filename":"secret.txt","is_encrypted":true}`))
-	}))
-	defer srv.Close()
+	m := uploadMock(t, 200, `{}`)
 
 	path := filepath.Join(t.TempDir(), "secret.txt")
 	if err := os.WriteFile(path, []byte(marker), 0644); err != nil {
 		t.Fatal(err)
 	}
 	key := newMasterKey(t)
-	if _, err := uploadEncrypted(client.NewClient(srv.URL, "at_test"), key, path, "", ""); err != nil {
+	if _, err := uploadEncrypted(context.Background(), client.NewClient(m.baseURL(), "at_test"), key, path, "", ""); err != nil {
 		t.Fatalf("uploadEncrypted: %v", err)
 	}
 
-	if bytes.Contains(body, []byte(marker)) {
-		t.Fatal("the plaintext reached the server — the bytes were not encrypted before upload")
+	sent := []byte(m.rawBodyOf(t, "PUT /storage/blob"))
+	if bytes.Contains(sent, []byte(marker)) {
+		t.Fatal("the plaintext reached storage — the bytes were not encrypted before upload")
 	}
-	if !bytes.Contains(body, []byte("HRBC2")) {
-		t.Fatal("no HRBC2 envelope in the multipart body")
+	if !bytes.HasPrefix(sent, []byte("HRBC2")) {
+		t.Fatal("the bytes sent to storage are not an HRBC2 envelope")
 	}
-	// Filename and MIME come from the ORIGINAL file, not from the ciphertext.
-	for _, want := range []string{"secret.txt", "text/plain", "is_encrypted"} {
-		if !bytes.Contains(body, []byte(want)) {
-			t.Errorf("multipart body missing %q", want)
-		}
-	}
-
 	// And what was sent must decrypt back to the original file.
-	start := bytes.Index(body, []byte("HRBC2"))
-	sealed := body[start : start+crypto.BinaryEnvelopeMinBytes+len(marker)]
-	got, err := crypto.OpenBytes(key, sealed)
+	got, err := crypto.OpenBytes(key, sent)
 	if err != nil {
 		t.Fatalf("the uploaded envelope does not decrypt: %v", err)
 	}
 	if string(got) != marker {
 		t.Fatalf("decrypted = %q, want %q", got, marker)
+	}
+
+	// The content address covers the ciphertext, and the record is marked
+	// encrypted. Filename and MIME come from the ORIGINAL file.
+	sum := sha256.Sum256(sent)
+	presign := m.bodyOf(t, "POST /api/v1/files/presign-upload")
+	if presign["hash"] != hex.EncodeToString(sum[:]) || presign["size"] != float64(len(sent)) || presign["is_encrypted"] != true {
+		t.Errorf("presign body = %v, want the envelope's hash and size, is_encrypted true", presign)
+	}
+	commit := m.bodyOf(t, "POST /api/v1/files/commit")
+	if commit["filename"] != "secret.txt" || commit["mime"] != "text/plain" || commit["is_encrypted"] != true {
+		t.Errorf("commit body = %v, want secret.txt, text/plain, is_encrypted true", commit)
 	}
 }
 
@@ -531,14 +530,29 @@ func TestFilesDownloadOutputStillWins(t *testing.T) {
 // ===========================================================================
 
 // uploadMock builds a stub API for the upload command: the root /client-flags
-// document plus a successful upload route. flags is the raw body served for the
-// policy probe, so a test can publish a cap, withhold one, or fail the probe.
+// document plus a successful presigned upload — check, presign, the PUT to the
+// link (served by the same mock), and commit. flags is the raw body served for
+// the policy probe, so a test can publish a cap, withhold one, or fail the
+// probe.
 func uploadMock(t *testing.T, flagsStatus int, flags string) *apiMock {
 	t.Helper()
-	return newAPIMock(t, map[string]mockReply{
-		"GET /client-flags":         {Status: flagsStatus, Body: flags},
-		"POST /api/v1/files/upload": {Status: 201, Body: `{"hash":"abc123","size":10,"mime":"text/plain"}`},
-	})
+	m := newAPIMock(t, nil)
+	m.routes = map[string]mockReply{
+		"GET /client-flags":        {Status: flagsStatus, Body: flags},
+		"POST /api/v1/files/check": {Status: 200, Body: `{"exists":false}`},
+		"POST /api/v1/files/presign-upload": {Status: 200, Body: fmt.Sprintf(
+			`{"upload_url":"%s/storage/blob?sig=1","method":"PUT","headers":{"Content-Type":"application/octet-stream"}}`,
+			m.srv.URL)},
+		"PUT /storage/blob":         {Status: 200},
+		"POST /api/v1/files/commit": {Status: 201, Body: `{"hash":"abc123","size":10,"mime":"text/plain"}`},
+	}
+	return m
+}
+
+// uploaded reports whether a run sent the file to storage and committed it.
+func uploaded(m *apiMock) bool {
+	calls := strings.Join(m.calls(), " ")
+	return strings.Contains(calls, "PUT /storage/blob") && strings.Contains(calls, "POST /api/v1/files/commit")
 }
 
 // writeSized writes a file of exactly n bytes and returns its path.
@@ -578,13 +592,13 @@ func TestFilesUploadRefusesOverCapBeforeStreaming(t *testing.T) {
 	if apiErr.Code != "file_too_large" {
 		t.Errorf("code = %q, want file_too_large (--json would report cli_error)", apiErr.Code)
 	}
-	want := `"big.bin" is 1.1 KB — the per-file limit is 1 KB`
+	want := `"big.bin" is 1.1 KB; the limit is 1 KB.`
 	if apiErr.Message != want {
 		t.Errorf("message = %q, want %q", apiErr.Message, want)
 	}
 
 	for _, call := range m.calls() {
-		if strings.HasPrefix(call, "POST") {
+		if call != "GET /client-flags" {
 			t.Errorf("refused upload still sent %s (calls: %v)", call, m.calls())
 		}
 	}
@@ -625,16 +639,105 @@ func TestUploadSizeCapIsZeroWhenUnknown(t *testing.T) {
 	}
 	for name, tc := range unknown {
 		t.Run(name, func(t *testing.T) {
-			if got := uploadSizeCap(serve(t, tc.status, tc.body)); got != 0 {
-				t.Errorf("uploadSizeCap = %d, want 0 — a guessed cap refuses files the server would take", got)
+			c := serve(t, tc.status, tc.body)
+			for _, encrypted := range []bool{false, true} {
+				if got := uploadSizeCap(c, encrypted); got != 0 {
+					t.Errorf("uploadSizeCap(encrypted=%v) = %d, want 0 — a guessed cap refuses files the server would take", encrypted, got)
+				}
 			}
 		})
 	}
 
 	// The positive control: a published cap really is read, so the zeros above
 	// are proving fail-open rather than a probe that never works at all.
-	if got := uploadSizeCap(serve(t, 200, `{"max_upload_bytes":104857600}`)); got != 104857600 {
+	if got := uploadSizeCap(serve(t, 200, `{"max_upload_bytes":104857600}`), false); got != 104857600 {
 		t.Errorf("uploadSizeCap = %d, want 104857600", got)
+	}
+}
+
+// The server publishes one cap for normal files and one for encrypted files.
+// Each upload is held to its own. A server that predates the two publishes only
+// max_upload_bytes, which then stands in for whichever one is missing.
+func TestUploadSizeCapReadsTheRightLimit(t *testing.T) {
+	serve := func(t *testing.T, body string) *client.Client {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(srv.Close)
+		return client.NewClient(srv.URL+"/api/v1", "")
+	}
+
+	cases := map[string]struct {
+		body                string
+		wantPlain, wantEncr int64
+	}{
+		"both published": {`{"max_upload_bytes":104857600,"max_upload_bytes_plain":524288000,"max_upload_bytes_encrypted":104857600}`,
+			524288000, 104857600},
+		"older server": {`{"max_upload_bytes":104857600}`, 104857600, 104857600},
+		"only plain":   {`{"max_upload_bytes":104857600,"max_upload_bytes_plain":524288000}`, 524288000, 104857600},
+		"only encrypted": {`{"max_upload_bytes":104857600,"max_upload_bytes_encrypted":52428800}`,
+			104857600, 52428800},
+		"new fields unusable": {`{"max_upload_bytes":104857600,"max_upload_bytes_plain":null,"max_upload_bytes_encrypted":"big"}`,
+			104857600, 104857600},
+		"new fields without the old one": {`{"max_upload_bytes_plain":524288000,"max_upload_bytes_encrypted":104857600}`,
+			524288000, 104857600},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := serve(t, tc.body)
+			if got := uploadSizeCap(c, false); got != tc.wantPlain {
+				t.Errorf("normal cap = %d, want %d", got, tc.wantPlain)
+			}
+			if got := uploadSizeCap(c, true); got != tc.wantEncr {
+				t.Errorf("encrypted cap = %d, want %d", got, tc.wantEncr)
+			}
+		})
+	}
+}
+
+// --encrypted is held to the encrypted cap, with the web's message for it,
+// while the same file uploads normally under the larger normal cap. The size
+// check runs before the key is needed, so no passphrase is set here.
+func TestFilesUploadHoldsEncryptedFilesToTheEncryptedCap(t *testing.T) {
+	flags := `{"max_upload_bytes":1050,"max_upload_bytes_plain":5000,"max_upload_bytes_encrypted":1050}`
+	path := writeSized(t, "big.bin", 1075)
+
+	m := uploadMock(t, 200, flags)
+	_, err := runCLI(t, m, "files", "upload", "--encrypted", path)
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "file_too_large" {
+		t.Fatalf("error = %v, want file_too_large", err)
+	}
+	if want := `"big.bin" is 1.1 KB; the limit for encrypted notes is 1 KB.`; apiErr.Message != want {
+		t.Errorf("message = %q, want %q", apiErr.Message, want)
+	}
+	if got := m.calls(); len(got) != 1 {
+		t.Errorf("refused upload still sent more than the probe: %v", got)
+	}
+
+	plain := uploadMock(t, 200, flags)
+	if _, err := runCLI(t, plain, "files", "upload", path); err != nil {
+		t.Fatalf("a normal upload under the normal cap failed: %v", err)
+	}
+	if !uploaded(plain) {
+		t.Errorf("normal upload was not sent: %v", plain.calls())
+	}
+}
+
+// A normal upload is held to the normal cap, even when it is the larger one and
+// the old max_upload_bytes (kept for older apps) is smaller.
+func TestFilesUploadHoldsNormalFilesToTheNormalCap(t *testing.T) {
+	m := uploadMock(t, 200, `{"max_upload_bytes":5000,"max_upload_bytes_plain":1050,"max_upload_bytes_encrypted":5000}`)
+	path := writeSized(t, "big.bin", 1075)
+
+	_, err := runCLI(t, m, "files", "upload", path)
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "file_too_large" {
+		t.Fatalf("error = %v, want file_too_large", err)
+	}
+	if want := `"big.bin" is 1.1 KB; the limit is 1 KB.`; apiErr.Message != want {
+		t.Errorf("message = %q, want %q", apiErr.Message, want)
 	}
 }
 
@@ -686,7 +789,7 @@ func TestFilesUploadAcceptsFileExactlyAtCap(t *testing.T) {
 	if _, err := runCLI(t, m, "files", "upload", path); err != nil {
 		t.Fatalf("file exactly at the cap must upload, got %v", err)
 	}
-	if !strings.Contains(strings.Join(m.calls(), " "), "POST /api/v1/files/upload") {
+	if !uploaded(m) {
 		t.Errorf("upload was not sent: %v", m.calls())
 	}
 }
@@ -712,10 +815,23 @@ func TestFilesUploadFailsOpenWithoutAPublishedCap(t *testing.T) {
 			if _, err := runCLI(t, m, "files", "upload", path); err != nil {
 				t.Fatalf("must fail open and upload, got %v", err)
 			}
-			if !strings.Contains(strings.Join(m.calls(), " "), "POST /api/v1/files/upload") {
+			if !uploaded(m) {
 				t.Errorf("upload was not sent: %v", m.calls())
 			}
 		})
+	}
+}
+
+// A stalled upload is a network failure: the same command can work on a better
+// connection, so it gets the network exit code, and the file error mapping
+// leaves it alone.
+func TestStalledUploadGetsTheNetworkExitCode(t *testing.T) {
+	err := mapFileError(fmt.Errorf("upload failed: %w", &client.StallError{After: time.Minute, Upload: true}))
+	if got := exitCodeFor(err); got != exitNetwork {
+		t.Errorf("exit code = %d, want %d (network)", got, exitNetwork)
+	}
+	if want := "upload failed: no data moved for 60 seconds"; err.Error() != want {
+		t.Errorf("message = %q, want %q", err.Error(), want)
 	}
 }
 
