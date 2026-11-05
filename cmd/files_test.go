@@ -15,7 +15,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -347,7 +349,7 @@ func TestUploadEncryptedSendsEnvelopeNotPlaintext(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := newMasterKey(t)
-	if _, err := uploadEncrypted(context.Background(), client.NewClient(m.baseURL(), "at_test"), key, path, "", ""); err != nil {
+	if _, err := uploadEncrypted(context.Background(), client.NewClient(m.baseURL(), "at_test"), key, path, "", "", 0); err != nil {
 		t.Fatalf("uploadEncrypted: %v", err)
 	}
 
@@ -738,6 +740,97 @@ func TestFilesUploadRefusalUsesTheStoredName(t *testing.T) {
 	}
 	if want := `"Report.pdf" is 1.1 KB; the limit is 1 KB.`; apiErr.Message != want {
 		t.Errorf("message = %q, want %q", apiErr.Message, want)
+	}
+}
+
+// pipeOf returns a /dev/fd path that reads n bytes from a pipe, for an upload
+// whose size cannot be measured on disk.
+//
+// Some systems report the bytes waiting in a pipe as its size, which would let
+// the on-disk check measure it. So the bytes are written only once the command
+// asks the mock for its limits, which it does after that check.
+func pipeOf(t *testing.T, m *apiMock, n int) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("no /dev/fd on Windows")
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.Close() })
+	asked := make(chan struct{})
+	var once sync.Once
+	m.handler = func(rw http.ResponseWriter, req *http.Request) {
+		if req.Method+" "+req.URL.Path == "GET /client-flags" {
+			once.Do(func() { close(asked) })
+		}
+		reply, ok := m.routes[req.Method+" "+req.URL.Path]
+		if !ok {
+			t.Errorf("apiMock: unrouted request %s %s", req.Method, req.URL.Path)
+			rw.WriteHeader(http.StatusNotFound)
+			return
+		}
+		rw.WriteHeader(reply.Status)
+		_, _ = rw.Write([]byte(reply.Body))
+	}
+	go func() {
+		select {
+		case <-asked:
+		case <-time.After(10 * time.Second):
+		}
+		_, _ = w.Write(bytes.Repeat([]byte("p"), n))
+		w.Close()
+	}()
+	return fmt.Sprintf("/dev/fd/%d", r.Fd())
+}
+
+// A pipe has no size on disk, so it is held to the limit while it is read. It
+// gets the same refusal as a file, with "over" in place of a size it cannot
+// know, and nothing is sent.
+func TestFilesUploadHoldsAPipeToTheLimit(t *testing.T) {
+	m := uploadMock(t, 200, `{"max_upload_bytes":1050}`)
+	_, err := runCLI(t, m, "files", "upload", "--filename", "piped.txt", pipeOf(t, m, 5000))
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "file_too_large" {
+		t.Fatalf("error = %v, want file_too_large", err)
+	}
+	if want := `"piped.txt" is over 1 KB; the limit is 1 KB.`; apiErr.Message != want {
+		t.Errorf("message = %q, want %q", apiErr.Message, want)
+	}
+	if got := m.calls(); len(got) != 1 {
+		t.Errorf("a refused pipe still sent more than the probe: %v", got)
+	}
+}
+
+// An encrypted upload reads the whole input into memory to seal it, so a pipe
+// is held to the encrypted limit while it is read, not after.
+func TestFilesUploadHoldsAnEncryptedPipeToTheEncryptedLimit(t *testing.T) {
+	unlockedSession(t, newMasterKey(t))
+	m := uploadMock(t, 200, `{"max_upload_bytes":1050,"max_upload_bytes_plain":9000,"max_upload_bytes_encrypted":1050}`)
+	_, err := runCLI(t, m, "files", "upload", "--encrypted", "--filename", "piped.bin", pipeOf(t, m, 5000))
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "file_too_large" {
+		t.Fatalf("error = %v, want file_too_large", err)
+	}
+	if want := `"piped.bin" is over 1 KB; the limit for encrypted notes is 1 KB.`; apiErr.Message != want {
+		t.Errorf("message = %q, want %q", apiErr.Message, want)
+	}
+	for _, call := range m.calls() {
+		if strings.Contains(call, "/files/") || strings.Contains(call, "/storage/") {
+			t.Errorf("a refused pipe still sent %s", call)
+		}
+	}
+}
+
+// A pipe under the limit uploads, every byte of it.
+func TestFilesUploadSendsAPipe(t *testing.T) {
+	m := uploadMock(t, 200, `{"max_upload_bytes":104857600}`)
+	if _, err := runCLI(t, m, "files", "upload", "--filename", "piped.txt", pipeOf(t, m, 5000)); err != nil {
+		t.Fatalf("upload error: %v", err)
+	}
+	if got := m.rawBodyOf(t, "PUT /storage/blob"); got != strings.Repeat("p", 5000) {
+		t.Errorf("storage got %d bytes, want the 5000 piped", len(got))
 	}
 }
 

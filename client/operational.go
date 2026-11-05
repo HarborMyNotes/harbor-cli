@@ -50,10 +50,9 @@ func (c *Client) OpenAPI() ([]byte, error) {
 // It carries the per-file upload policy — max_upload_bytes_plain,
 // max_upload_bytes_encrypted (newer servers), max_upload_bytes (every server)
 // and allowed_mime — which is the server's answer to "what will you accept?",
-// published so a
-// client can screen a file before spending a user's bandwidth on it. The
-// document is a bare JSON object with no {"data": …} envelope, matching its
-// root-level neighbours.
+// published so a client can screen a file before spending a user's bandwidth
+// on it. The document is a bare JSON object with no {"data": …} envelope,
+// matching its root-level neighbours.
 //
 // Every consumer must fail OPEN: an unreachable or older server means "do not
 // pre-validate, send it and let the server decide", never a hardcoded fallback

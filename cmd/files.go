@@ -142,14 +142,15 @@ deduplicate against an existing blob.`,
 		path, mimeType, filename := args[0], stringFlag(cmd, "mime"), stringFlag(cmd, "filename")
 		encrypted := boolFlag(cmd, "encrypted")
 
-		if err := checkUploadSize(c, path, filename, encrypted); err != nil {
+		limit, err := checkUploadSize(c, path, filename, encrypted)
+		if err != nil {
 			return err
 		}
 
 		if !encrypted {
-			data, uerr := c.UploadFile(cmd.Context(), path, mimeType, filename)
+			data, uerr := c.UploadFile(cmd.Context(), path, mimeType, filename, limit)
 			if uerr != nil {
-				return mapFileError(uerr)
+				return mapUploadError(uerr, path, filename, encrypted)
 			}
 			printResult(data, displayResource)
 			return nil
@@ -161,31 +162,42 @@ deduplicate against an existing blob.`,
 		if err != nil {
 			return err
 		}
-		data, err := uploadEncrypted(cmd.Context(), c, key, path, mimeType, filename)
+		data, err := uploadEncrypted(cmd.Context(), c, key, path, mimeType, filename, limit)
 		if err != nil {
-			return err
+			return mapUploadError(err, path, filename, encrypted)
 		}
 		printResult(data, displayResource)
 		return nil
 	},
 }
 
+// mapUploadError turns a pipe that ran past the limit into the same refusal an
+// over-limit file gets, and gives everything else the usual file error mapping.
+func mapUploadError(err error, path, filename string, encrypted bool) error {
+	var tooLarge *client.StreamTooLargeError
+	if errors.As(err, &tooLarge) {
+		return fileTooLarge(path, filename, "over "+limitBytesHuman(tooLarge.Limit, false), tooLarge.Limit, encrypted)
+	}
+	return mapFileError(err)
+}
+
 // uploadEncrypted seals a file on this machine and uploads the envelope, so the
 // server never receives the plaintext.
 //
 // The file and its envelope are both held in memory: the envelope format seals a
-// file in one piece. Encrypted files have a small limit for that reason, and
-// checkUploadSize holds the file to it first.
+// file in one piece. Encrypted files have a small limit for that reason.
+// checkUploadSize holds a file to it first, and limit stops a pipe from being
+// read past it.
 //
 // It is a named function rather than inline RunE so a test can point it at a
 // mock server and assert what actually goes on the wire: that the bytes sent to
 // storage are the envelope and NOT the plaintext. An upload that stamps the
 // resource is_encrypted while sending the file in the clear passes every other
 // test.
-func uploadEncrypted(ctx context.Context, c *client.Client, key []byte, path, mimeType, filename string) ([]byte, error) {
-	content, err := os.ReadFile(path)
+func uploadEncrypted(ctx context.Context, c *client.Client, key []byte, path, mimeType, filename string, limit int64) ([]byte, error) {
+	content, err := readUpTo(path, limit)
 	if err != nil {
-		return nil, fmt.Errorf("cannot read file: %w", err)
+		return nil, err
 	}
 	// Resolve both from the ORIGINAL file, before sealing — sniffing the
 	// envelope would record every encrypted upload as octet-stream.
@@ -199,11 +211,30 @@ func uploadEncrypted(ctx context.Context, c *client.Client, key []byte, path, mi
 	if err != nil {
 		return nil, fmt.Errorf("encrypting %s: %w", filepath.Base(path), err)
 	}
-	data, err := c.UploadBytes(ctx, sealed, mimeType, filename, true)
+	return c.UploadBytes(ctx, sealed, mimeType, filename, true)
+}
+
+// readUpTo reads a whole file, or stops one byte past limit (when limit is
+// positive) and returns a *client.StreamTooLargeError. A regular file was
+// measured before this runs; the cap is what bounds a pipe.
+func readUpTo(path string, limit int64) ([]byte, error) {
+	f, err := os.Open(path)
 	if err != nil {
-		return nil, mapFileError(err)
+		return nil, fmt.Errorf("cannot read file: %w", err)
 	}
-	return data, nil
+	defer f.Close()
+	var r io.Reader = f
+	if limit > 0 {
+		r = io.LimitReader(f, limit+1)
+	}
+	content, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read file: %w", err)
+	}
+	if limit > 0 && int64(len(content)) > limit {
+		return nil, &client.StreamTooLargeError{Limit: limit}
+	}
+	return content, nil
 }
 
 // filesGetCmd shows the presigned download URL + basic metadata for a blob.
@@ -638,8 +669,7 @@ func uploadSizeCap(c *client.Client, encrypted bool) int64 {
 
 // checkUploadSize refuses an over-cap file before a single byte is streamed,
 // naming the file, its size and the limit. An encrypted upload is held to the
-// encrypted cap, any other to the normal one. The file is named as it will be
-// stored: by filename when one was given, else by its base name.
+// encrypted cap, any other to the normal one.
 //
 // The comparison is ">", not ">=", mirroring the server's own predicate: a file
 // sized exactly at the cap is accepted, and a client that refused it would
@@ -654,23 +684,31 @@ func uploadSizeCap(c *client.Client, encrypted bool) int64 {
 // It measures the file as it sits on disk. With --encrypted the HRBC2 envelope
 // adds 33 bytes, so a file within 33 bytes of the cap still reaches the server
 // and is refused there — the same answer either way, and it keeps the message
-// honest about the size the user can actually see.
+// honest about the size the user can actually see. A pipe has no size on disk;
+// the cap it returns is what stops one being read past the limit.
 //
 // The local checks come first so a typo'd path costs no network round-trip.
-func checkUploadSize(c *client.Client, path, filename string, encrypted bool) error {
+// It returns the cap it checked against, 0 when none is known.
+func checkUploadSize(c *client.Client, path, filename string, encrypted bool) (int64, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		// Not ours to report: the upload opens the file next and says something
 		// better about why it could not be read.
-		return nil
+		return 0, nil
 	}
 	if info.IsDir() {
-		return fmt.Errorf("%q is a directory", filepath.Base(path))
+		return 0, fmt.Errorf("%q is a directory", filepath.Base(path))
 	}
 	limit := uploadSizeCap(c, encrypted)
 	if limit <= 0 || info.Size() <= limit {
-		return nil
+		return limit, nil
 	}
+	return limit, fileTooLarge(path, filename, limitBytesHuman(info.Size(), true), limit, encrypted)
+}
+
+// fileTooLarge is the refusal for a file over its cap, in the web app's words.
+// The file is named by filename when one was given, else by its base name.
+func fileTooLarge(path, filename, size string, limit int64, encrypted bool) error {
 	limitFor := "the limit is"
 	if encrypted {
 		limitFor = "the limit for encrypted notes is"
@@ -679,9 +717,8 @@ func checkUploadSize(c *client.Client, path, filename string, encrypted bool) er
 		filename = filepath.Base(path)
 	}
 	return &client.APIError{
-		Code: "file_too_large",
-		Message: fmt.Sprintf(`"%s" is %s; %s %s.`, filename,
-			limitBytesHuman(info.Size(), true), limitFor, limitBytesHuman(limit, false)),
+		Code:    "file_too_large",
+		Message: fmt.Sprintf(`"%s" is %s; %s %s.`, filename, size, limitFor, limitBytesHuman(limit, false)),
 	}
 }
 

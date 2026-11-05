@@ -126,9 +126,10 @@ func (c *Client) UploadImportPart(ctx context.Context, url string, chunk io.Read
 }
 
 // putImportPart performs a single PUT of a chunk, reporting whether a failure is
-// worth retrying. A transport error or a 5xx/408/429 is transient; anything else
-// (a 403 from an expired signature, a 400 from a malformed request) would fail
-// identically however many times it is sent.
+// worth retrying. A transport error or a temporary refusal (see
+// storageTransient) is transient; anything else (a 403 from an expired
+// signature, a 400 from a malformed request) would fail identically however
+// many times it is sent.
 func (c *Client) putImportPart(ctx context.Context, url string, chunk io.ReaderAt, size int64) (etag string, retryable bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, io.NewSectionReader(chunk, 0, size))
 	if err != nil {
@@ -147,9 +148,7 @@ func (c *Client) putImportPart(ctx context.Context, url string, chunk io.ReaderA
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		transient := resp.StatusCode >= 500 ||
-			resp.StatusCode == http.StatusRequestTimeout ||
-			resp.StatusCode == http.StatusTooManyRequests
+		transient := storageTransient(resp.StatusCode, body)
 		return "", transient, fmt.Errorf("storage rejected the upload: HTTP %d %s",
 			resp.StatusCode, bytes.TrimSpace(body))
 	}

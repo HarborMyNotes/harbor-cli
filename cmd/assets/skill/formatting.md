@@ -229,8 +229,8 @@ HTML
 
 ## 5. Embedding files & images
 
-Attachments are **content-addressed**: you upload bytes once (the server computes
-a `sha256`) and then reference that hash from any note body via a typed
+Attachments are **content-addressed**: you upload bytes once (their `sha256` is
+the address) and then reference that hash from any note body via a typed
 `<harbor-embed>` element. Bytes are never inlined into the note.
 
 ```bash
