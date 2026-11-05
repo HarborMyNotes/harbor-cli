@@ -5,11 +5,14 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -242,8 +245,7 @@ func TestUploadImportPartSkipsHarborHeaders(t *testing.T) {
 
 // TestUploadImportPartRetriesTransientFailures proves a blip does not cost the
 // whole import: there is no resume, so a 500 on part 200 of 300 would otherwise
-// mean re-uploading everything. The retried attempt must send the same bytes,
-// which is what the re-seek is for.
+// mean re-uploading everything. The retried attempt must send the same bytes.
 func TestUploadImportPartRetriesTransientFailures(t *testing.T) {
 	restore := importPartRetryBackoff
 	importPartRetryBackoff = time.Millisecond
@@ -421,5 +423,76 @@ func TestExportENEXNotFound(t *testing.T) {
 	apiErr, ok := err.(*APIError)
 	if !ok || apiErr.Code != "not_found" || apiErr.Status != 404 {
 		t.Fatalf("want not_found APIError, got %v", err)
+	}
+}
+
+// A retried part gets its own reader. The failed attempt's transport is held
+// in the middle of reading the chunk, and lets go once the retry is under way.
+// With a reader shared between the attempts, that late read would move the
+// retry's place in the chunk, and the retry would send the wrong bytes.
+func TestUploadImportPartRetryDoesNotShareTheChunk(t *testing.T) {
+	restore := importPartRetryBackoff
+	importPartRetryBackoff = time.Millisecond
+	defer func() { importPartRetryBackoff = restore }()
+
+	const size = 64 << 20
+	chunk := newGatedReader(t, size)
+	want := chunk.hash()
+	var attempts atomic.Int32
+	var got atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		h := sha256.New()
+		if _, err := io.CopyN(h, r.Body, 1); err != nil {
+			return
+		}
+		chunk.open()
+		_, _ = io.Copy(h, r.Body)
+		got.Store(hex.EncodeToString(h.Sum(nil)))
+		w.Header().Set("ETag", `"ok"`)
+	}))
+	defer srv.Close()
+
+	if _, err := testClient("http://unused").UploadImportPart(context.Background(), srv.URL, chunk, size); err != nil {
+		t.Fatalf("UploadImportPart error: %v", err)
+	}
+	if !chunk.held.Load() {
+		t.Fatal("attempt 1 never reached the held read, so this test proved nothing")
+	}
+	if got.Load() != want {
+		t.Error("the retry sent different bytes from the chunk")
+	}
+	if n := attempts.Load(); n != 2 {
+		t.Errorf("sent %d times, want 2: a third try means the second sent a broken body", n)
+	}
+}
+
+// S3's 400 RequestTimeout means the connection went idle, not that the chunk is
+// wrong, so the part is sent again.
+func TestUploadImportPartRetriesS3RequestTimeout(t *testing.T) {
+	restore := importPartRetryBackoff
+	importPartRetryBackoff = time.Millisecond
+	defer func() { importPartRetryBackoff = restore }()
+
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if attempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte("<Error><Code>RequestTimeout</Code></Error>"))
+			return
+		}
+		w.Header().Set("ETag", `"ok"`)
+	}))
+	defer srv.Close()
+
+	if _, err := testClient("http://unused").UploadImportPart(context.Background(), srv.URL, strings.NewReader("x"), 1); err != nil {
+		t.Fatalf("UploadImportPart error: %v", err)
+	}
+	if n := attempts.Load(); n != 2 {
+		t.Errorf("sent %d times, want 2", n)
 	}
 }

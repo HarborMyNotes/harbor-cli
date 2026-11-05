@@ -336,8 +336,8 @@ func bytesHuman(n float64) string {
 //
 // roundUp forces the value up to the next tenth. The offending file's size uses
 // it and the cap does not: at one decimal place a file a single byte over a
-// 100 MB cap rounds back onto it and the refusal reads "is 100 MB — the
-// per-file limit is 100 MB", a sentence that contradicts itself. The cap is an
+// 100 MB cap rounds back onto it and the refusal reads "is 100 MB; the limit
+// is 100 MB.", a sentence that contradicts itself. The cap is an
 // exact figure and must render as the number the operator set.
 func limitBytesHuman(n int64, roundUp bool) string {
 	const unit = 1024

@@ -191,7 +191,7 @@ Run `harbor <command> --help` for full flags and examples on any command.
 |---|---|
 | `harbor files list` | List files with their linked notes (`--mime`, `--note-id`, …). |
 | `harbor files check` | Check whether a blob exists (`--hash` or `--file`). |
-| `harbor files upload <path>` | Upload a file (multipart; server computes the hash). |
+| `harbor files upload <path>` | Upload a file: hashed here, then sent straight to storage with a presigned link. |
 | `harbor files get <hash>` | Show the presigned download URL + metadata. |
 | `harbor files download <hash>` | Download bytes (`--output`, `--raw`). Saved under the file's own name, made safe for every filesystem, never overwriting (`name (2).ext`). |
 | `harbor files download --note <id>` | Save every file linked to a note into `--output-dir` (default: the current folder), named the same way. |

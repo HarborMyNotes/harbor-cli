@@ -391,13 +391,18 @@ Content-addressed (sha256) blobs.
 
 | Command | What it does | Key flags |
 |---|---|---|
-| `harbor files upload <path>` | Upload (server sniffs MIME) | `--mime`, `--filename`, `--encrypted` |
+| `harbor files upload <path>` | Upload straight to storage (MIME detected from the file) | `--mime`, `--filename`, `--encrypted` |
 | `harbor files list` | List with linked notes | `--mime`, `--note-id`, `--ocr-status`, `--encrypted`, `--updated-since`, paging |
 | `harbor files get <hash>` | Presigned URL + metadata (no bytes) | |
 | `harbor files check` | Does a blob exist? | `--hash` (+`--size`) or `--file` (hash computed locally) |
 | `harbor files download <hash>` | Download bytes | `--output` (`-` = stdout), `--raw`, `--ciphertext` |
 | `harbor files download --note <id>` | Save every file linked to a note | `--output-dir` (default `.`, created if missing), `--raw` |
 | `harbor files rename <hash> <new-name>` | Rename a file (one name for the whole account, shown in every note that holds it) | |
+
+**Size limits.** The server sets the largest file it takes, and encrypted files
+have their own, smaller limit. A file over its limit is refused before anything
+is sent (`file_too_large`). A big upload has no time limit; one that moves no
+data for 60 seconds fails with the network exit code (3), so it can be run again.
 
 **Encrypted attachments.** `files upload --encrypted` seals the bytes on this
 machine (HRBC2 binary envelope, master key) before uploading — it needs
