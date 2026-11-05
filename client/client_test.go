@@ -614,6 +614,9 @@ func trickleServer(t *testing.T, chunks int, gap time.Duration) *httptest.Server
 func stallingServer(t *testing.T, beforeHeaders bool) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Read any body first: only then does the server notice the client
+		// hang up, which ends the wait below.
+		_, _ = io.Copy(io.Discard, r.Body)
 		if !beforeHeaders {
 			_, _ = w.Write([]byte("x"))
 			w.(http.Flusher).Flush()
@@ -698,6 +701,13 @@ func TestStreamedDownloadGivesUpWaitingForHeaders(t *testing.T) {
 	}
 	if _, err := c.doGetRaw("/files/abc/raw", nil); !errors.As(err, new(*StallError)) {
 		t.Errorf("doGetRaw error = %v, want a *StallError", err)
+	}
+	// The ENEX export POSTs a small JSON body and then downloads. Its stall is a
+	// download stall, so the message talks about data arriving.
+	_, err := c.rawPost(srv.URL+"/export/enex", []byte("{}"), "application/json")
+	var stall *StallError
+	if !errors.As(err, &stall) || stall.Error() != "no data arrived for 100ms" {
+		t.Errorf("rawPost error = %v, want a stall saying no data arrived", err)
 	}
 }
 

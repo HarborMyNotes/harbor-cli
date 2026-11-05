@@ -725,6 +725,22 @@ func TestFilesUploadHoldsEncryptedFilesToTheEncryptedCap(t *testing.T) {
 	}
 }
 
+// The refusal names the file as it would be stored, like the web does: by
+// --filename when one is given.
+func TestFilesUploadRefusalUsesTheStoredName(t *testing.T) {
+	m := uploadMock(t, 200, `{"max_upload_bytes":1050}`)
+	path := writeSized(t, "a.bin", 1075)
+
+	_, err := runCLI(t, m, "files", "upload", "--filename", "Report.pdf", path)
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "file_too_large" {
+		t.Fatalf("error = %v, want file_too_large", err)
+	}
+	if want := `"Report.pdf" is 1.1 KB; the limit is 1 KB.`; apiErr.Message != want {
+		t.Errorf("message = %q, want %q", apiErr.Message, want)
+	}
+}
+
 // A normal upload is held to the normal cap, even when it is the larger one and
 // the old max_upload_bytes (kept for older apps) is smaller.
 func TestFilesUploadHoldsNormalFilesToTheNormalCap(t *testing.T) {

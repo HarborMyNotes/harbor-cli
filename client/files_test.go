@@ -15,8 +15,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -226,8 +228,8 @@ type uploadStub struct {
 	exists bool
 	// presignReply, when set, answers presign instead of a link.
 	presignReply *mockReply
-	// putStatus gives the status for the nth PUT (1-based). Nil means 200.
-	putStatus func(n int) int
+	// putReply gives the reply for the nth PUT (1-based). Nil means 200.
+	putReply func(n int) mockReply
 	// commitReply gives the reply for the nth commit. Nil means 201.
 	commitReply func(n int) mockReply
 	// onPut, when set, handles the PUT itself (after it is counted).
@@ -260,7 +262,7 @@ func (s *uploadStub) serve(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		n := len(s.puts) + 1
 		s.puts = append(s.puts, storedPut{Query: r.URL.RawQuery, ContentLength: r.ContentLength, Header: r.Header.Clone()})
-		onPut, putStatus := s.onPut, s.putStatus
+		onPut, putReply := s.onPut, s.putReply
 		s.mu.Unlock()
 		if onPut != nil {
 			onPut(w, r)
@@ -270,14 +272,12 @@ func (s *uploadStub) serve(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		s.puts[n-1].Body = body
 		s.mu.Unlock()
-		status := http.StatusOK
-		if putStatus != nil {
-			status = putStatus(n)
+		reply := mockReply{Status: http.StatusOK}
+		if putReply != nil {
+			reply = putReply(n)
 		}
-		w.WriteHeader(status)
-		if status != http.StatusOK {
-			_, _ = w.Write([]byte("<Error><Code>Refused</Code></Error>"))
-		}
+		w.WriteHeader(reply.Status)
+		_, _ = w.Write([]byte(reply.Body))
 		return
 	}
 
@@ -371,6 +371,11 @@ func (s *uploadStub) putList() []storedPut {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]storedPut(nil), s.puts...)
+}
+
+// storeError is an object store's XML refusal.
+func storeError(status int, code string) mockReply {
+	return mockReply{Status: status, Body: "<Error><Code>" + code + "</Code></Error>"}
 }
 
 // sha256Hex is the content address of b.
@@ -489,14 +494,14 @@ func TestUploadFileCommitsWhenPresignSaysAlreadyExists(t *testing.T) {
 // than failing.
 func TestUploadPresignsAgainAfterA403OnARetry(t *testing.T) {
 	stub := newUploadStub(t)
-	stub.putStatus = func(n int) int {
+	stub.putReply = func(n int) mockReply {
 		switch n {
 		case 1:
-			return http.StatusServiceUnavailable
+			return storeError(http.StatusServiceUnavailable, "SlowDown")
 		case 2:
-			return http.StatusForbidden
+			return storeError(http.StatusForbidden, "AccessDenied")
 		}
-		return http.StatusOK
+		return mockReply{Status: http.StatusOK}
 	}
 	content := []byte("a file whose link ran out")
 	path := writeFile(t, "slow.bin", content)
@@ -528,7 +533,7 @@ func TestUploadPresignsAgainAfterA403OnARetry(t *testing.T) {
 // the request itself. Asking again would only repeat it.
 func TestUploadFirst403IsFinal(t *testing.T) {
 	stub := newUploadStub(t)
-	stub.putStatus = func(int) int { return http.StatusForbidden }
+	stub.putReply = func(int) mockReply { return storeError(http.StatusForbidden, "SignatureDoesNotMatch") }
 	path := writeFile(t, "refused.bin", []byte("refused"))
 
 	_, err := stub.client(t).UploadFile(context.Background(), path, "", "")
@@ -544,7 +549,7 @@ func TestUploadFirst403IsFinal(t *testing.T) {
 // is reported and nothing is committed.
 func TestUploadGivesUpAfterTheLastAttempt(t *testing.T) {
 	stub := newUploadStub(t)
-	stub.putStatus = func(int) int { return http.StatusInternalServerError }
+	stub.putReply = func(int) mockReply { return storeError(http.StatusInternalServerError, "InternalError") }
 	path := writeFile(t, "flaky.bin", []byte("flaky"))
 
 	_, err := stub.client(t).UploadFile(context.Background(), path, "", "")
@@ -560,40 +565,46 @@ func TestUploadGivesUpAfterTheLastAttempt(t *testing.T) {
 }
 
 // lazyReader makes size bytes on demand, so a test can send a big body without
-// holding it. It counts what was read, and it refuses to be rewound once read:
-// the client may only seek to the start before it sends.
+// holding it. It counts what was read.
 type lazyReader struct {
 	size int64
-	pos  int64
 	read atomic.Int64
 }
 
-// Read fills p with a repeating pattern.
-func (r *lazyReader) Read(p []byte) (int, error) {
-	if r.pos >= r.size {
+// lazyByte is the byte at offset off.
+func lazyByte(off int64) byte { return byte('a' + off%26) }
+
+// ReadAt fills p with the pattern from off.
+func (r *lazyReader) ReadAt(p []byte, off int64) (int, error) {
+	if off >= r.size {
 		return 0, io.EOF
 	}
 	n := int64(len(p))
-	if left := r.size - r.pos; n > left {
+	if left := r.size - off; n > left {
 		n = left
 	}
 	for i := range p[:n] {
-		p[i] = byte('a' + (r.pos+int64(i))%26)
+		p[i] = lazyByte(off + int64(i))
 	}
-	r.pos += n
 	r.read.Add(n)
+	if n < int64(len(p)) {
+		return int(n), io.EOF
+	}
 	return int(n), nil
 }
 
-// Seek allows only a rewind to the start, and only before anything was read.
-func (r *lazyReader) Seek(offset int64, whence int) (int64, error) {
-	if offset != 0 || whence != io.SeekStart {
-		return 0, errors.New("lazyReader: only Seek(0, SeekStart)")
+// hash returns the sha256 of the whole pattern without counting it as read.
+func (r *lazyReader) hash() string {
+	h := sha256.New()
+	buf := make([]byte, 1<<20)
+	for off := int64(0); off < r.size; off += int64(len(buf)) {
+		n := min(int64(len(buf)), r.size-off)
+		for i := range buf[:n] {
+			buf[i] = lazyByte(off + int64(i))
+		}
+		h.Write(buf[:n])
 	}
-	if r.pos != 0 {
-		return 0, errors.New("lazyReader: read twice")
-	}
-	return 0, nil
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // The body streams: the store sees the first bytes while most of the body has
@@ -616,7 +627,7 @@ func TestUploadStreamsTheBodyInsteadOfBufferingIt(t *testing.T) {
 		received.Store(n + 1)
 	}
 
-	up := fileUpload{Body: body, Size: size, Hash: strings.Repeat("a", 64), MIME: "video/mp4", Filename: "big.mp4"}
+	up := fileUpload{Body: body, Size: size, Hash: body.hash(), MIME: "video/mp4", Filename: "big.mp4"}
 	if _, err := stub.client(t).upload(context.Background(), up); err != nil {
 		t.Fatalf("upload error: %v", err)
 	}
@@ -632,43 +643,45 @@ func TestUploadStreamsTheBodyInsteadOfBufferingIt(t *testing.T) {
 	}
 }
 
-// slowReader gives out its bytes a chunk at a time with a pause before each,
-// like a slow but steady connection.
+// slowReader gives out its bytes 1 KiB at a time with a pause before each,
+// like a slow but steady connection. Its short reads break the io.ReaderAt
+// rule that a short read returns an error; io.SectionReader passes them
+// through, which is all this needs.
 type slowReader struct {
-	chunks int
-	delay  time.Duration
-	sent   int
+	size  int64
+	delay time.Duration
 }
 
-// Read waits, then returns one 1 KiB chunk.
-func (r *slowReader) Read(p []byte) (int, error) {
-	if r.sent >= r.chunks {
+// ReadAt waits, then returns at most 1 KiB of 's'.
+func (r *slowReader) ReadAt(p []byte, off int64) (int, error) {
+	if off >= r.size {
 		return 0, io.EOF
 	}
 	time.Sleep(r.delay)
-	r.sent++
-	return copy(p, bytes.Repeat([]byte("s"), min(len(p), 1024))), nil
+	n := min(int64(len(p)), 1024, r.size-off)
+	return copy(p, bytes.Repeat([]byte("s"), int(n))), nil
 }
 
-// Seek rewinds to the start.
-func (r *slowReader) Seek(int64, int) (int64, error) { r.sent = 0; return 0, nil }
-
 // An upload that keeps moving has no time limit: it outlives both the API
-// client's request timeout and the stall timeout. The body takes about 360ms,
-// past both 150ms limits, with no gap longer than 30ms.
+// client's request timeout and the stall timeout. The body takes about 600ms,
+// twice the 300ms request timeout and four times the 150ms stall timeout, with
+// no gap longer than 30ms. The request timeout still covers check, presign and
+// commit, so it is long enough for those on a busy machine.
 func TestUploadOutlivesTheRequestTimeoutWhileBytesMove(t *testing.T) {
 	stub := newUploadStub(t)
 	c := stub.client(t)
-	c.HTTPClient.Timeout = 150 * time.Millisecond
+	c.HTTPClient.Timeout = 300 * time.Millisecond
 	c.StallTimeout = 150 * time.Millisecond
 
-	up := fileUpload{Body: &slowReader{chunks: 12, delay: 30 * time.Millisecond}, Size: 12 * 1024,
-		Hash: strings.Repeat("b", 64), MIME: "text/plain", Filename: "slow.txt"}
+	const size = 20 * 1024
+	want := bytes.Repeat([]byte("s"), size)
+	up := fileUpload{Body: &slowReader{size: size, delay: 30 * time.Millisecond}, Size: size,
+		Hash: sha256Hex(want), MIME: "text/plain", Filename: "slow.txt"}
 	if _, err := c.upload(context.Background(), up); err != nil {
 		t.Fatalf("a slow but steady upload failed: %v", err)
 	}
-	if got := len(stub.putList()[0].Body); got != 12*1024 {
-		t.Errorf("store received %d bytes, want all %d", got, 12*1024)
+	if got := stub.putList()[0].Body; !bytes.Equal(got, want) {
+		t.Errorf("store received %d bytes, want all %d", len(got), size)
 	}
 }
 
@@ -687,7 +700,7 @@ func TestUploadGivesUpOnAStall(t *testing.T) {
 	c.StallTimeout = 100 * time.Millisecond
 
 	up := fileUpload{Body: &lazyReader{size: 64 << 20}, Size: 64 << 20,
-		Hash: strings.Repeat("c", 64), MIME: "video/mp4", Filename: "stuck.mp4"}
+		Hash: "not checked: the upload never finishes", MIME: "video/mp4", Filename: "stuck.mp4"}
 	start := time.Now()
 	_, err := c.upload(context.Background(), up)
 	if elapsed := time.Since(start); elapsed > 3*time.Second {
@@ -833,5 +846,215 @@ func TestUploadBytesSendsTheGivenBytes(t *testing.T) {
 	commit := stub.body(t, "POST /files/commit", 0)
 	if commit["filename"] != "secret.pdf" || commit["mime"] != "application/pdf" || commit["is_encrypted"] != true {
 		t.Errorf("commit body = %v", commit)
+	}
+}
+
+// UploadFile sends the file as it is on disk at the moment of sending, piece by
+// piece, never a copy read into memory first. The store changes the end of the
+// file once the first byte arrives. A streaming upload then sends the changed
+// end; a buffered one would already hold the old bytes. The file is far bigger
+// than the socket buffers, so the end cannot have been read yet.
+//
+// The change also means the bytes sent no longer match the hash they would be
+// stored under, so the upload must stop without a commit.
+func TestUploadFileStreamsFromDiskAndRefusesAFileChangedMidUpload(t *testing.T) {
+	const size, tail = 64 << 20, 1 << 20
+	path := writeFile(t, "growing.log", bytes.Repeat([]byte("a"), size))
+
+	var tailChanged atomic.Bool
+	stub := newUploadStub(t)
+	stub.onPut = func(w http.ResponseWriter, r *http.Request) {
+		if _, err := io.ReadFull(r.Body, make([]byte, 1)); err != nil {
+			t.Errorf("reading the first byte: %v", err)
+			return
+		}
+		f, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			t.Errorf("opening the file to change it: %v", err)
+			return
+		}
+		_, _ = f.WriteAt(bytes.Repeat([]byte("z"), tail), size-tail)
+		f.Close()
+		rest, _ := io.ReadAll(r.Body)
+		tailChanged.Store(len(rest) == size-1 && bytes.Equal(rest[len(rest)-tail:], bytes.Repeat([]byte("z"), tail)))
+	}
+
+	_, err := stub.client(t).UploadFile(context.Background(), path, "", "")
+	if !tailChanged.Load() {
+		t.Error("the store received the file as it was when hashed — the body was read into memory before sending")
+	}
+	if !errors.Is(err, errFileChanged) {
+		t.Errorf("error = %v, want errFileChanged", err)
+	}
+	if n := stub.commitCount(); n != 0 {
+		t.Errorf("committed %d times, want 0: the stored bytes do not match their hash", n)
+	}
+}
+
+// A retry gets its own reader. The transport can still be reading the failed
+// attempt's body after the store answered, so a shared, rewound reader would
+// let the two attempts interleave. Run with -race to see the interleaving; the
+// byte-for-byte check catches what it does to the body.
+func TestUploadRetryDoesNotShareTheBody(t *testing.T) {
+	content := bytes.Repeat([]byte("0123456789abcdef"), 1<<19) // 8 MiB
+	stub := newUploadStub(t)
+	var second atomic.Value
+	stub.onPut = func(w http.ResponseWriter, r *http.Request) {
+		if len(stub.putList()) == 1 {
+			// Answer before reading the body: the transport is mid-write.
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		got, _ := io.ReadAll(r.Body)
+		second.Store(got)
+	}
+	path := writeFile(t, "retry.bin", content)
+
+	if _, err := stub.client(t).UploadFile(context.Background(), path, "", ""); err != nil {
+		t.Fatalf("UploadFile error: %v", err)
+	}
+	if got, _ := second.Load().([]byte); !bytes.Equal(got, content) {
+		t.Errorf("the retry sent %d bytes that differ from the file", len(got))
+	}
+}
+
+// S3 answers 400 RequestTimeout when the connection went idle for a while.
+// That is the network, not the request, so it is tried again.
+func TestUploadRetriesS3RequestTimeout(t *testing.T) {
+	stub := newUploadStub(t)
+	stub.putReply = func(n int) mockReply {
+		if n == 1 {
+			return storeError(http.StatusBadRequest, "RequestTimeout")
+		}
+		return mockReply{Status: http.StatusOK}
+	}
+	path := writeFile(t, "idle.bin", []byte("idle connection"))
+
+	if _, err := stub.client(t).UploadFile(context.Background(), path, "", ""); err != nil {
+		t.Fatalf("UploadFile error: %v", err)
+	}
+	if got := len(stub.putList()); got != 2 {
+		t.Errorf("store got %d PUTs, want 2", got)
+	}
+}
+
+// Any other 400 is the request itself, and sending it again cannot help.
+func TestUploadOtherBadRequestIsFinal(t *testing.T) {
+	stub := newUploadStub(t)
+	stub.putReply = func(int) mockReply { return storeError(http.StatusBadRequest, "InvalidArgument") }
+	path := writeFile(t, "bad.bin", []byte("bad"))
+
+	if _, err := stub.client(t).UploadFile(context.Background(), path, "", ""); err == nil {
+		t.Fatal("expected an error")
+	}
+	if got := len(stub.putList()); got != 1 {
+		t.Errorf("store got %d PUTs, want 1", got)
+	}
+}
+
+// One blip on check, presign or commit does not throw the upload away: each is
+// tried again after a 5xx or a 429. After a long PUT, a lost commit would
+// otherwise mean starting over.
+func TestUploadRetriesTheAPIStepsOnATemporaryError(t *testing.T) {
+	var checks, presigns, commits atomic.Int32
+	stub := newUploadStub(t)
+	busy := `{"error":{"code":"internal_error","message":"busy"}}`
+	stub.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := r.Method + " " + r.URL.Path
+		first := false
+		switch key {
+		case "POST /files/check":
+			first = checks.Add(1) == 1
+		case "POST /files/presign-upload":
+			first = presigns.Add(1) == 1
+		case "POST /files/commit":
+			first = commits.Add(1) == 1
+		}
+		if first {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(busy))
+			return
+		}
+		stub.serve(w, r)
+	})
+	path := writeFile(t, "blip.bin", []byte("one blip each"))
+
+	if _, err := stub.client(t).UploadFile(context.Background(), path, "", ""); err != nil {
+		t.Fatalf("UploadFile error: %v", err)
+	}
+	if checks.Load() != 2 || presigns.Load() != 2 || commits.Load() != 2 {
+		t.Errorf("tries: check %d, presign %d, commit %d; want 2 each", checks.Load(), presigns.Load(), commits.Load())
+	}
+}
+
+// A refusal is not a blip: a 4xx from an API step is reported at once.
+func TestUploadDoesNotRetryAnAPIRefusal(t *testing.T) {
+	stub := newUploadStub(t)
+	stub.presignReply = &mockReply{Status: http.StatusUnprocessableEntity,
+		Body: `{"error":{"code":"file_too_large","message":"too big"}}`}
+	path := writeFile(t, "big.bin", []byte("pretend this is big"))
+
+	_, err := stub.client(t).UploadFile(context.Background(), path, "", "")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "file_too_large" {
+		t.Fatalf("error = %v, want file_too_large", err)
+	}
+	if n := stub.presignCount(); n != 1 {
+		t.Errorf("presigned %d times, want 1", n)
+	}
+}
+
+// A server without real storage hands out links no HTTP client can reach.
+// That is said once and plainly, not retried as if the network had failed.
+func TestUploadRefusesALinkThatIsNotHTTP(t *testing.T) {
+	stub := newUploadStub(t)
+	stub.presignReply = &mockReply{Status: http.StatusOK,
+		Body: `{"upload_url":"fake://put/blobs/u/ab/cd/abcd?sig=1","method":"PUT","headers":{}}`}
+	path := writeFile(t, "local.bin", []byte("local dev server"))
+
+	_, err := stub.client(t).UploadFile(context.Background(), path, "", "")
+	if err == nil || !strings.Contains(err.Error(), "not an http(s) link") || strings.Contains(err.Error(), "sig=") {
+		t.Fatalf("error = %v, want a plain refusal of the link (without its signature)", err)
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		t.Errorf("the refusal looks like a network failure (%T), which would give it the network exit code", urlErr)
+	}
+	if n := stub.presignCount(); n != 1 {
+		t.Errorf("presigned %d times, want 1", n)
+	}
+}
+
+// A pipe can be read only once, and an upload reads its file twice (to hash it,
+// then to send it). UploadFile copies a pipe to a temporary file first, so
+// 'harbor files upload /dev/stdin' keeps working, every byte included.
+func TestUploadFileAcceptsAPipe(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no /dev/fd on Windows")
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	content := bytes.Repeat([]byte("piped line of text\n"), 1000)
+	go func() {
+		_, _ = w.Write(content)
+		w.Close()
+	}()
+
+	stub := newUploadStub(t)
+	path := fmt.Sprintf("/dev/fd/%d", r.Fd())
+	if _, err := stub.client(t).UploadFile(context.Background(), path, "", "notes.txt"); err != nil {
+		t.Fatalf("UploadFile(%s) error: %v", path, err)
+	}
+	if got := stub.putList()[0].Body; !bytes.Equal(got, content) {
+		t.Errorf("store received %d bytes, want the %d piped", len(got), len(content))
+	}
+	if got := stub.body(t, "POST /files/presign-upload", 0)["hash"]; got != sha256Hex(content) {
+		t.Errorf("presign hash = %v, want the piped bytes' hash", got)
+	}
+	if got := stub.body(t, "POST /files/commit", 0)["mime"]; !strings.HasPrefix(fmt.Sprint(got), "text/plain") {
+		t.Errorf("commit mime = %v, want text/plain detected from the content", got)
 	}
 }

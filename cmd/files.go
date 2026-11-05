@@ -142,7 +142,7 @@ deduplicate against an existing blob.`,
 		path, mimeType, filename := args[0], stringFlag(cmd, "mime"), stringFlag(cmd, "filename")
 		encrypted := boolFlag(cmd, "encrypted")
 
-		if err := checkUploadSize(c, path, encrypted); err != nil {
+		if err := checkUploadSize(c, path, filename, encrypted); err != nil {
 			return err
 		}
 
@@ -638,7 +638,8 @@ func uploadSizeCap(c *client.Client, encrypted bool) int64 {
 
 // checkUploadSize refuses an over-cap file before a single byte is streamed,
 // naming the file, its size and the limit. An encrypted upload is held to the
-// encrypted cap, any other to the normal one.
+// encrypted cap, any other to the normal one. The file is named as it will be
+// stored: by filename when one was given, else by its base name.
 //
 // The comparison is ">", not ">=", mirroring the server's own predicate: a file
 // sized exactly at the cap is accepted, and a client that refused it would
@@ -656,7 +657,7 @@ func uploadSizeCap(c *client.Client, encrypted bool) int64 {
 // honest about the size the user can actually see.
 //
 // The local checks come first so a typo'd path costs no network round-trip.
-func checkUploadSize(c *client.Client, path string, encrypted bool) error {
+func checkUploadSize(c *client.Client, path, filename string, encrypted bool) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		// Not ours to report: the upload opens the file next and says something
@@ -674,9 +675,12 @@ func checkUploadSize(c *client.Client, path string, encrypted bool) error {
 	if encrypted {
 		limitFor = "the limit for encrypted notes is"
 	}
+	if filename == "" {
+		filename = filepath.Base(path)
+	}
 	return &client.APIError{
 		Code: "file_too_large",
-		Message: fmt.Sprintf(`"%s" is %s; %s %s.`, filepath.Base(path),
+		Message: fmt.Sprintf(`"%s" is %s; %s %s.`, filename,
 			limitBytesHuman(info.Size(), true), limitFor, limitBytesHuman(limit, false)),
 	}
 }

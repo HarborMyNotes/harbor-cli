@@ -11,13 +11,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -43,24 +46,25 @@ func (c *Client) CheckFile(hash string, size int64) ([]byte, error) {
 // one; this is what the server records for an unknown file anyway.
 const defaultUploadMIME = "application/octet-stream"
 
-// fileUploadAttempts is how many times one file's PUT to storage is tried. A
-// dropped connection starts the file again from the first byte.
+// fileUploadAttempts is how many times each step of an upload is tried: the
+// check, the presign, the PUT to storage and the commit. A dropped connection
+// starts the PUT again from the first byte.
 const fileUploadAttempts = 3
 
 // fileUploadRetryBackoff is the pause before the first retry. It doubles for
 // each one after that. A variable so tests can make it instant.
 var fileUploadRetryBackoff = time.Second
 
-// commitAttempts is how many times a commit is tried when the store does not
-// show the bytes yet, right after they were sent.
-const commitAttempts = 3
+// errFileChanged is a file whose bytes changed between hashing and sending.
+var errFileChanged = errors.New("the file changed while it was being uploaded, so it was not saved; upload it again")
 
 // fileUpload is one file on its way to storage: its bytes and what the server
 // records about them.
 type fileUpload struct {
-	// Body is read from the start on every attempt, so a retry sends the same
-	// bytes. It is never read into memory as a whole.
-	Body        io.ReadSeeker
+	// Body holds the bytes. Each PUT reads it through its own section reader,
+	// so the transport can still be reading a failed attempt's body while the
+	// retry starts. It is never read into memory as a whole.
+	Body        io.ReaderAt
 	Size        int64
 	Hash        string
 	MIME        string
@@ -93,6 +97,21 @@ func (c *Client) UploadFile(ctx context.Context, path, mimeType, filename string
 		return nil, fmt.Errorf("cannot open file: %w", err)
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("cannot read file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		// A pipe can be read only once, and the upload reads twice. A private
+		// copy on disk can be read again.
+		copied, err := copyToTempFile(f)
+		if err != nil {
+			return nil, err
+		}
+		defer os.Remove(copied.Name())
+		defer copied.Close()
+		f = copied
+	}
 
 	if filename == "" {
 		filename = filepath.Base(path)
@@ -108,15 +127,33 @@ func (c *Client) UploadFile(ctx context.Context, path, mimeType, filename string
 	if size == 0 {
 		return c.uploadEmpty(mimeType, filename, false)
 	}
-	// A section of exactly the hashed length: if the file grows while it is
-	// sent, the extra bytes are not sent under a hash that does not cover them.
 	return c.upload(ctx, fileUpload{
-		Body:     io.NewSectionReader(f, 0, size),
+		Body:     f,
 		Size:     size,
 		Hash:     hex.EncodeToString(h.Sum(nil)),
 		MIME:     mimeType,
 		Filename: filename,
 	})
+}
+
+// copyToTempFile copies a stream into a new temporary file (mode 0600) and
+// returns it rewound. The caller closes and removes it.
+func copyToTempFile(r io.Reader) (*os.File, error) {
+	tmp, err := os.CreateTemp("", "harbor-upload-*")
+	if err != nil {
+		return nil, fmt.Errorf("cannot make a temporary copy of the input: %w", err)
+	}
+	if _, err := io.Copy(tmp, r); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return nil, fmt.Errorf("cannot read the input: %w", err)
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return nil, fmt.Errorf("cannot read the temporary copy: %w", err)
+	}
+	return tmp, nil
 }
 
 // UploadBytes uploads content already held in memory, with the same presigned
@@ -148,7 +185,7 @@ func (c *Client) upload(ctx context.Context, up fileUpload) ([]byte, error) {
 	if up.MIME == "" {
 		up.MIME = defaultUploadMIME
 	}
-	stored, err := c.blobStored(up.Hash, up.Size)
+	stored, err := c.blobStored(ctx, up.Hash, up.Size)
 	if err != nil {
 		return nil, err
 	}
@@ -163,8 +200,8 @@ func (c *Client) upload(ctx context.Context, up fileUpload) ([]byte, error) {
 
 // blobStored asks the server whether it already holds these bytes, so a file
 // uploaded before is not sent again.
-func (c *Client) blobStored(hash string, size int64) (bool, error) {
-	data, err := c.CheckFile(hash, size)
+func (c *Client) blobStored(ctx context.Context, hash string, size int64) (bool, error) {
+	data, err := retryStep(ctx, func() ([]byte, error) { return c.CheckFile(hash, size) }, nil)
 	if err != nil {
 		return false, err
 	}
@@ -187,7 +224,7 @@ func (c *Client) blobStored(hash string, size int64) (bool, error) {
 // attempt a 403 is final: the link is new, so the store refused the request
 // itself.
 func (c *Client) sendBlob(ctx context.Context, up fileUpload) (bool, error) {
-	target, err := c.presignFor(up)
+	target, err := c.presignFor(ctx, up)
 	if err != nil || target == nil {
 		return false, err
 	}
@@ -201,14 +238,14 @@ func (c *Client) sendBlob(ctx context.Context, up fileUpload) (bool, error) {
 			}
 			backoff *= 2
 		}
-		status, retryable, err := c.putPresigned(ctx, target, up.Body, up.Size)
+		status, retryable, err := c.putPresigned(ctx, target, up)
 		if err != nil && status == http.StatusForbidden && attempt > 1 {
-			fresh, perr := c.presignFor(up)
+			fresh, perr := c.presignFor(ctx, up)
 			if perr != nil || fresh == nil {
 				return false, perr
 			}
 			target = fresh
-			_, retryable, err = c.putPresigned(ctx, target, up.Body, up.Size)
+			_, retryable, err = c.putPresigned(ctx, target, up)
 		}
 		if err == nil {
 			return true, nil
@@ -224,8 +261,10 @@ func (c *Client) sendBlob(ctx context.Context, up fileUpload) (bool, error) {
 // presignFor asks for a link to PUT these bytes. A nil link with no error means
 // a live row already holds them (409 already_exists): another upload of the
 // same file got there first, so the commit can go ahead without a PUT.
-func (c *Client) presignFor(up fileUpload) (*PresignedUpload, error) {
-	target, err := c.PresignUpload(up.Hash, up.Size, up.MIME, up.IsEncrypted)
+func (c *Client) presignFor(ctx context.Context, up fileUpload) (*PresignedUpload, error) {
+	target, err := retryStep(ctx, func() (*PresignedUpload, error) {
+		return c.PresignUpload(up.Hash, up.Size, up.MIME, up.IsEncrypted)
+	}, nil)
 	var apiErr *APIError
 	if errors.As(err, &apiErr) && apiErr.Code == "already_exists" {
 		return nil, nil
@@ -234,22 +273,46 @@ func (c *Client) presignFor(up fileUpload) (*PresignedUpload, error) {
 }
 
 // commitUpload registers the stored bytes as a resource. Right after a PUT, a
-// blob_missing answer can mean the store has not caught up yet, so that one
-// answer is tried again a few times. Without a PUT it is final.
+// blob_missing answer can mean the store has not caught up yet, so that answer
+// is tried again too. Without a PUT it is final.
 func (c *Client) commitUpload(ctx context.Context, up fileUpload, justSent bool) ([]byte, error) {
+	storeLag := func(err error) bool {
+		var apiErr *APIError
+		return justSent && errors.As(err, &apiErr) && apiErr.Code == "blob_missing"
+	}
+	return retryStep(ctx, func() ([]byte, error) {
+		return c.CommitFile(up.Hash, up.Size, up.MIME, up.Filename, up.IsEncrypted)
+	}, storeLag)
+}
+
+// retryStep runs one API call of an upload and tries it again after a failure
+// that can go better next time: no answer at all, a 5xx or a 429, or whatever
+// also says. Every step is safe to repeat. One blip after a long PUT would
+// otherwise throw the whole upload away.
+func retryStep[T any](ctx context.Context, step func() (T, error), also func(error) bool) (T, error) {
 	backoff := fileUploadRetryBackoff
 	for attempt := 1; ; attempt++ {
-		data, err := c.CommitFile(up.Hash, up.Size, up.MIME, up.Filename, up.IsEncrypted)
-		var apiErr *APIError
-		if err == nil || !justSent || attempt == commitAttempts ||
-			!errors.As(err, &apiErr) || apiErr.Code != "blob_missing" {
-			return data, err
+		out, err := step()
+		if err == nil || attempt == fileUploadAttempts || ctx.Err() != nil ||
+			!(transientAPIError(err) || (also != nil && also(err))) {
+			return out, err
 		}
-		if err := sleepCtx(ctx, backoff); err != nil {
-			return nil, err
+		if serr := sleepCtx(ctx, backoff); serr != nil {
+			return out, err
 		}
 		backoff *= 2
 	}
+}
+
+// transientAPIError reports whether an API call failed in a way a retry can
+// fix: the request got no answer, or the server answered 5xx or 429.
+func transientAPIError(err error) bool {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Status >= 500 || apiErr.Status == http.StatusTooManyRequests
+	}
+	var urlErr *url.Error
+	return errors.As(err, &urlErr)
 }
 
 // PresignUpload asks for a presigned link to PUT one new blob straight to
@@ -268,6 +331,12 @@ func (c *Client) PresignUpload(hash string, size int64, mimeType string, isEncry
 	if target.URL == "" {
 		return nil, errors.New("the server returned no upload link")
 	}
+	// A server without real storage hands out links like fake://…, which no
+	// HTTP client can PUT to. Say so once instead of retrying a dead end.
+	if u, err := url.Parse(target.URL); err != nil || (u.Scheme != "https" && u.Scheme != "http") {
+		return nil, fmt.Errorf("the server's upload link is not an http(s) link, so this CLI cannot send the file to it: %s",
+			strings.SplitN(target.URL, "?", 2)[0])
+	}
 	return &target, nil
 }
 
@@ -280,38 +349,39 @@ func (c *Client) CommitFile(hash string, size int64, mimeType, filename string, 
 	})
 }
 
-// putPresigned sends size bytes of body to a presigned storage link, and
+// putPresigned sends the upload's bytes to a presigned storage link, and
 // reports the storage status (0 when no answer came) and whether a failure is
 // worth another try.
 //
 // The link carries its own credentials, so the request must NOT carry the
 // bearer token: S3-compatible stores refuse two kinds of auth on one request.
-// The body streams from body as the network takes it, and Content-Length is set
-// up front because the link is signed for that length. There is no total time
-// limit; sendStreaming gives up when nothing moves for the stall timeout.
+// The body streams from up.Body as the network takes it, and Content-Length is
+// set up front because the link is signed for that length. There is no total
+// time limit; sendUpload gives up when nothing moves for the stall timeout.
 //
-// A dropped connection, a 5xx, a 408 or a 429 can go better next time. A stall
-// cannot be hurried by trying again at once, so it fails the upload.
-func (c *Client) putPresigned(ctx context.Context, target *PresignedUpload, body io.ReadSeeker, size int64) (status int, retryable bool, err error) {
-	if _, err := body.Seek(0, io.SeekStart); err != nil {
-		return 0, false, fmt.Errorf("cannot re-read the file: %w", err)
-	}
+// The bytes are hashed as they go. Storage does not check them against the
+// hash in the link, so a file edited in place after it was hashed would
+// otherwise be stored under a hash that does not match it.
+//
+// A dropped connection, a 5xx, a 408, a 429, or S3's 400 RequestTimeout (sent
+// when the connection went idle) can go better next time. A stall cannot be
+// hurried by trying again at once, so it fails the upload.
+func (c *Client) putPresigned(ctx context.Context, target *PresignedUpload, up fileUpload) (status int, retryable bool, err error) {
 	method := target.Method
 	if method == "" {
 		method = http.MethodPut
 	}
-	// NopCloser hides the concrete reader, so net/http never buffers or
-	// rewinds it on its own.
-	req, err := http.NewRequestWithContext(ctx, method, target.URL, io.NopCloser(body))
+	body := &hashingReader{r: io.NewSectionReader(up.Body, 0, up.Size), h: sha256.New()}
+	req, err := http.NewRequestWithContext(ctx, method, target.URL, body)
 	if err != nil {
 		return 0, false, fmt.Errorf("failed to create upload request: %w", err)
 	}
-	req.ContentLength = size
+	req.ContentLength = up.Size
 	for k, v := range target.Headers {
 		req.Header.Set(k, v)
 	}
 
-	resp, err := c.sendStreaming(c.storageClient(), req)
+	resp, err := c.sendUpload(c.storageClient(), req)
 	if err != nil {
 		var stall *StallError
 		return 0, !errors.As(err, &stall) && ctx.Err() == nil, fmt.Errorf("upload failed: %w", err)
@@ -321,13 +391,44 @@ func (c *Client) putPresigned(ctx context.Context, target *PresignedUpload, body
 	// A short excerpt names the problem.
 	excerpt, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if sum, n := body.sum(); n != up.Size || sum != up.Hash {
+			return resp.StatusCode, false, errFileChanged
+		}
 		return resp.StatusCode, false, nil
 	}
 	transient := resp.StatusCode >= 500 ||
 		resp.StatusCode == http.StatusRequestTimeout ||
-		resp.StatusCode == http.StatusTooManyRequests
+		resp.StatusCode == http.StatusTooManyRequests ||
+		(resp.StatusCode == http.StatusBadRequest && bytes.Contains(excerpt, []byte("<Code>RequestTimeout</Code>")))
 	return resp.StatusCode, transient, fmt.Errorf("storage refused the upload: HTTP %d %s",
 		resp.StatusCode, bytes.TrimSpace(excerpt))
+}
+
+// hashingReader hashes what passes through it. The transport reads it on its
+// own goroutine, so the hash is behind a lock.
+type hashingReader struct {
+	r io.Reader
+
+	mu sync.Mutex
+	h  hash.Hash
+	n  int64
+}
+
+// Read passes the read through and adds what it read to the hash.
+func (r *hashingReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	r.mu.Lock()
+	r.h.Write(p[:n])
+	r.n += int64(n)
+	r.mu.Unlock()
+	return n, err
+}
+
+// sum returns the hex sha256 of what was read so far, and how many bytes.
+func (r *hashingReader) sum() (string, int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return hex.EncodeToString(r.h.Sum(nil)), r.n
 }
 
 // uploadEmpty sends a zero-byte file through the API's multipart route. A

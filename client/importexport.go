@@ -97,10 +97,11 @@ func (c *Client) AbortImportUpload(kind, jobID string) ([]byte, error) {
 // The presigned URL carries its own credentials in the query string, so this
 // request must NOT be signed again — sending an Authorization header alongside
 // a presigned URL is rejected by S3-compatible stores as two auth mechanisms.
-// chunk is re-seeked before every attempt so a retry sends the same bytes, and
-// Content-Length is set explicitly: the store requires a length up front, and
-// net/http cannot infer one from a section reader.
-func (c *Client) UploadImportPart(ctx context.Context, url string, chunk io.ReadSeeker, size int64) (string, error) {
+// Each attempt reads chunk through its own section reader, so a retry sends the
+// same bytes even while the transport is still reading the failed attempt's
+// body. Content-Length is set explicitly: the store requires a length up front,
+// and net/http cannot infer one from a section reader.
+func (c *Client) UploadImportPart(ctx context.Context, url string, chunk io.ReaderAt, size int64) (string, error) {
 	backoff := importPartRetryBackoff
 	var lastErr error
 	for attempt := 1; attempt <= importPartAttempts; attempt++ {
@@ -128,11 +129,8 @@ func (c *Client) UploadImportPart(ctx context.Context, url string, chunk io.Read
 // worth retrying. A transport error or a 5xx/408/429 is transient; anything else
 // (a 403 from an expired signature, a 400 from a malformed request) would fail
 // identically however many times it is sent.
-func (c *Client) putImportPart(ctx context.Context, url string, chunk io.ReadSeeker, size int64) (etag string, retryable bool, err error) {
-	if _, err := chunk.Seek(0, io.SeekStart); err != nil {
-		return "", false, fmt.Errorf("cannot re-read the file: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, chunk)
+func (c *Client) putImportPart(ctx context.Context, url string, chunk io.ReaderAt, size int64) (etag string, retryable bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, io.NewSectionReader(chunk, 0, size))
 	if err != nil {
 		return "", false, fmt.Errorf("failed to create upload request: %w", err)
 	}

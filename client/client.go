@@ -371,27 +371,37 @@ func (c *Client) streamClient() *http.Client {
 	return &hc
 }
 
-// sendStreaming sends req on hc and gives up when the transfer stops moving for
-// the stall timeout. Only time spent waiting inside Read counts, so a slow reader
-// (a pipe into a pager) never trips it.
-//
-// A request body (an upload) counts too: every read the transport makes from it
-// restarts the timer, and the last one gives the server the full stall timeout to
-// answer. When the network stops taking bytes the transport stops reading, and
-// the timer fires. The caller must close the response body.
+// sendStreaming sends req on hc and gives up when the response, or the next
+// bytes of its body, take longer than the stall timeout. Only time spent waiting
+// inside Read counts, so a slow reader (a pipe into a pager) never trips it.
+// The caller must close the body.
 func (c *Client) sendStreaming(hc *http.Client, req *http.Request) (*http.Response, error) {
+	return c.sendWatched(hc, req, false)
+}
+
+// sendUpload is sendStreaming for a request whose body is a big upload. Every
+// read the transport makes from the body restarts the stall timer, and the last
+// one gives the server the full stall timeout to answer. When the network stops
+// taking bytes the transport stops reading, and the timer fires.
+func (c *Client) sendUpload(hc *http.Client, req *http.Request) (*http.Response, error) {
+	return c.sendWatched(hc, req, true)
+}
+
+// sendWatched is the body of sendStreaming and sendUpload. watchBody makes reads
+// of the request body count as progress.
+func (c *Client) sendWatched(hc *http.Client, req *http.Request, watchBody bool) (*http.Response, error) {
 	after := c.StallTimeout
 	if after <= 0 {
 		after = defaultStallTimeout
 	}
-	hasBody := req.Body != nil && req.Body != http.NoBody
-	stall := &StallError{After: after, Upload: hasBody}
+	watchBody = watchBody && req.Body != nil && req.Body != http.NoBody
+	stall := &StallError{After: after, Upload: watchBody}
 	ctx, cancel := context.WithCancelCause(req.Context())
 	timer := time.AfterFunc(after, func() { cancel(stall) })
 
 	sent := req.WithContext(ctx)
 	var upload *stallUpload
-	if hasBody {
+	if watchBody {
 		upload = &stallUpload{body: sent.Body, timer: timer, after: after}
 		sent.Body = upload
 		// A rewound body from GetBody would bypass the timer. Without it the
