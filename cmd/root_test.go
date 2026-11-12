@@ -35,11 +35,23 @@ import (
 // suite would otherwise run with encryption quietly switched ON, and take
 // different branches than it takes in CI. Tests that want any of these set them
 // with t.Setenv, which still wins.
+//
+// HOME goes to a throwaway directory for the same reason: the server-name
+// cache is file-backed in every command, so a test that forgot its own HOME
+// would otherwise read and write the developer's real ~/.config/harbor.
 func TestMain(m *testing.M) {
 	for _, key := range []string{"HARBOR_PASSPHRASE", "HARBOR_NEW_PASSPHRASE", "HARBOR_TOKEN", "HARBOR_API_URL"} {
 		_ = os.Unsetenv(key)
 	}
-	os.Exit(m.Run())
+	home, err := os.MkdirTemp("", "harbor-cmd-test-home-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cannot create a test HOME:", err)
+		os.Exit(1)
+	}
+	_ = os.Setenv("HOME", home)
+	code := m.Run()
+	_ = os.RemoveAll(home)
+	os.Exit(code)
 }
 
 // ===========================================================================
@@ -248,6 +260,9 @@ func resetCommandState(t *testing.T) {
 		// --no-wait sets this and nothing clears it, so one async import would
 		// otherwise change how every later run's summary is rendered.
 		importEnexAsync = false
+		// The server-name cache is keyed by base URL, and a stub server's port
+		// can be reused by a later test.
+		client.ForgetServerNames()
 		resetFlags(rootCmd)
 	}
 	clear()
@@ -938,5 +953,61 @@ func TestVersionIsWiredEverywhere(t *testing.T) {
 				t.Errorf("%s surfaces the raw version variable (%q) instead of resolveVersion(), so it reports \"dev\" under go install", f, bad)
 			}
 		}
+	}
+}
+
+// TestServerNameCarriedToTheNextCommand is the staging check as a test. Every
+// command is a new process, so the name one command learns must reach the first
+// request of the next through the file. A wrong saved name still works and is
+// healed by the response, and nothing extra prints.
+func TestServerNameCarriedToTheNextCommand(t *testing.T) {
+	home := t.TempDir()
+	var sent []string
+	m := newAPIMock(t, nil)
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		sent = append(sent, r.Header.Get("X-Harbor-Server"))
+		w.Header().Set("X-Harbor-Server", "app-harbor-my-02")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[],"paging":{"limit":50,"offset":0,"total":0,"has_more":false}}`))
+	}
+
+	// run executes one command as a fresh process would and returns the
+	// X-Harbor-Server its first request carried, plus its output.
+	run := func() (string, string) {
+		t.Helper()
+		start := len(sent)
+		out, err := runCLIInHome(t, home, m, "notebooks", "list")
+		if err != nil {
+			t.Fatalf("notebooks list: %v", err)
+		}
+		if len(sent) == start {
+			t.Fatal("notebooks list sent no request")
+		}
+		return sent[start], out
+	}
+
+	first, out1 := run()
+	if first != "" {
+		t.Errorf("first command carried %q, want no header before any response", first)
+	}
+	if got, _ := config.LoadServerName(m.baseURL()); got != "app-harbor-my-02" {
+		t.Errorf("saved name = %q, want app-harbor-my-02", got)
+	}
+	if second, _ := run(); second != "app-harbor-my-02" {
+		t.Errorf("next command carried %q, want app-harbor-my-02 from the file", second)
+	}
+
+	if err := config.SaveServerName(m.baseURL(), "wrong"); err != nil {
+		t.Fatal(err)
+	}
+	third, out3 := run()
+	if third != "wrong" {
+		t.Errorf("command carried %q, want the saved name", third)
+	}
+	if got, _ := config.LoadServerName(m.baseURL()); got != "app-harbor-my-02" {
+		t.Errorf("saved name = %q after a response, want it healed to app-harbor-my-02", got)
+	}
+	if out3 != out1 {
+		t.Errorf("output changed with a server name in play:\nfirst:\n%s\nlater:\n%s", out1, out3)
 	}
 }

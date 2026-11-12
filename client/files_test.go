@@ -290,6 +290,7 @@ func (s *uploadStub) serve(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Harbor-Server", "app-1")
 	switch key {
 	case "POST /files/check":
 		_, _ = fmt.Fprintf(w, `{"exists":%t,"hash":%q}`, s.exists, body["hash"])
@@ -448,6 +449,11 @@ func TestUploadFileUsesThePresignedFlow(t *testing.T) {
 	}
 	if got := put.Header.Get("X-Harbor-Platform"); got != "" {
 		t.Errorf("PUT carried X-Harbor-Platform %q, want none on a presigned link", got)
+	}
+	// The API's answers named a server before the PUT, so the client had one
+	// cached; it is for the API only.
+	if got := put.Header.Get("X-Harbor-Server"); got != "" {
+		t.Errorf("PUT carried X-Harbor-Server %q, want none on a presigned link", got)
 	}
 
 	commit := stub.body(t, "POST /files/commit", 0)

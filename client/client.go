@@ -269,11 +269,12 @@ func (c *Client) requestWithStatus(method, fullURL string, body []byte, contentT
 	}
 	c.setCommonHeaders(req)
 
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.apiClient().Do(req)
 	if err != nil {
 		return nil, 0, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
+	c.noteServerName(resp)
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -310,6 +311,7 @@ func (c *Client) rawRequest(method, fullURL string, allowRefresh bool) (*http.Re
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
+	c.noteServerName(resp)
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		c.LastRequestID = resp.Header.Get("X-Request-Id")
 		return resp, nil
@@ -362,13 +364,23 @@ func (e *StallError) Timeout() bool { return true }
 // Temporary reports true: a stall says nothing about the request itself.
 func (e *StallError) Temporary() bool { return true }
 
-// streamClient returns HTTPClient without its overall timeout, for a response
-// that is read as a stream. That timeout is sized for small JSON calls and would
-// cut a large download off part way; sendStreaming bounds a stall instead.
-func (c *Client) streamClient() *http.Client {
+// apiClient returns a copy of HTTPClient with the API's redirect policy (see
+// checkRedirect). It is applied on every request, not once in NewClient, so a
+// caller that swaps in its own HTTPClient cannot lose it.
+func (c *Client) apiClient() *http.Client {
 	hc := *c.HTTPClient
-	hc.Timeout = 0
+	hc.CheckRedirect = c.checkRedirect
 	return &hc
+}
+
+// streamClient returns the API client without its overall timeout, for a
+// response that is read as a stream. That timeout is sized for small JSON calls
+// and would cut a large download off part way; sendStreaming bounds a stall
+// instead.
+func (c *Client) streamClient() *http.Client {
+	hc := c.apiClient()
+	hc.Timeout = 0
+	return hc
 }
 
 // sendStreaming sends req on hc and gives up when the response, or the next
@@ -493,8 +505,9 @@ func (b *stallBody) Close() error {
 	return err
 }
 
-// setCommonHeaders applies Accept, Authorization (when a token is present), and
-// a generated X-Request-Id to a request.
+// setCommonHeaders applies Accept, Authorization (when a token is present), the
+// platform, a generated X-Request-Id, and the cached server name (when there is
+// one and the request goes to the API's host) to a request.
 func (c *Client) setCommonHeaders(req *http.Request) {
 	req.Header.Set("Accept", "application/json")
 	if c.AccessToken != "" {
@@ -502,6 +515,9 @@ func (c *Client) setCommonHeaders(req *http.Request) {
 	}
 	req.Header.Set("X-Harbor-Platform", clientPlatform)
 	req.Header.Set("X-Request-Id", generateRequestID())
+	if name := c.serverName(); name != "" && c.onAPIOrigin(req.URL) {
+		req.Header.Set(serverHeader, name)
+	}
 }
 
 // refresh invokes the OnUnauthorized hook under a lock so concurrent callers

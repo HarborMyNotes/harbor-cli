@@ -813,6 +813,7 @@ var logoutCmd = &cobra.Command{
 
 		creds, err := config.Load()
 		if err != nil {
+			forgetServerNames()
 			fmt.Println("Not logged in.")
 			return nil
 		}
@@ -829,6 +830,9 @@ var logoutCmd = &cobra.Command{
 				_ = c.Revoke(creds.AccessToken, "access_token")
 			}
 		}
+		// After the revoke calls, whose responses would otherwise save the name
+		// again.
+		forgetServerNames()
 		if err := config.Clear(); err != nil {
 			return err
 		}
@@ -842,6 +846,15 @@ var logoutCmd = &cobra.Command{
 		}
 		return nil
 	},
+}
+
+// forgetServerNames removes the saved X-Harbor-Server names, on disk and in
+// memory, so the next person to sign in on this device starts fresh. A
+// HARBOR_TOKEN run saves names without a session, so logout clears them even
+// when nobody is logged in.
+func forgetServerNames() {
+	_ = config.ClearServerNames()
+	client.ForgetServerNames()
 }
 
 // whoamiCmd shows the current session status.

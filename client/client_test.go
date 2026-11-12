@@ -297,8 +297,8 @@ func TestEveryRequestBuilderSetsCommonHeaders(t *testing.T) {
 	// Every exemption targets a presigned storage URL whose credentials live in
 	// the query string — a download for FetchURL, an import chunk for
 	// putImportPart, a file upload for putPresigned. None is a Harbor API
-	// endpoint, so they must send neither the bearer token nor the platform
-	// header.
+	// endpoint, so they must send neither the bearer token, the platform header
+	// nor the server name.
 	exemptRequestBuilders := map[string]bool{"FetchURL": true, "putImportPart": true, "putPresigned": true}
 
 	fset := token.NewFileSet()
@@ -369,6 +369,14 @@ func TestEveryRequestBuilderSetsCommonHeaders(t *testing.T) {
 					"it would send Harbor API traffic without X-Harbor-Platform: cli. "+
 					"Route it through setCommonHeaders, or add it to exemptRequestBuilders "+
 					"with a comment saying why it is not a Harbor API request.",
+					path, fn.Name.Name)
+			}
+			// The server name goes both ways: a builder that sends it must also
+			// read the response, or a new name is never learned and a 421 there
+			// never clears the old one.
+			if !callsPrefixed(fn, "c.noteServerName") {
+				t.Errorf("%s: %s sends Harbor API traffic but never calls noteServerName — "+
+					"it would never learn a new X-Harbor-Server name, and a 421 would not clear it.",
 					path, fn.Name.Name)
 			}
 		}

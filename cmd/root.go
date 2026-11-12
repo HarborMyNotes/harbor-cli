@@ -163,6 +163,10 @@ func init() {
 	pf.BoolVar(&utcFlag, "utc", false, "Render timestamps in UTC instead of local time")
 	pf.StringVar(&apiURLFlag, "api-url", "", "Override the API base URL (maintainer use; defaults to the production endpoint)")
 
+	// Every client in this process shares the server name, and the file carries
+	// it to the first request of the next command.
+	client.SetServerNameStore(config.LoadServerName, config.SaveServerName)
+
 	rootCmd.AddGroup(
 		&cobra.Group{ID: groupAuth, Title: "Authentication:"},
 		&cobra.Group{ID: groupContent, Title: "Content:"},
@@ -416,11 +420,12 @@ func usingEnvToken() bool {
 // It is silent by design: the write is a cache, so failing to make it is not
 // worth interrupting the command the user actually ran.
 //
-// One file is still written under HARBOR_TOKEN: the keystore cache
-// (config.SaveKeystoreBlob). That is the WRAPPED master key, useless without the
+// Two files are still written under HARBOR_TOKEN. The keystore cache
+// (config.SaveKeystoreBlob) is the WRAPPED master key, useless without the
 // passphrase, and caching it is what keeps a headless run from re-fetching the
 // keystore on every command. 'harbor crypto sync' refreshes it and
-// config.ClearKeystoreBlob removes it.
+// config.ClearKeystoreBlob removes it. The server-name cache (servers.json)
+// holds no secret, only which app server answered.
 func cacheCredentials(creds *config.Credentials) {
 	if usingEnvToken() {
 		return

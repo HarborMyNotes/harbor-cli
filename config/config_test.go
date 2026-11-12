@@ -82,6 +82,33 @@ func TestClearIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestKeystoreBlobRoundTripAndPerms covers writePrivateFile through its first
+// caller: the blob comes back, the file is 0600, the directory 0700, and no
+// temp file is left beside it.
+func TestKeystoreBlobRoundTripAndPerms(t *testing.T) {
+	home := withTempHome(t)
+	if err := SaveKeystoreBlob("HRBK1-test-blob"); err != nil {
+		t.Fatalf("SaveKeystoreBlob: %v", err)
+	}
+	if got, err := LoadKeystoreBlob(); err != nil || got != "HRBK1-test-blob" {
+		t.Errorf("LoadKeystoreBlob = %q, %v", got, err)
+	}
+
+	dir := filepath.Join(home, ".config", "harbor")
+	if info, err := os.Stat(filepath.Join(dir, "keystore.json")); err != nil || info.Mode().Perm() != 0600 {
+		t.Errorf("keystore.json stat = %v, %v; want mode 0600", info, err)
+	}
+	if info, err := os.Stat(dir); err != nil || info.Mode().Perm() != 0700 {
+		t.Errorf("config dir stat = %v, %v; want mode 0700", info, err)
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if e.Name() != "keystore.json" {
+			t.Errorf("unexpected file %q left in the config dir", e.Name())
+		}
+	}
+}
+
 func TestBaseURLDefaulting(t *testing.T) {
 	var nilCreds *Credentials
 	if got := nilCreds.BaseURL(); got != DefaultBaseURL {
