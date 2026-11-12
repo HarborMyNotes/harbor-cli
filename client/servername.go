@@ -4,7 +4,7 @@
 package client
 
 import (
-	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -152,7 +152,7 @@ func (c *Client) onAPIOrigin(u *url.URL) bool {
 // leaves the API origin. It keeps Go's default limit of 10 redirects.
 func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= maxRedirects {
-		return errors.New("stopped after 10 redirects")
+		return fmt.Errorf("stopped after %d redirects", maxRedirects)
 	}
 	if !c.onAPIOrigin(req.URL) {
 		req.Header.Del(serverHeader)

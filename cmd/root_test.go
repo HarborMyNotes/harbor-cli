@@ -35,11 +35,23 @@ import (
 // suite would otherwise run with encryption quietly switched ON, and take
 // different branches than it takes in CI. Tests that want any of these set them
 // with t.Setenv, which still wins.
+//
+// HOME goes to a throwaway directory for the same reason: the server-name
+// cache is file-backed in every command, so a test that forgot its own HOME
+// would otherwise read and write the developer's real ~/.config/harbor.
 func TestMain(m *testing.M) {
 	for _, key := range []string{"HARBOR_PASSPHRASE", "HARBOR_NEW_PASSPHRASE", "HARBOR_TOKEN", "HARBOR_API_URL"} {
 		_ = os.Unsetenv(key)
 	}
-	os.Exit(m.Run())
+	home, err := os.MkdirTemp("", "harbor-cmd-test-home-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cannot create a test HOME:", err)
+		os.Exit(1)
+	}
+	_ = os.Setenv("HOME", home)
+	code := m.Run()
+	_ = os.RemoveAll(home)
+	os.Exit(code)
 }
 
 // ===========================================================================

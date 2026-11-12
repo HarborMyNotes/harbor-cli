@@ -88,10 +88,9 @@ type Client struct {
 const clientPlatform = "cli"
 
 // NewClient creates a Harbor API client for the given base URL and access
-// token. The base URL is trimmed of any trailing slash. The request client keeps
-// the server name off any redirect that leaves the API's host.
+// token. The base URL is trimmed of any trailing slash.
 func NewClient(baseURL, accessToken string) *Client {
-	c := &Client{
+	return &Client{
 		BaseURL:     strings.TrimRight(baseURL, "/"),
 		AccessToken: accessToken,
 		HTTPClient: &http.Client{
@@ -99,8 +98,6 @@ func NewClient(baseURL, accessToken string) *Client {
 		},
 		StorageHTTPClient: &http.Client{},
 	}
-	c.HTTPClient.CheckRedirect = c.checkRedirect
-	return c
 }
 
 // storageClient returns the client used for direct-to-storage transfers,
@@ -272,7 +269,7 @@ func (c *Client) requestWithStatus(method, fullURL string, body []byte, contentT
 	}
 	c.setCommonHeaders(req)
 
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.apiClient().Do(req)
 	if err != nil {
 		return nil, 0, fmt.Errorf("request failed: %w", err)
 	}
@@ -367,13 +364,23 @@ func (e *StallError) Timeout() bool { return true }
 // Temporary reports true: a stall says nothing about the request itself.
 func (e *StallError) Temporary() bool { return true }
 
-// streamClient returns HTTPClient without its overall timeout, for a response
-// that is read as a stream. That timeout is sized for small JSON calls and would
-// cut a large download off part way; sendStreaming bounds a stall instead.
-func (c *Client) streamClient() *http.Client {
+// apiClient returns a copy of HTTPClient with the API's redirect policy (see
+// checkRedirect). It is applied on every request, not once in NewClient, so a
+// caller that swaps in its own HTTPClient cannot lose it.
+func (c *Client) apiClient() *http.Client {
 	hc := *c.HTTPClient
-	hc.Timeout = 0
+	hc.CheckRedirect = c.checkRedirect
 	return &hc
+}
+
+// streamClient returns the API client without its overall timeout, for a
+// response that is read as a stream. That timeout is sized for small JSON calls
+// and would cut a large download off part way; sendStreaming bounds a stall
+// instead.
+func (c *Client) streamClient() *http.Client {
+	hc := c.apiClient()
+	hc.Timeout = 0
+	return hc
 }
 
 // sendStreaming sends req on hc and gives up when the response, or the next

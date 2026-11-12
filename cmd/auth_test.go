@@ -688,3 +688,25 @@ func TestLogoutClearsServerNames(t *testing.T) {
 		t.Errorf("a request after logout carried X-Harbor-Server %q, want none", lastSent)
 	}
 }
+
+// TestLogoutWithoutSessionClearsServerNames covers a HARBOR_TOKEN user: those
+// runs save server names but no credentials, so logout finds nobody logged in
+// and must still remove the names.
+func TestLogoutWithoutSessionClearsServerNames(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	resetCommandState(t)
+	_ = config.SaveServerName("https://staging.example.com/api/v1", "app-1")
+
+	out := captureStdout(t, func() {
+		if err := logoutCmd.RunE(logoutCmd, nil); err != nil {
+			t.Fatalf("logout: %v", err)
+		}
+	})
+	if !strings.Contains(out, "Not logged in.") {
+		t.Errorf("logout output = %q, want \"Not logged in.\"", out)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".config", "harbor", "servers.json")); !os.IsNotExist(err) {
+		t.Errorf("servers.json survived logout (stat err %v)", err)
+	}
+}

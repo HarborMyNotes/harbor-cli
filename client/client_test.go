@@ -371,6 +371,14 @@ func TestEveryRequestBuilderSetsCommonHeaders(t *testing.T) {
 					"with a comment saying why it is not a Harbor API request.",
 					path, fn.Name.Name)
 			}
+			// The server name goes both ways: a builder that sends it must also
+			// read the response, or a new name is never learned and a 421 there
+			// never clears the old one.
+			if !callsPrefixed(fn, "c.noteServerName") {
+				t.Errorf("%s: %s sends Harbor API traffic but never calls noteServerName — "+
+					"it would never learn a new X-Harbor-Server name, and a 421 would not clear it.",
+					path, fn.Name.Name)
+			}
 		}
 		return nil
 	})

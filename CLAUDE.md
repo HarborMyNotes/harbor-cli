@@ -104,6 +104,7 @@ cmd/                    cobra command tree — ONE FILE PER DOMAIN
   assets/skill/         embedded skill content (SKILL.md + formatting.md + reference.md)
 client/                 HTTP client + API methods — ONE FILE PER DOMAIN
   client.go             Client, HTTP verbs, transparent-refresh, request plumbing
+  servername.go         X-Harbor-Server: cache the name per base URL, send it back
   errors.go             APIError (typed error envelope)
   envelope.go           response-envelope decoders (collection/paging/data/token)
   auth.go  notebooks.go  notes.go  …                (mirror cmd/ domains)
@@ -112,6 +113,7 @@ crypto/                 client-side E2E note crypto (zero-knowledge server)
   README.md             the canonical cross-client interop contract
 config/
   config.go             credentials.json load/save (0600), expiry helpers; keystore-blob cache
+  servers.go            servers.json: the X-Harbor-Server name per API base URL
 .github/workflows/      test.yml (CI) + release.yml (CD)
 .github/scripts/        bump-tap-formula.py — repoints the homebrew-harbor
                         formula at a new release (run by release.yml)

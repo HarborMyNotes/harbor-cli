@@ -813,6 +813,7 @@ var logoutCmd = &cobra.Command{
 
 		creds, err := config.Load()
 		if err != nil {
+			forgetServerNames()
 			fmt.Println("Not logged in.")
 			return nil
 		}
@@ -829,17 +830,15 @@ var logoutCmd = &cobra.Command{
 				_ = c.Revoke(creds.AccessToken, "access_token")
 			}
 		}
+		// After the revoke calls, whose responses would otherwise save the name
+		// again.
+		forgetServerNames()
 		if err := config.Clear(); err != nil {
 			return err
 		}
 		// Drop the cached (wrapped) keystore blob too, so a logout leaves no
 		// account-specific encryption state behind.
 		_ = config.ClearKeystoreBlob()
-		// Forget which app server answered, so the next person to sign in on
-		// this device starts fresh. This runs after the revoke calls, whose
-		// responses would otherwise save the name again.
-		_ = config.ClearServerNames()
-		client.ForgetServerNames()
 		if allDevices {
 			fmt.Println("Logged out of all devices.")
 		} else {
@@ -847,6 +846,15 @@ var logoutCmd = &cobra.Command{
 		}
 		return nil
 	},
+}
+
+// forgetServerNames removes the saved X-Harbor-Server names, on disk and in
+// memory, so the next person to sign in on this device starts fresh. A
+// HARBOR_TOKEN run saves names without a session, so logout clears them even
+// when nobody is logged in.
+func forgetServerNames() {
+	_ = config.ClearServerNames()
+	client.ForgetServerNames()
 }
 
 // whoamiCmd shows the current session status.

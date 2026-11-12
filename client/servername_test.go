@@ -208,6 +208,22 @@ func TestServerNameLoadedFromStoreOnFirstRequest(t *testing.T) {
 	}
 }
 
+// TestInvalidSavedServerNameIsNotSent proves a damaged entry in the file is
+// treated as no name. Sending it would fail every request: Go refuses a header
+// value with a control character, and the server would see junk otherwise.
+func TestInvalidSavedServerNameIsNotSent(t *testing.T) {
+	for _, bad := range []string{"app\n1", "app 1", strings.Repeat("a", 65)} {
+		stub := newServerStub(t, serverReply{status: 200, body: `{}`})
+		useServerStore(t, map[string]string{stub.srv.URL: bad})
+		if _, err := NewClient(stub.srv.URL, "at_x").doGet("/notes", nil); err != nil {
+			t.Fatalf("saved name %q: request failed: %v", bad, err)
+		}
+		if got := stub.headers(); got[0] != "" {
+			t.Errorf("saved name %q: request carried %q, want no header", bad, got[0])
+		}
+	}
+}
+
 // TestServerNameSharedAcrossClients covers the short-lived clients (sign-in,
 // whoami, the upload-limits probe): a name one client learns, a new client for
 // the same API sends.
@@ -379,9 +395,9 @@ func TestServerNameSurvivesRefreshRetry(t *testing.T) {
 	}
 }
 
-// TestServerNameNeverSentToOtherHosts proves the presigned transfers (a
-// download, an import part, a file upload's PUT) never carry the name, even
-// with one cached for the API.
+// TestServerNameNeverSentToOtherHosts proves a presigned download and an
+// import part never carry the name, even with one cached for the API. The file
+// upload's PUT is pinned in TestUploadFileUsesThePresignedFlow.
 func TestServerNameNeverSentToOtherHosts(t *testing.T) {
 	storage := newServerStub(t, serverReply{status: 200, body: `blob`})
 	api := newServerStub(t, serverReply{status: 200, body: `{}`})
@@ -409,27 +425,57 @@ func TestServerNameNeverSentToOtherHosts(t *testing.T) {
 // TestServerNameStrippedOnRedirectToOtherHost proves a redirect that leaves the
 // API's host loses the header (Go copies custom headers to any host), that the
 // API itself still got it, and that a name the other host sends is not learned.
+// It holds when a caller swaps in its own HTTPClient, as the upload-limits probe
+// does, and on the streamed path.
 func TestServerNameStrippedOnRedirectToOtherHost(t *testing.T) {
-	elsewhere := newServerStub(t, serverReply{status: 200, name: named("not-harbor"), body: `{}`})
-	var apiGot string
-	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		apiGot = r.Header.Get("X-Harbor-Server")
-		http.Redirect(w, r, elsewhere.srv.URL+"/landing", http.StatusFound)
-	}))
-	defer api.Close()
-	store := useServerStore(t, map[string]string{api.URL: "app-1"})
+	cases := []struct {
+		name    string
+		swap    bool
+		request func(c *Client) error
+	}{
+		{"requestWithStatus", false, func(c *Client) error { _, e := c.doGet("/go", nil); return e }},
+		{"requestWithStatus, own HTTPClient", true, func(c *Client) error { _, e := c.doGet("/go", nil); return e }},
+		{"rawRequest, own HTTPClient", true, func(c *Client) error {
+			resp, e := c.doGetRaw("/go", nil)
+			if e == nil {
+				resp.Body.Close()
+			}
+			return e
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			elsewhere := newServerStub(t, serverReply{status: 200, name: named("not-harbor"), body: `{}`})
+			var mu sync.Mutex
+			var apiGot []string
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				apiGot = append(apiGot, r.Header.Get("X-Harbor-Server"))
+				mu.Unlock()
+				http.Redirect(w, r, elsewhere.srv.URL+"/landing", http.StatusFound)
+			}))
+			t.Cleanup(api.Close)
+			store := useServerStore(t, map[string]string{api.URL: "app-1"})
+			c := NewClient(api.URL, "at_x")
+			if tc.swap {
+				c.HTTPClient = &http.Client{}
+			}
 
-	if _, err := NewClient(api.URL, "at_x").doGet("/go", nil); err != nil {
-		t.Fatalf("doGet: %v", err)
-	}
-	if apiGot != "app-1" {
-		t.Errorf("the API got %q, want app-1", apiGot)
-	}
-	if got := elsewhere.headers(); got[0] != "" {
-		t.Errorf("the other host got X-Harbor-Server %q, want none", got[0])
-	}
-	if name := store.get(api.URL); name != "app-1" {
-		t.Errorf("stored name = %q, want app-1 kept (the other host's name ignored)", name)
+			if err := tc.request(c); err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			mu.Lock()
+			if len(apiGot) != 1 || apiGot[0] != "app-1" {
+				t.Errorf("the API got %q, want [app-1]", apiGot)
+			}
+			mu.Unlock()
+			if got := elsewhere.headers(); got[0] != "" {
+				t.Errorf("the other host got X-Harbor-Server %q, want none", got[0])
+			}
+			if name := store.get(api.URL); name != "app-1" {
+				t.Errorf("stored name = %q, want app-1 kept (the other host's name ignored)", name)
+			}
+		})
 	}
 }
 
