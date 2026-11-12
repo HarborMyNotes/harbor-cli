@@ -835,6 +835,11 @@ var logoutCmd = &cobra.Command{
 		// Drop the cached (wrapped) keystore blob too, so a logout leaves no
 		// account-specific encryption state behind.
 		_ = config.ClearKeystoreBlob()
+		// Forget which app server answered, so the next person to sign in on
+		// this device starts fresh. This runs after the revoke calls, whose
+		// responses would otherwise save the name again.
+		_ = config.ClearServerNames()
+		client.ForgetServerNames()
 		if allDevices {
 			fmt.Println("Logged out of all devices.")
 		} else {

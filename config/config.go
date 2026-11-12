@@ -194,6 +194,17 @@ func LoadKeystoreBlob() (string, error) {
 // SaveKeystoreBlob atomically writes the keystore blob cache with 0600
 // permissions, creating the config directory if needed.
 func SaveKeystoreBlob(blob string) error {
+	data, err := json.MarshalIndent(map[string]string{"blob": blob}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writePrivateFile(keystoreCacheFile, data)
+}
+
+// writePrivateFile atomically writes data to name in the config directory with
+// 0600 permissions, creating the 0700 directory if needed. It writes a temp file
+// and renames it, so a crash never leaves a half-written file.
+func writePrivateFile(name string, data []byte) error {
 	dir, err := ConfigDirPath()
 	if err != nil {
 		return err
@@ -201,30 +212,25 @@ func SaveKeystoreBlob(blob string) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("unable to create config directory: %w", err)
 	}
-	data, err := json.MarshalIndent(map[string]string{"blob": blob}, "", "  ")
+	tmp, err := os.CreateTemp(dir, "."+name+"-*.tmp")
 	if err != nil {
-		return err
-	}
-	path := filepath.Join(dir, keystoreCacheFile)
-	tmp, err := os.CreateTemp(dir, ".keystore-*.tmp")
-	if err != nil {
-		return fmt.Errorf("unable to create temp keystore file: %w", err)
+		return fmt.Errorf("unable to create temp file for %s: %w", name, err)
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	defer os.Remove(tmpName) // no-op once the rename succeeds
 	if err := tmp.Chmod(0600); err != nil {
 		tmp.Close()
-		return fmt.Errorf("unable to set keystore permissions: %w", err)
+		return fmt.Errorf("unable to set permissions on %s: %w", name, err)
 	}
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
-		return fmt.Errorf("unable to write keystore cache: %w", err)
+		return fmt.Errorf("unable to write %s: %w", name, err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("unable to flush keystore cache: %w", err)
+		return fmt.Errorf("unable to flush %s: %w", name, err)
 	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("unable to finalize keystore cache: %w", err)
+	if err := os.Rename(tmpName, filepath.Join(dir, name)); err != nil {
+		return fmt.Errorf("unable to finalize %s: %w", name, err)
 	}
 	return nil
 }

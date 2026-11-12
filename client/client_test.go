@@ -297,8 +297,8 @@ func TestEveryRequestBuilderSetsCommonHeaders(t *testing.T) {
 	// Every exemption targets a presigned storage URL whose credentials live in
 	// the query string — a download for FetchURL, an import chunk for
 	// putImportPart, a file upload for putPresigned. None is a Harbor API
-	// endpoint, so they must send neither the bearer token nor the platform
-	// header.
+	// endpoint, so they must send neither the bearer token, the platform header
+	// nor the server name.
 	exemptRequestBuilders := map[string]bool{"FetchURL": true, "putImportPart": true, "putPresigned": true}
 
 	fset := token.NewFileSet()

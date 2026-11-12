@@ -163,6 +163,10 @@ func init() {
 	pf.BoolVar(&utcFlag, "utc", false, "Render timestamps in UTC instead of local time")
 	pf.StringVar(&apiURLFlag, "api-url", "", "Override the API base URL (maintainer use; defaults to the production endpoint)")
 
+	// Every client in this process shares the server name, and the file carries
+	// it to the first request of the next command.
+	client.SetServerNameStore(config.LoadServerName, config.SaveServerName)
+
 	rootCmd.AddGroup(
 		&cobra.Group{ID: groupAuth, Title: "Authentication:"},
 		&cobra.Group{ID: groupContent, Title: "Content:"},

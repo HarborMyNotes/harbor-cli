@@ -646,3 +646,45 @@ func TestWhoamiWithoutEnvTokenStillReadsTheSavedSession(t *testing.T) {
 		t.Errorf("a saved session was reported as an env-token session:\n%s", out)
 	}
 }
+
+// TestLogoutClearsServerNames proves logout removes the saved server names, so
+// the next person to sign in starts fresh. The logout and revoke responses
+// name a server too, so this also pins that the clear runs after them.
+func TestLogoutClearsServerNames(t *testing.T) {
+	var lastSent string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lastSent = r.Header.Get("X-Harbor-Server")
+		w.Header().Set("X-Harbor-Server", "app-1")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	resetCommandState(t)
+	base := srv.URL + "/api/v1"
+	if err := config.Save(&config.Credentials{APIURL: base, Email: "you@example.com", AccessToken: "hbp_test"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = config.SaveServerName(base, "app-1")
+	_ = config.SaveServerName("https://other.example.com/api/v1", "app-9")
+
+	captureStdout(t, func() {
+		if err := logoutCmd.RunE(logoutCmd, nil); err != nil {
+			t.Fatalf("logout: %v", err)
+		}
+	})
+
+	if _, err := os.Stat(filepath.Join(home, ".config", "harbor", "servers.json")); !os.IsNotExist(err) {
+		t.Errorf("servers.json survived logout (stat err %v)", err)
+	}
+	// The in-memory copy is gone too: a request in this same process goes
+	// without the name.
+	if _, err := client.NewClient(base, "").Health(); err != nil {
+		t.Fatalf("health: %v", err)
+	}
+	if lastSent != "" {
+		t.Errorf("a request after logout carried X-Harbor-Server %q, want none", lastSent)
+	}
+}

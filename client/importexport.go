@@ -229,6 +229,7 @@ func (c *Client) rawPostWithRefresh(fullURL string, body []byte, contentType str
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
+	c.noteServerName(resp)
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		c.LastRequestID = resp.Header.Get("X-Request-Id")
 		return resp, nil
