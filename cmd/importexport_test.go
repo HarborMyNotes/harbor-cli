@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -81,9 +82,9 @@ func TestDisplayImportStatusJobLevelError(t *testing.T) {
 	}
 
 	// A job-level error that says something the reason did not still shows.
-	data = []byte(`{"data":{"id":"job-y","status":"failed","failure_reason":"","errors":[{"note_index":-1,"title":"","reason":"storage_unavailable"}]}}`)
+	data = []byte(`{"data":{"id":"j-y","status":"failed","failure_reason":"","errors":[{"note_index":-1,"title":"","reason":"storage_unavailable"}]}}`)
 	out = captureStdout(t, func() { displayImportStatus(data) })
-	if !containsSub(out, "Errors:", "job", "temporarily unavailable") {
+	if !containsSub(out, "Errors:", "temporarily unavailable") || !hasJobRow(out) {
 		t.Errorf("job-level error not rendered:\n%s", out)
 	}
 }
@@ -112,6 +113,98 @@ func TestImportReasonSentence(t *testing.T) {
 	}
 	if !strings.Contains(shortExport, "re-export") {
 		t.Errorf("a truncated source must point at re-exporting, got %q", shortExport)
+	}
+
+	// A read that stopped partway names neither a cut-off upload nor a re-run.
+	if got, want := importReasonSentence("incomplete_read"), "Harbor lost its connection to the file partway through."; got != want {
+		t.Errorf("incomplete_read = %q, want %q", got, want)
+	}
+	if got, want := cutOff, "Harbor couldn't read the rest of the file from here on."; got != want {
+		t.Errorf("file_truncated = %q, want %q", got, want)
+	}
+
+	// file_damaged reads differently on the job and on a note: the job read no
+	// note, so it cannot say "copy this note".
+	if got, want := importReasonSentence("file_damaged"), "The export file is damaged, so Harbor couldn't read any notes from it. Make a fresh export from Evernote and import that."; got != want {
+		t.Errorf("file_damaged job sentence = %q, want %q", got, want)
+	}
+	if got, want := importNoteReasonSentence("file_damaged", "file_damaged"), "The export file is damaged at this note, so Harbor couldn't read it. Copy this note across from Evernote by hand."; got != want {
+		t.Errorf("file_damaged note sentence = %q, want %q", got, want)
+	}
+	if got := importNoteReasonSentence("file_damaged", ""); got != importReasonSentences["file_damaged"] {
+		t.Errorf("file_damaged on a partial job = %q", got)
+	}
+
+	// The codes the server already sends must not fall to the generic sentence.
+	for _, code := range []string{"file_damaged", "import_stopped", "not_upnote_zip", "evernote_disconnected", "evernote_unavailable", "evernote_note_unreadable", "evernote_notes_unreachable"} {
+		if importReasonSentence(code) == importReasonSentences["unknown"] {
+			t.Errorf("%s has no sentence of its own", code)
+		}
+	}
+}
+
+// TestImportReasonSentencesNeverAdviseARerunOfAStoppedRead pins the rule that
+// no sentence for a read that stopped partway sends someone to run the same
+// import again (that adds every note twice) or blames a cut-off upload.
+func TestImportReasonSentencesNeverAdviseARerunOfAStoppedRead(t *testing.T) {
+	sentences := []string{
+		importReasonSentence("incomplete_read"),
+		importReasonSentence("file_damaged"),
+		importNoteReasonSentence("file_damaged", ""),
+		importNoteReasonSentence("file_damaged", "file_damaged"),
+		importNoteReasonSentence("file_truncated", ""),
+		importNoteReasonSentence("file_truncated", "incomplete_read"),
+		importNoteReasonSentence("file_truncated", "truncated_source"),
+	}
+	for _, s := range sentences {
+		lower := strings.ToLower(s)
+		for _, banned := range []string{"again", "re-run", "rerun", "cut off", "upload", "transfer"} {
+			if strings.Contains(lower, banned) {
+				t.Errorf("%q says %q", s, banned)
+			}
+		}
+	}
+}
+
+// TestDisplayImportStatusFileDamaged checks both shapes a damaged export takes:
+// a failed job whose Why: line uses the job sentence, and a partial or
+// completed job whose rows, including a -1 row between two notes, use the
+// per-note sentence.
+func TestDisplayImportStatusFileDamaged(t *testing.T) {
+	// Not one note could be read. A -1 row between notes still shows, because
+	// it does not read the same as the Why: line.
+	data := []byte(`{"data":{"id":"j-d","status":"failed","failure_reason":"file_damaged","total_notes":2,"imported_notes":0,"failed_notes":2,"errors":[` +
+		`{"note_index":0,"title":"First","reason":"file_damaged"},` +
+		`{"note_index":-1,"title":"","reason":"file_damaged"},` +
+		`{"note_index":1,"title":"Second","reason":"file_damaged"}]}}`)
+	out := captureStdout(t, func() { displayImportStatus(data) })
+	flat := strings.Join(strings.Fields(out), " ")
+	if !strings.Contains(flat, "Why: The export file is damaged, so Harbor couldn't read any notes from it. Make a fresh export from Evernote and import that.") {
+		t.Errorf("Why: should carry the job sentence:\n%s", out)
+	}
+	if !containsSub(out, "Errors:", "First", "Second") || !hasJobRow(out) {
+		t.Errorf("every damaged spot should be a row:\n%s", out)
+	}
+	if got := strings.Count(flat, "damaged at this"); got != 3 {
+		t.Errorf("want the per-note sentence on all 3 rows, got %d:\n%s", got, out)
+	}
+	if strings.Contains(out, "file_damaged") {
+		t.Errorf("the raw reason code leaked to the user:\n%s", out)
+	}
+
+	// Damage only between notes: every note imported and the job completed,
+	// with one -1 row in the per-note wording and no Why: line.
+	data = []byte(`{"data":{"id":"j-e","status":"completed","total_notes":3,"imported_notes":3,"failed_notes":0,"errors":[{"note_index":-1,"title":"","reason":"file_damaged"}]}}`)
+	out = captureStdout(t, func() { displayImportStatus(data) })
+	flat = strings.Join(strings.Fields(out), " ")
+	if strings.Contains(out, "Why:") {
+		t.Errorf("a completed job has no Why: line:\n%s", out)
+	}
+	if !hasJobRow(out) || !strings.Contains(flat, "damaged at this") {
+		t.Errorf("a -1 file_damaged row should print as a job row with the per-note sentence:\n%s", out)
+	}
+	if strings.Contains(flat, "couldn't read any notes") {
+		t.Errorf("a -1 row must not use the job sentence:\n%s", out)
 	}
 }
 
@@ -255,6 +348,12 @@ func TestFilepathBase(t *testing.T) {
 
 // containsSub reports whether s contains every substring in subs. A small local
 // helper mirroring the client package's containsAll for cmd display assertions.
+// hasJobRow reports whether a status table has a row whose NOTE cell is "job"
+// (a -1 row), allowing for the color codes dim may wrap it in.
+func hasJobRow(out string) bool {
+	return regexp.MustCompile(`│\s*(\x1b\[[0-9;]*m)*job(\x1b\[[0-9;]*m)*\s*│`).MatchString(out)
+}
+
 func containsSub(s string, subs ...string) bool {
 	for _, sub := range subs {
 		if !strings.Contains(s, sub) {
@@ -721,6 +820,15 @@ func TestImportJobFailureFlagsLostNotes(t *testing.T) {
 	}
 	if why, _ := apiError.Details["reason"].(string); !strings.Contains(why, "re-export") {
 		t.Errorf("a truncated source should point at re-exporting, got %v", apiError.Details["reason"])
+	}
+
+	// A damaged export gets the job sentence, not the per-note one.
+	err = importJobFailure([]byte(`{"data":{"id":"job-d","status":"failed","failure_reason":"file_damaged","total_notes":2,"imported_notes":0}}`))
+	if !errors.As(err, &apiError) {
+		t.Fatalf("want an *client.APIError, got %T", err)
+	}
+	if why := apiError.Details["reason"]; why != importJobReasonSentences["file_damaged"] {
+		t.Errorf("a damaged export should carry the job sentence, got %v", why)
 	}
 }
 
