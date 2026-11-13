@@ -138,7 +138,7 @@ var importStatusCmd = &cobra.Command{
 	Use:     "status <job-id>",
 	Short:   "Poll an ENEX import job",
 	Args:    cobra.ExactArgs(1),
-	Long:    "Fetch the live counters for an import job plus the list of per-note failures (up to 100). A job-level failure appears as a single error with note index -1.",
+	Long:    "Fetch the live counters for an import job plus the list of per-note failures (up to 100). A row that belongs to no single note (a job-level failure, or damage between two notes in the file) shows \"job\" in the NOTE column.",
 	Example: "  harbor import status 0f9c2b1e-1a2b-3c4d-5e6f-7a8b9c0d1e2f",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c, _, err := loadClientFromConfig()
@@ -844,14 +844,16 @@ func displayImportStatus(data []byte) {
 	}
 
 	// errors is always present (never null); render the per-note failures, if
-	// any, under the counters. A job-level failure carries note_index -1.
+	// any, under the counters. A row that belongs to no single note carries
+	// note_index -1.
 	errRows := make([][]string, 0, len(toSlice(j["errors"])))
 	for _, e := range toSlice(j["errors"]) {
 		idx := int(num(e, "note_index"))
-		reason := str(e, "reason")
-		// A job-level entry that just restates failure_reason is the line above,
-		// printed twice.
-		if idx < 0 && reason == failureReason {
+		sentence := importNoteReasonSentence(str(e, "reason"), failureReason)
+		// A job-level entry that reads the same as the Why: line is that line
+		// printed twice. A file_damaged one between two notes reads differently,
+		// so it stays.
+		if idx < 0 && sentence == importReasonSentence(failureReason) {
 			continue
 		}
 		idxStr := strconv.Itoa(idx)
@@ -861,7 +863,7 @@ func displayImportStatus(data []byte) {
 		errRows = append(errRows, []string{
 			idxStr,
 			truncate(str(e, "title"), 30),
-			importNoteReasonSentence(reason, failureReason),
+			sentence,
 		})
 	}
 	if len(errRows) == 0 {
@@ -879,43 +881,57 @@ func displayImportStatus(data []byte) {
 // is reported as `unknown` precisely so a client running ahead of its server
 // cannot leak one. The wording is Harbor's own, shared with the web client, so
 // the same failure reads the same wherever someone meets it.
+//
+// Running a stopped import again adds every note a second time, so no sentence
+// for a read that stopped partway says to do that. import_stopped is the one
+// that names a re-import, and it says to delete the notebook first.
 var importReasonSentences = map[string]string{
-	"attachment_unreadable": "An attachment in this note was corrupted and couldn't be read.",
-	"storage_unavailable":   "Harbor's file storage was temporarily unavailable, so this note's attachment couldn't be saved. Re-running the import will retry it.",
-	"note_malformed":        "This note's formatting couldn't be understood by the importer.",
-	"file_truncated":        "The file couldn't be read all the way through — the upload may have been cut off.",
-	"not_enex":              "This file isn't an Evernote export, so there was nothing to import.",
-	"not_obsidian_zip":      "This file isn't a readable vault zip, so there was nothing to import.",
-	"not_standardnotes":     "This file isn't a decrypted Standard Notes backup, so there was nothing to import.",
-	"upload_incomplete":     "The upload didn't finish, so the file couldn't be read. Try importing it again.",
-	"source_missing":        "The uploaded file was no longer available to import. Try importing it again.",
-	"notebook_unavailable":  "Harbor couldn't open the notebook these notes were being imported into.",
-	"unsafe_zip_entry":      "A file in the zip had an unsafe path and was refused.",
-	"note_too_large":        "This note is bigger than Harbor's per-note limit.",
-	"attachment_missing":    "An attachment this note references couldn't be read from the zip.",
-	"link_ambiguous":        "A link in this note matches more than one file, so it was left as text.",
-	"truncated_source":      "The Evernote export itself ends mid-note, so the missing notes aren't in the file — re-export from Evernote to recover them.",
-	"incomplete_read":       "The transfer ended before the whole file was read. Run the import again to finish it.",
-	"unknown":               "Something went wrong while importing this note.",
+	"attachment_unreadable":      "An attachment in this note was corrupted and couldn't be read.",
+	"storage_unavailable":        "Harbor's file storage was temporarily unavailable, so this note's attachment couldn't be saved. Re-running the import will retry it.",
+	"note_malformed":             "This note's formatting couldn't be understood by the importer.",
+	"file_truncated":             "Harbor couldn't read the rest of the file from here on.",
+	"file_damaged":               "The export file is damaged at this note, so Harbor couldn't read it. Copy this note across from Evernote by hand.",
+	"not_enex":                   "This file isn't an Evernote export, so there was nothing to import.",
+	"not_obsidian_zip":           "This file isn't a readable vault zip, so there was nothing to import.",
+	"not_upnote_zip":             "This file isn't an UpNote export Harbor could open, so there was nothing to import. In UpNote, export all notes as Markdown, zip the folder it makes, and try again.",
+	"not_standardnotes":          "This file isn't a decrypted Standard Notes backup, so there was nothing to import.",
+	"upload_incomplete":          "The upload didn't finish, so the file couldn't be read. Try importing it again.",
+	"source_missing":             "The uploaded file was no longer available to import. Try importing it again.",
+	"notebook_unavailable":       "Harbor couldn't open the notebook these notes were being imported into.",
+	"unsafe_zip_entry":           "A file in the zip had an unsafe path and was refused.",
+	"note_too_large":             "This note is bigger than Harbor's per-note limit.",
+	"attachment_missing":         "An attachment this note references couldn't be read from the zip.",
+	"link_ambiguous":             "A link in this note matches more than one file, so it was left as text.",
+	"truncated_source":           "The Evernote export itself ends mid-note, so the missing notes aren't in the file — re-export from Evernote to recover them.",
+	"incomplete_read":            "Harbor lost its connection to the file partway through.",
+	"import_stopped":             "The import stopped before it finished. Delete the notebook and import the file again.",
+	"evernote_disconnected":      "Harbor lost access to your Evernote account part way, so the import stopped. Connect again to import the rest.",
+	"evernote_unavailable":       "Evernote isn't accepting Harbor's connection right now, so the import stopped. Try again later, or import an .enex export.",
+	"evernote_note_unreadable":   "Evernote kept failing to hand over this note, so it was left out.",
+	"evernote_notes_unreachable": "Evernote's search couldn't list some notes (too many were created on one day), so they weren't imported. Export that day's notebook as an .enex and import it.",
+	"unknown":                    "Something went wrong while importing this note.",
+}
+
+// importJobReasonSentences holds the job-level wording for a code whose Why:
+// line must say something different from its per-note row. A file_damaged job
+// read no note at all, so "copy this note by hand" has no note to point at.
+var importJobReasonSentences = map[string]string{
+	"file_damaged": "The export file is damaged, so Harbor couldn't read any notes from it. Make a fresh export from Evernote and import that.",
 }
 
 // importNoteNotInFile is what file_truncated means on a job whose read reached
-// the end of a short EXPORT: not a cut-off upload but a note Evernote never
-// wrote. Retrying the same file cannot recover it, so the generic "the upload
-// may have been cut off" wording would send someone to the one action that
-// definitely will not work.
+// the end of a short EXPORT: a note Evernote never wrote. Only a fresh export
+// can recover it, so this sentence says so instead of the generic one.
 const importNoteNotInFile = "The export file ends in the middle of this note — re-export from Evernote to recover it."
 
-// importReasonSentence renders one failure code as a sentence, falling back to
-// the generic one rather than printing an unrecognised code raw.
+// importReasonSentence renders a JOB's failure_reason as a sentence. A code
+// with its own job wording uses it; every other code reads the same as on a
+// note.
 func importReasonSentence(code string) string {
-	if code == "" {
-		return ""
-	}
-	if sentence, ok := importReasonSentences[code]; ok {
+	if sentence, ok := importJobReasonSentences[code]; ok {
 		return sentence
 	}
-	return importReasonSentences["unknown"]
+	return importCodeSentence(code)
 }
 
 // importNoteReasonSentence renders a PER-NOTE failure code, which the job's own
@@ -924,7 +940,20 @@ func importNoteReasonSentence(code, jobFailureReason string) string {
 	if code == "file_truncated" && jobFailureReason == "truncated_source" {
 		return importNoteNotInFile
 	}
-	return importReasonSentence(code)
+	return importCodeSentence(code)
+}
+
+// importCodeSentence looks one failure code up in importReasonSentences,
+// falling back to the generic sentence rather than printing an unrecognised
+// code raw. An empty code renders as an empty string.
+func importCodeSentence(code string) string {
+	if code == "" {
+		return ""
+	}
+	if sentence, ok := importReasonSentences[code]; ok {
+		return sentence
+	}
+	return importReasonSentences["unknown"]
 }
 
 func init() {
