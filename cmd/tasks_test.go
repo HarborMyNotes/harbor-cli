@@ -161,17 +161,28 @@ func TestAddTaskDueToBodyTimed(t *testing.T) {
 func TestAddTaskDueToBodyExplicitOverride(t *testing.T) {
 	withLocalZone(t, "America/Los_Angeles")
 	body := map[string]any{}
-	cmd := newTaskFieldCmd(map[string]string{"due": "2026-08-01T09:30:00Z", "due-has-time": "false"})
+	cmd := newTaskFieldCmd(map[string]string{"due": "2026-08-01T03:00:00Z", "due-has-time": "false"})
 	if err := addTaskDueToBody(cmd, body); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if body["due_has_time"] != false {
 		t.Errorf("explicit --due-has-time=false must win, got %v", body["due_has_time"])
 	}
-	// Made date-only, the due moves to the end of its local day (09:30 UTC is
-	// 02:30 on Aug 1 in Los Angeles), the same moment a plain date would send.
+	// Made date-only, an RFC3339 due keeps the day written in it (Aug 1), even
+	// though that moment is still Jul 31 in Los Angeles.
 	if body["due_at"] != endOfDayIn(t, "America/Los_Angeles", 2026, time.August, 1) {
-		t.Errorf("due_at = %v, want the end of the local day", body["due_at"])
+		t.Errorf("due_at = %v, want the end of Aug 1 local", body["due_at"])
+	}
+
+	// Epoch-ms names only a moment, so its day is the local one: Jul 31.
+	body = map[string]any{}
+	epoch := time.Date(2026, 8, 1, 3, 0, 0, 0, time.UTC).UnixMilli()
+	cmd = newTaskFieldCmd(map[string]string{"due": fmt.Sprintf("%d", epoch), "due-has-time": "false"})
+	if err := addTaskDueToBody(cmd, body); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if body["due_at"] != endOfDayIn(t, "America/Los_Angeles", 2026, time.July, 31) {
+		t.Errorf("epoch due_at = %v, want the end of Jul 31 local", body["due_at"])
 	}
 
 	body = map[string]any{}

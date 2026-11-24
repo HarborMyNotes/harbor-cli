@@ -78,7 +78,7 @@ func parsePlainDate(s string) (int, time.Month, int, bool) {
 
 // startOfLocalDay is the first moment of a calendar day in this computer's
 // time zone. Where the clocks jump forward at midnight, 00:00 does not exist
-// and Go resolves it to the evening before; the day then starts at the jump.
+// and Go may resolve it to the evening before; the day then starts at the jump.
 func startOfLocalDay(y int, m time.Month, d int) time.Time {
 	t := time.Date(y, m, d, 0, 0, 0, 0, time.Local)
 	if ty, tm, td := t.Date(); ty != y || tm != m || td != d {

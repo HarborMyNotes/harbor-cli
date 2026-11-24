@@ -160,7 +160,8 @@ var tasksCreateCmd = &cobra.Command{
 A --due given as a plain date (2026-08-01) is stored date-only, so clients show
 the day without a time. The day is the one in this computer's time zone, the
 same as on the web. A --due carrying a time (RFC3339, epoch-ms, or "in 2h") is
-stored timed. Pass --due-has-time explicitly to override that.
+stored timed. Pass --due-has-time explicitly to override that; a plain date
+made timed is due at 23:59 that day.
 
 Tasks cannot be attached to a note here; a note's body owns its tasks.`,
 	Example: `  harbor tasks create --title "Pay the invoice" --due 2026-08-01
@@ -390,12 +391,23 @@ func addTaskDueToBody(cmd *cobra.Command, body map[string]any) error {
 		hasTime = boolFlag(cmd, "due-has-time")
 	}
 	if !hasTime {
-		y, m, d := time.UnixMilli(ms).In(time.Local).Date()
+		y, m, d := taskDueDay(stringFlag(cmd, "due"), ms)
 		ms = endOfLocalDay(y, m, d).UnixMilli()
 	}
 	body["due_at"] = ms
 	body["due_has_time"] = hasTime
 	return nil
+}
+
+// taskDueDay picks the calendar day a --due names, for storing it date-only.
+// An RFC3339 value names its day in its own text (2026-04-16T00:00:00Z is the
+// 16th wherever the computer is); epoch-ms and "in 2h" name only a moment, so
+// their day is the one on this computer's calendar.
+func taskDueDay(s string, ms int64) (int, time.Month, int) {
+	if t, err := time.Parse(time.RFC3339, strings.TrimSpace(s)); err == nil {
+		return t.Date()
+	}
+	return time.UnixMilli(ms).In(time.Local).Date()
 }
 
 // addTaskReminderToBody copies --reminder into body as reminder_at (epoch-ms).

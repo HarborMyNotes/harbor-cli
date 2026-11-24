@@ -115,11 +115,13 @@ func TestParseTimeToEpochMS(t *testing.T) {
 
 // TestParseTimeToEpochMSPlainDateSkippedMidnight verifies a plain date whose
 // midnight the local clocks skip still means that day: it starts at the jump
-// (01:00), not at 23:00 the evening before.
+// (01:00), not at 23:00 the evening before. Go resolves the missing midnight
+// backward in Santiago and Havana and forward in Beirut; both must give 01:00.
 func TestParseTimeToEpochMSPlainDateSkippedMidnight(t *testing.T) {
 	for _, c := range []struct{ zone, day string }{
 		{"America/Santiago", "2026-09-06"},
 		{"America/Havana", "2026-03-08"},
+		{"Asia/Beirut", "2026-03-29"},
 	} {
 		withLocalZone(t, c.zone)
 		ms, err := parseTimeToEpochMS(c.day)

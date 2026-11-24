@@ -236,8 +236,8 @@ returns OCR highlight boxes (pair with `--json`).
 
 ## Reminders  (aliases: `reminder`, `rem`)
 
-Times: epoch-ms, RFC3339, `YYYY-MM-DD` (start of that day, local time), or
-relative (`in 2h`, `in 3d`).
+Times: epoch-ms, RFC3339, `YYYY-MM-DD` (start of that day, local time; for
+`--due-before`, the whole day), or relative (`in 2h`, `in 3d`).
 
 | Command | What it does | Key flags |
 |---|---|---|
@@ -258,7 +258,8 @@ Times: epoch-ms, RFC3339, `YYYY-MM-DD`, or relative (`in 2h`). A bare
 the computer's time zone, the same as the web; anything else is timed. Override
 with `--due-has-time=false|true`. A bare date in `--due-before` includes that
 whole day. If the computer's zone is not the user's (a server or container on
-UTC), set `TZ`, e.g. `TZ=America/Los_Angeles harbor tasks create …`.
+UTC), set `TZ` on macOS or Linux, e.g.
+`TZ=America/Los_Angeles harbor tasks create …`.
 
 Recurrence: `daily`, `weekly`, `monthly`, `yearly`, `every:N:days|weeks|months|
 years`, or an RRULE (`FREQ=WEEKLY;BYDAY=FR`).
