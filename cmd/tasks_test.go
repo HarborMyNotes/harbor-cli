@@ -61,9 +61,8 @@ func TestParseTaskDueDateOnly(t *testing.T) {
 	}
 }
 
-// TestParseTaskDueDateOnlyLosAngeles pins the exact moment the issue names, so
-// the end-of-day rule is checked against a literal and not only against a
-// helper that shares its arithmetic.
+// TestParseTaskDueDateOnlyLosAngeles checks the end-of-day rule against a
+// literal moment, not only against a helper that shares its arithmetic.
 func TestParseTaskDueDateOnlyLosAngeles(t *testing.T) {
 	withLocalZone(t, "America/Los_Angeles")
 	want, err := time.Parse(time.RFC3339Nano, "2026-04-16T23:59:59.999-07:00")
@@ -81,16 +80,26 @@ func TestParseTaskDueDateOnlyLosAngeles(t *testing.T) {
 
 // TestParseTaskDueDateOnlyDSTDays verifies a date-only due on a day the clocks
 // change still lands on that day's last millisecond, not an hour either side.
+// Santiago and Havana skip midnight itself on these days, where a day read
+// from a resolved local midnight would be the day before.
 func TestParseTaskDueDateOnlyDSTDays(t *testing.T) {
-	withLocalZone(t, "America/Los_Angeles")
-	for _, day := range []string{"2026-03-08", "2026-11-01"} {
-		ms, _, err := parseTaskDue(day)
+	for _, c := range []struct{ zone, day string }{
+		{"America/Los_Angeles", "2026-03-08"},
+		{"America/Los_Angeles", "2026-11-01"},
+		{"America/Santiago", "2026-09-06"},
+		{"America/Havana", "2026-03-08"},
+	} {
+		withLocalZone(t, c.zone)
+		ms, _, err := parseTaskDue(c.day)
 		if err != nil {
-			t.Fatalf("%s: %v", day, err)
+			t.Fatalf("%s %s: %v", c.zone, c.day, err)
 		}
 		got := time.UnixMilli(ms).In(time.Local)
-		if got.Format("2006-01-02 15:04:05.000") != day+" 23:59:59.999" {
-			t.Errorf("%s: stored as %s", day, got.Format("2006-01-02 15:04:05.000 MST"))
+		if got.Format("2006-01-02 15:04:05.000") != c.day+" 23:59:59.999" {
+			t.Errorf("%s %s: stored as %s", c.zone, c.day, got.Format("2006-01-02 15:04:05.000 MST"))
+		}
+		if printed := taskDateOnly(float64(ms)); printed != c.day {
+			t.Errorf("%s %s: prints as %s", c.zone, c.day, printed)
 		}
 	}
 }
@@ -150,6 +159,7 @@ func TestAddTaskDueToBodyTimed(t *testing.T) {
 // TestAddTaskDueToBodyExplicitOverride verifies an explicit --due-has-time wins
 // over whatever the --due shape implied, in both directions.
 func TestAddTaskDueToBodyExplicitOverride(t *testing.T) {
+	withLocalZone(t, "America/Los_Angeles")
 	body := map[string]any{}
 	cmd := newTaskFieldCmd(map[string]string{"due": "2026-08-01T09:30:00Z", "due-has-time": "false"})
 	if err := addTaskDueToBody(cmd, body); err != nil {
@@ -158,8 +168,12 @@ func TestAddTaskDueToBodyExplicitOverride(t *testing.T) {
 	if body["due_has_time"] != false {
 		t.Errorf("explicit --due-has-time=false must win, got %v", body["due_has_time"])
 	}
+	// Made date-only, the due moves to the end of its local day (09:30 UTC is
+	// 02:30 on Aug 1 in Los Angeles), the same moment a plain date would send.
+	if body["due_at"] != endOfDayIn(t, "America/Los_Angeles", 2026, time.August, 1) {
+		t.Errorf("due_at = %v, want the end of the local day", body["due_at"])
+	}
 
-	withLocalZone(t, "America/Los_Angeles")
 	body = map[string]any{}
 	cmd = newTaskFieldCmd(map[string]string{"due": "2026-08-01", "due-has-time": "true"})
 	if err := addTaskDueToBody(cmd, body); err != nil {
@@ -458,10 +472,10 @@ func TestTaskDateOnlyIgnoresUTCFlag(t *testing.T) {
 	}
 }
 
-// TestTaskDateOnlyLegacyUTCMidnight pins what a user west of UTC now sees for a
-// date-only task stored at UTC midnight: the day before, which is the day the
-// web and the apps already show for it.
-func TestTaskDateOnlyLegacyUTCMidnight(t *testing.T) {
+// TestTaskDateOnlyUTCMidnightPrintsLocalDay verifies a date-only due stored at
+// UTC midnight prints as the local day that moment falls on. West of UTC that
+// is the day before, the same day the web and the apps show for it.
+func TestTaskDateOnlyUTCMidnightPrintsLocalDay(t *testing.T) {
 	withLocalZone(t, "America/Los_Angeles")
 	ms := float64(time.Date(2026, 4, 16, 0, 0, 0, 0, time.UTC).UnixMilli())
 	if got := taskDateOnly(ms); got != "2026-04-15" {
@@ -722,37 +736,49 @@ func TestTasksCreateSendsDueHasTimeForDateOnly(t *testing.T) {
 // in each zone, then feeds the moment that went on the wire back through the
 // list and detail views. The day typed must be the day stored and the day
 // printed, or the CLI disagrees with the web about when the task is due.
+//
+// Each case is its own subtest so its mock server is shut down before the next
+// case changes time.Local; the race detector flags the overlap otherwise.
 func TestTasksDateOnlyDueRoundTrip(t *testing.T) {
 	for _, zone := range dateOnlyZones {
-		withLocalZone(t, zone)
-		want := float64(endOfDayIn(t, zone, 2026, time.April, 16))
 		for _, verb := range []string{"create", "update"} {
-			route := "POST /api/v1/tasks"
-			args := []string{"tasks", "create", "--title", "X", "--due", "2026-04-16"}
-			if verb == "update" {
-				route = "PATCH /api/v1/tasks/" + canonicalTaskID
-				args = []string{"tasks", "update", canonicalTaskID, "--due", "2026-04-16"}
-			}
-			m := newAPIMock(t, map[string]mockReply{route: {Status: 200, Body: taskReply}})
-			if _, err := runCLI(t, m, args...); err != nil {
-				t.Fatalf("%s %s: %v", zone, verb, err)
-			}
-			body := m.bodyOf(t, route)
-			if body["due_at"] != want {
-				t.Errorf("%s %s: due_at = %v, want %v", zone, verb, body["due_at"], want)
-			}
-			if body["due_has_time"] != false {
-				t.Errorf("%s %s: due_has_time = %v, want false", zone, verb, body["due_has_time"])
-			}
+			t.Run(zone+"/"+verb, func(t *testing.T) {
+				testDateOnlyDueRoundTrip(t, zone, verb)
+			})
+		}
+	}
+}
 
-			task := fmt.Sprintf(`{"id":"t1","title":"X","due_at":%d,"due_has_time":false,"usn":1}`, int64(want))
-			list := captureStdout(t, func() { displayTasks([]byte(`{"data":[` + task + `],"paging":{}}`)) })
-			detail := captureStdout(t, func() { displayTask([]byte(`{"task":` + task + `,"usn":1}`)) })
-			for name, out := range map[string]string{"list": list, "detail": detail} {
-				if !strings.Contains(out, "2026-04-16") {
-					t.Errorf("%s %s: %s view does not print 2026-04-16:\n%s", zone, verb, name, out)
-				}
-			}
+// testDateOnlyDueRoundTrip is one case of TestTasksDateOnlyDueRoundTrip: one
+// zone, one verb.
+func testDateOnlyDueRoundTrip(t *testing.T, zone, verb string) {
+	withLocalZone(t, zone)
+	want := float64(endOfDayIn(t, zone, 2026, time.April, 16))
+
+	route := "POST /api/v1/tasks"
+	args := []string{"tasks", "create", "--title", "X", "--due", "2026-04-16"}
+	if verb == "update" {
+		route = "PATCH /api/v1/tasks/" + canonicalTaskID
+		args = []string{"tasks", "update", canonicalTaskID, "--due", "2026-04-16"}
+	}
+	m := newAPIMock(t, map[string]mockReply{route: {Status: 200, Body: taskReply}})
+	if _, err := runCLI(t, m, args...); err != nil {
+		t.Fatalf("%s: %v", verb, err)
+	}
+	body := m.bodyOf(t, route)
+	if body["due_at"] != want {
+		t.Errorf("due_at = %v, want %v", body["due_at"], want)
+	}
+	if body["due_has_time"] != false {
+		t.Errorf("due_has_time = %v, want false", body["due_has_time"])
+	}
+
+	task := fmt.Sprintf(`{"id":"t1","title":"X","due_at":%d,"due_has_time":false,"usn":1}`, int64(want))
+	list := captureStdout(t, func() { displayTasks([]byte(`{"data":[` + task + `],"paging":{}}`)) })
+	detail := captureStdout(t, func() { displayTask([]byte(`{"task":` + task + `,"usn":1}`)) })
+	for name, out := range map[string]string{"list": list, "detail": detail} {
+		if !strings.Contains(out, "2026-04-16") {
+			t.Errorf("%s view does not print 2026-04-16:\n%s", name, out)
 		}
 	}
 }

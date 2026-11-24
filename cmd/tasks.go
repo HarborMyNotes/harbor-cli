@@ -109,10 +109,9 @@ and usn. Anything else is rejected by the server.`,
 		if s := stringFlag(cmd, "status"); s != "" {
 			params["status"] = s
 		}
-		// --due-before is read like --due, so a plain date is the end of that
-		// day and still matches the date-only tasks due on it.
+		// --due-before accepts any human time form; the API wants epoch-ms.
 		if cmd.Flags().Changed("due-before") {
-			ms, _, perr := parseTaskDue(stringFlag(cmd, "due-before"))
+			ms, perr := parseDueBeforeToEpochMS(stringFlag(cmd, "due-before"))
 			if perr != nil {
 				return fmt.Errorf("invalid --due-before: %w", perr)
 			}
@@ -363,40 +362,39 @@ var tasksDeleteCmd = &cobra.Command{
 // a spurious midnight. Every other accepted form (epoch-ms, RFC3339, "in 2h")
 // names a moment and is timed.
 func parseTaskDue(s string) (int64, bool, error) {
-	if ms, ok := endOfLocalDay(s); ok {
-		return ms, false, nil
+	if y, m, d, ok := parsePlainDate(s); ok {
+		return endOfLocalDay(y, m, d).UnixMilli(), false, nil
 	}
 	ms, err := parseTimeToEpochMS(s)
 	return ms, true, err
-}
-
-// endOfLocalDay turns a bare YYYY-MM-DD into the last millisecond of that day
-// in this computer's time zone, and reports false for anything else. That is
-// the moment the web app stores for a date-only due, so "due today" and
-// overdue work on the server without knowing the user's zone.
-func endOfLocalDay(s string) (int64, bool) {
-	d, err := time.ParseInLocation("2006-01-02", strings.TrimSpace(s), time.Local)
-	if err != nil {
-		return 0, false
-	}
-	y, m, day := d.Date()
-	return time.Date(y, m, day, 23, 59, 59, int(999*time.Millisecond), time.Local).UnixMilli(), true
 }
 
 // addTaskDueToBody copies --due into body as due_at plus the due_has_time flag
 // implied by its shape, then lets an explicit --due-has-time override that. The
 // server defaults an absent due_has_time to true, so sending it is what keeps a
 // date-only due from becoming a timed one.
+//
+// A date-only due always goes out as the last millisecond of its local day,
+// even when a timed --due was made date-only with --due-has-time=false, so the
+// server's "due today" and overdue checks treat it the way the web's do.
 func addTaskDueToBody(cmd *cobra.Command, body map[string]any) error {
-	if cmd.Flags().Changed("due") {
-		ms, hasTime, err := parseTaskDue(stringFlag(cmd, "due"))
-		if err != nil {
-			return fmt.Errorf("invalid --due: %w", err)
-		}
-		body["due_at"] = ms
-		body["due_has_time"] = hasTime
-	}
 	addBoolIfChanged(cmd, body, "due-has-time", "due_has_time")
+	if !cmd.Flags().Changed("due") {
+		return nil
+	}
+	ms, hasTime, err := parseTaskDue(stringFlag(cmd, "due"))
+	if err != nil {
+		return fmt.Errorf("invalid --due: %w", err)
+	}
+	if cmd.Flags().Changed("due-has-time") {
+		hasTime = boolFlag(cmd, "due-has-time")
+	}
+	if !hasTime {
+		y, m, d := time.UnixMilli(ms).In(time.Local).Date()
+		ms = endOfLocalDay(y, m, d).UnixMilli()
+	}
+	body["due_at"] = ms
+	body["due_has_time"] = hasTime
 	return nil
 }
 

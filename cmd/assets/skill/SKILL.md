@@ -298,7 +298,9 @@ harbor reminders clear "$NOTE_ID" --json
 A task is its own syncable record, not a field on a note. A bare `YYYY-MM-DD`
 due is stored date-only, as that day in the computer's time zone (the same as
 the web); a time-bearing value (`in 2h`, RFC3339, epoch-ms) is timed. A bare
-date in `--due-before` includes that whole day.
+date in `--due-before` includes that whole day. If the computer's zone is not
+the user's (a server or container on UTC), set `TZ`, e.g.
+`TZ=America/Los_Angeles harbor tasks create …`.
 
 ```bash
 harbor tasks create --title "Pay the invoice" --due 2026-08-01 --priority high --json

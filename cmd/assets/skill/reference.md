@@ -32,7 +32,7 @@ what you need. The CLI's own help is always authoritative: `harbor <cmd> --help`
 | `--json` | Raw JSON instead of tables |
 | `--no-color` | Disable ANSI color |
 | `-v, --verbose` | Include `request_id` + HTTP status on errors |
-| `--utc` | Render timestamps in UTC, not local |
+| `--utc` | Render timestamps in UTC, not local (date-only task dues keep their local day) |
 | `--api-url <url>` | Override API base URL (dev/staging; rarely needed) |
 
 Env: `HARBOR_API_URL` (same as `--api-url`), `NO_COLOR`.
@@ -257,7 +257,8 @@ Times: epoch-ms, RFC3339, `YYYY-MM-DD`, or relative (`in 2h`). A bare
 `YYYY-MM-DD` due is stored **date-only** (no time shown) and means that day in
 the computer's time zone, the same as the web; anything else is timed. Override
 with `--due-has-time=false|true`. A bare date in `--due-before` includes that
-whole day.
+whole day. If the computer's zone is not the user's (a server or container on
+UTC), set `TZ`, e.g. `TZ=America/Los_Angeles harbor tasks create …`.
 
 Recurrence: `daily`, `weekly`, `monthly`, `yearly`, `every:N:days|weeks|months|
 years`, or an RRULE (`FREQ=WEEKLY;BYDAY=FR`).

@@ -112,3 +112,74 @@ func TestParseTimeToEpochMS(t *testing.T) {
 		t.Error("expected error for unparseable time")
 	}
 }
+
+// TestParseTimeToEpochMSPlainDateSkippedMidnight verifies a plain date whose
+// midnight the local clocks skip still means that day: it starts at the jump
+// (01:00), not at 23:00 the evening before.
+func TestParseTimeToEpochMSPlainDateSkippedMidnight(t *testing.T) {
+	for _, c := range []struct{ zone, day string }{
+		{"America/Santiago", "2026-09-06"},
+		{"America/Havana", "2026-03-08"},
+	} {
+		withLocalZone(t, c.zone)
+		ms, err := parseTimeToEpochMS(c.day)
+		if err != nil {
+			t.Fatalf("%s %s: %v", c.zone, c.day, err)
+		}
+		got := time.UnixMilli(ms).In(time.Local)
+		if got.Format("2006-01-02 15:04") != c.day+" 01:00" {
+			t.Errorf("%s %s: = %s, want %s 01:00", c.zone, c.day, got.Format("2006-01-02 15:04 MST"), c.day)
+		}
+	}
+}
+
+// TestParseDueBeforeToEpochMS verifies a plain-date cut-off covers the whole
+// local day, and that every other form is read exactly as parseTimeToEpochMS
+// reads it.
+func TestParseDueBeforeToEpochMS(t *testing.T) {
+	withLocalZone(t, "America/Los_Angeles")
+	ms, err := parseDueBeforeToEpochMS("2026-04-16")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := time.Date(2026, 4, 16, 23, 59, 59, 999_000_000, time.Local).UnixMilli(); ms != want {
+		t.Errorf("plain date = %d, want %d", ms, want)
+	}
+	for _, in := range []string{"1750000000000", "2026-06-22T15:04:05Z"} {
+		got, err := parseDueBeforeToEpochMS(in)
+		want, _ := parseTimeToEpochMS(in)
+		if err != nil || got != want {
+			t.Errorf("%q = %d err=%v, want %d", in, got, err, want)
+		}
+	}
+	if _, err := parseDueBeforeToEpochMS("someday"); err == nil {
+		t.Error("an unparseable value should error")
+	}
+}
+
+// TestParsePlainDate verifies only a bare YYYY-MM-DD is a plain date; a
+// timestamp or a relative offset is not.
+func TestParsePlainDate(t *testing.T) {
+	y, m, d, ok := parsePlainDate(" 2026-04-16 ")
+	if !ok || y != 2026 || m != time.April || d != 16 {
+		t.Errorf("parsePlainDate = %d-%d-%d ok=%v", y, m, d, ok)
+	}
+	for _, in := range []string{"2026-04-16T09:00:00Z", "in 2h", "1750000000000", "2026-13-01"} {
+		if _, _, _, ok := parsePlainDate(in); ok {
+			t.Errorf("parsePlainDate(%q) should not be a plain date", in)
+		}
+	}
+}
+
+// TestStartAndEndOfLocalDay verifies the two ends of an ordinary local day.
+func TestStartAndEndOfLocalDay(t *testing.T) {
+	withLocalZone(t, "Australia/Sydney")
+	start := startOfLocalDay(2026, time.April, 16)
+	end := endOfLocalDay(2026, time.April, 16)
+	if got := start.Format("2006-01-02 15:04:05.000"); got != "2026-04-16 00:00:00.000" {
+		t.Errorf("start = %s", got)
+	}
+	if got := end.Format("2006-01-02 15:04:05.000"); got != "2026-04-16 23:59:59.999" {
+		t.Errorf("end = %s", got)
+	}
+}
