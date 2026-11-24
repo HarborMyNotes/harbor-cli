@@ -236,7 +236,8 @@ returns OCR highlight boxes (pair with `--json`).
 
 ## Reminders  (aliases: `reminder`, `rem`)
 
-Times: epoch-ms, RFC3339, `YYYY-MM-DD`, or relative (`in 2h`, `in 3d`).
+Times: epoch-ms, RFC3339, `YYYY-MM-DD` (start of that day, local time), or
+relative (`in 2h`, `in 3d`).
 
 | Command | What it does | Key flags |
 |---|---|---|
@@ -253,8 +254,10 @@ A task is a standalone to-do that syncs like a note — a title plus an optional
 due date, reminder, recurrence rule, priority (`none|low|medium|high`) and flag.
 
 Times: epoch-ms, RFC3339, `YYYY-MM-DD`, or relative (`in 2h`). A bare
-`YYYY-MM-DD` due is stored **date-only** (no time shown); anything else is
-timed. Override with `--due-has-time=false|true`.
+`YYYY-MM-DD` due is stored **date-only** (no time shown) and means that day in
+the computer's time zone, the same as the web; anything else is timed. Override
+with `--due-has-time=false|true`. A bare date in `--due-before` includes that
+whole day.
 
 Recurrence: `daily`, `weekly`, `monthly`, `yearly`, `every:N:days|weeks|months|
 years`, or an RRULE (`FREQ=WEEKLY;BYDAY=FR`).

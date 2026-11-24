@@ -35,15 +35,17 @@ func TestReminderTimeFlagToMSEpoch(t *testing.T) {
 	}
 }
 
-// TestReminderTimeFlagToMSDate verifies a YYYY-MM-DD date converts to the UTC
-// midnight epoch-ms for that day.
+// TestReminderTimeFlagToMSDate verifies a YYYY-MM-DD date converts to the
+// start of that day on this computer, not UTC midnight, which is the afternoon
+// before in the pinned zone.
 func TestReminderTimeFlagToMSDate(t *testing.T) {
+	withLocalZone(t, "America/Los_Angeles")
 	cmd := newReminderTimeCmd("2026-07-01", true)
 	ms, err := reminderTimeFlagToMS(cmd, "time", true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
+	want := time.Date(2026, 7, 1, 0, 0, 0, 0, time.Local).UnixMilli()
 	if ms != want {
 		t.Errorf("ms = %d, want %d", ms, want)
 	}

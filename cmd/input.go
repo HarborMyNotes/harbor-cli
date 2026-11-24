@@ -17,8 +17,9 @@ import (
 
 // parseTimeToEpochMS converts a flexible time input into UTC epoch
 // milliseconds, accepting: a raw epoch-ms integer; an RFC3339 timestamp
-// (2026-06-22T15:04:05Z); a date (2026-06-22); or a relative offset like
-// "in 2h", "in 30m", "in 3d". Used by reminder/time flags across commands.
+// (2026-06-22T15:04:05Z); a date (2026-06-22), which is the start of that day
+// in this computer's time zone; or a relative offset like "in 2h", "in 30m",
+// "in 3d". Used by reminder/time flags across commands.
 func parseTimeToEpochMS(s string) (int64, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -42,9 +43,10 @@ func parseTimeToEpochMS(s string) (int64, error) {
 		return t.UTC().UnixMilli(), nil
 	}
 
-	// Plain date (treated as midnight UTC).
-	if t, err := time.Parse("2006-01-02", s); err == nil {
-		return t.UTC().UnixMilli(), nil
+	// Plain date: local midnight, because the user means the day on their own
+	// calendar. UTC midnight is the afternoon before in the Americas.
+	if t, err := time.ParseInLocation("2006-01-02", s, time.Local); err == nil {
+		return t.UnixMilli(), nil
 	}
 
 	return 0, fmt.Errorf("could not parse time %q (use epoch-ms, RFC3339, YYYY-MM-DD, or \"in 2h\")", s)

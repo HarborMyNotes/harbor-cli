@@ -87,8 +87,10 @@ func TestParseTimeToEpochMS(t *testing.T) {
 	if got, err := parseTimeToEpochMS("2026-06-22T15:04:05Z"); err != nil || got != want {
 		t.Errorf("rfc3339 = %d err=%v", got, err)
 	}
-	// Plain date.
-	wantDay := time.Date(2026, 6, 22, 0, 0, 0, 0, time.UTC).UnixMilli()
+	// Plain date: the start of that day on this computer, pinned to a zone
+	// behind UTC, where UTC midnight would be the afternoon before.
+	withLocalZone(t, "America/Los_Angeles")
+	wantDay := time.Date(2026, 6, 22, 0, 0, 0, 0, time.Local).UnixMilli()
 	if got, _ := parseTimeToEpochMS("2026-06-22"); got != wantDay {
 		t.Errorf("date = %d, want %d", got, wantDay)
 	}
