@@ -122,7 +122,7 @@ access + refresh tokens in:
 | `--json` | Emit raw JSON instead of formatted tables (honored by every command). |
 | `--no-color` | Disable ANSI color. Also honors `NO_COLOR` and auto-disables when piped. |
 | `-v, --verbose` | Include the `request_id` and HTTP status on errors. |
-| `--utc` | Render timestamps in UTC instead of local time. |
+| `--utc` | Render timestamps in UTC instead of local time. A date-only task due keeps its local day. |
 | `--api-url` | Override the API base URL (maintainer use). |
 
 ## Command reference

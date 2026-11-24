@@ -10,7 +10,7 @@ description: >-
   assistant.
 ---
 
-<!-- Harbor agent skill • v1.9.2 -->
+<!-- Harbor agent skill • v1.9.3 -->
 <!-- Copyright (c) 2026 Cloudmanic Labs, LLC. All rights reserved. Date: 2026-06-22 -->
 
 # Harbor CLI — managing notes from the terminal
@@ -282,8 +282,9 @@ its name comes back with `"match": "name"` and an empty snippet.
 
 ### Reminders
 
-Times accept epoch-ms, RFC3339, `YYYY-MM-DD`, or a relative offset like `in 2h` /
-`in 3d`.
+Times accept epoch-ms, RFC3339, `YYYY-MM-DD` (the start of that day in the
+computer's time zone; for `--due-before`, the whole day), or a relative offset
+like `in 2h` / `in 3d`.
 
 ```bash
 harbor reminders set "$NOTE_ID" --time "in 2h" --json
@@ -296,8 +297,11 @@ harbor reminders clear "$NOTE_ID" --json
 ### Tasks (standalone to-dos)
 
 A task is its own syncable record, not a field on a note. A bare `YYYY-MM-DD`
-due is stored date-only; a time-bearing value (`in 2h`, RFC3339, epoch-ms) is
-timed.
+due is stored date-only, as that day in the computer's time zone (the same as
+the web); a time-bearing value (`in 2h`, RFC3339, epoch-ms) is timed. A bare
+date in `--due-before` includes that whole day. If the computer's zone is not
+the user's (a server or container on UTC), set `TZ` on macOS or Linux, e.g.
+`TZ=America/Los_Angeles harbor tasks create …`.
 
 ```bash
 harbor tasks create --title "Pay the invoice" --due 2026-08-01 --priority high --json

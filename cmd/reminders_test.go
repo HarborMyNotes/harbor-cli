@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -35,15 +36,17 @@ func TestReminderTimeFlagToMSEpoch(t *testing.T) {
 	}
 }
 
-// TestReminderTimeFlagToMSDate verifies a YYYY-MM-DD date converts to the UTC
-// midnight epoch-ms for that day.
+// TestReminderTimeFlagToMSDate verifies a YYYY-MM-DD date converts to the
+// start of that day on this computer, not UTC midnight, which is the afternoon
+// before in the pinned zone.
 func TestReminderTimeFlagToMSDate(t *testing.T) {
+	withLocalZone(t, "America/Los_Angeles")
 	cmd := newReminderTimeCmd("2026-07-01", true)
 	ms, err := reminderTimeFlagToMS(cmd, "time", true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
+	want := time.Date(2026, 7, 1, 0, 0, 0, 0, time.Local).UnixMilli()
 	if ms != want {
 		t.Errorf("ms = %d, want %d", ms, want)
 	}
@@ -153,5 +156,21 @@ func TestDisplayReminderMutationCleared(t *testing.T) {
 	out := captureStdout(t, func() { displayReminderMutation(data) })
 	if !strings.Contains(out, "(none)") {
 		t.Errorf("cleared reminder should show (none):\n%s", out)
+	}
+}
+
+// TestRemindersListDueBeforePlainDateIsEndOfDay verifies a plain-date
+// --due-before covers that whole local day, the same as on tasks list.
+func TestRemindersListDueBeforePlainDateIsEndOfDay(t *testing.T) {
+	withLocalZone(t, "America/Los_Angeles")
+	m := newAPIMock(t, map[string]mockReply{
+		"GET /api/v1/reminders": {Status: 200, Body: `{"data":[],"paging":{}}`},
+	})
+	if _, err := runCLI(t, m, "reminders", "list", "--due-before", "2026-04-16"); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	want := fmt.Sprintf("%d", time.Date(2026, 4, 16, 23, 59, 59, 999_000_000, time.Local).UnixMilli())
+	if got := m.queryOf(t, "GET /api/v1/reminders").Get("due_before"); got != want {
+		t.Errorf("due_before = %q, want %q", got, want)
 	}
 }

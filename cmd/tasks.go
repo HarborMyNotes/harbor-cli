@@ -27,8 +27,9 @@ optional due date, reminder, recurrence rule, priority and flag — that syncs t
 every device like a note does.
 
 Times accept epoch milliseconds, an RFC3339 timestamp, a plain date
-(YYYY-MM-DD), or a relative offset like "in 2h". A plain date is treated as
-date-only: the task shows a day with no time (see --due-has-time).
+(YYYY-MM-DD), or a relative offset like "in 2h". A plain date means that day in
+this computer's time zone. As a --due it is date-only: the task shows a day with
+no time (see --due-has-time).
 
 Priorities are none, low, medium, or high.
 
@@ -64,7 +65,7 @@ var tasksListCmd = &cobra.Command{
 	Short: "List tasks",
 	Long: `List tasks. By default only active (not-yet-completed) tasks are shown;
 use --status to switch to today, done, or all. Use --due-before for an
-overdue/upcoming view.
+overdue/upcoming view; a plain date there includes the whole of that day.
 
 With --note, the tasks belonging to that note are returned instead, whole and in
 their in-note order — the account-wide status and due filters do not apply
@@ -110,7 +111,7 @@ and usn. Anything else is rejected by the server.`,
 		}
 		// --due-before accepts any human time form; the API wants epoch-ms.
 		if cmd.Flags().Changed("due-before") {
-			ms, perr := parseTimeToEpochMS(stringFlag(cmd, "due-before"))
+			ms, perr := parseDueBeforeToEpochMS(stringFlag(cmd, "due-before"))
 			if perr != nil {
 				return fmt.Errorf("invalid --due-before: %w", perr)
 			}
@@ -157,8 +158,10 @@ var tasksCreateCmd = &cobra.Command{
 	Long: `Create a standalone task. Only --title is required.
 
 A --due given as a plain date (2026-08-01) is stored date-only, so clients show
-the day without a time. A --due carrying a time (RFC3339, epoch-ms, or "in 2h")
-is stored timed. Pass --due-has-time explicitly to override that.
+the day without a time. The day is the one in this computer's time zone, the
+same as on the web. A --due carrying a time (RFC3339, epoch-ms, or "in 2h") is
+stored timed. Pass --due-has-time explicitly to override that; a plain date
+made timed is due at 23:59 that day.
 
 Tasks cannot be attached to a note here; a note's body owns its tasks.`,
 	Example: `  harbor tasks create --title "Pay the invoice" --due 2026-08-01
@@ -354,14 +357,14 @@ var tasksDeleteCmd = &cobra.Command{
 // Flag → body helpers
 // ===========================================================================
 
-// parseTaskDue converts a --due value to UTC epoch milliseconds and reports
+// parseTaskDue converts a --due value to epoch milliseconds and reports
 // whether the input carried a TIME. A bare YYYY-MM-DD is date-only (false), so
 // the CLI can send due_has_time=false and the task renders as a day rather than
 // a spurious midnight. Every other accepted form (epoch-ms, RFC3339, "in 2h")
 // names a moment and is timed.
 func parseTaskDue(s string) (int64, bool, error) {
-	if t, err := time.Parse("2006-01-02", strings.TrimSpace(s)); err == nil {
-		return t.UTC().UnixMilli(), false, nil
+	if y, m, d, ok := parsePlainDate(s); ok {
+		return endOfLocalDay(y, m, d).UnixMilli(), false, nil
 	}
 	ms, err := parseTimeToEpochMS(s)
 	return ms, true, err
@@ -371,17 +374,40 @@ func parseTaskDue(s string) (int64, bool, error) {
 // implied by its shape, then lets an explicit --due-has-time override that. The
 // server defaults an absent due_has_time to true, so sending it is what keeps a
 // date-only due from becoming a timed one.
+//
+// A date-only due always goes out as the last millisecond of its local day,
+// even when a timed --due was made date-only with --due-has-time=false, so the
+// server's "due today" and overdue checks treat it the way the web's do.
 func addTaskDueToBody(cmd *cobra.Command, body map[string]any) error {
-	if cmd.Flags().Changed("due") {
-		ms, hasTime, err := parseTaskDue(stringFlag(cmd, "due"))
-		if err != nil {
-			return fmt.Errorf("invalid --due: %w", err)
-		}
-		body["due_at"] = ms
-		body["due_has_time"] = hasTime
-	}
 	addBoolIfChanged(cmd, body, "due-has-time", "due_has_time")
+	if !cmd.Flags().Changed("due") {
+		return nil
+	}
+	ms, hasTime, err := parseTaskDue(stringFlag(cmd, "due"))
+	if err != nil {
+		return fmt.Errorf("invalid --due: %w", err)
+	}
+	if cmd.Flags().Changed("due-has-time") {
+		hasTime = boolFlag(cmd, "due-has-time")
+	}
+	if !hasTime {
+		y, m, d := taskDueDay(stringFlag(cmd, "due"), ms)
+		ms = endOfLocalDay(y, m, d).UnixMilli()
+	}
+	body["due_at"] = ms
+	body["due_has_time"] = hasTime
 	return nil
+}
+
+// taskDueDay picks the calendar day a --due names, for storing it date-only.
+// An RFC3339 value names its day in its own text (2026-04-16T00:00:00Z is the
+// 16th wherever the computer is); epoch-ms and "in 2h" name only a moment, so
+// their day is the one on this computer's calendar.
+func taskDueDay(s string, ms int64) (int, time.Month, int) {
+	if t, err := time.Parse(time.RFC3339, strings.TrimSpace(s)); err == nil {
+		return t.Date()
+	}
+	return time.UnixMilli(ms).In(time.Local).Date()
 }
 
 // addTaskReminderToBody copies --reminder into body as reminder_at (epoch-ms).
@@ -645,11 +671,12 @@ func taskDueDetail(t map[string]any) string {
 	return epochMS(ms) + dim(" ("+relTime(ms)+")")
 }
 
-// taskDateOnly renders a date-only due as its calendar day. Such a due is
-// stored as UTC midnight, so it is formatted in UTC on purpose: rendering it in
-// a negative-offset local zone would show the previous day.
+// taskDateOnly renders a date-only due as its calendar day in this computer's
+// time zone. The web stores that day's last millisecond and the apps its first,
+// so the local day is right for both. It ignores --utc on purpose: in UTC, a
+// date-only due set in the Americas would print as the next day.
 func taskDateOnly(ms float64) string {
-	return time.UnixMilli(int64(ms)).UTC().Format("2006-01-02")
+	return time.UnixMilli(int64(ms)).In(time.Local).Format("2006-01-02")
 }
 
 // taskMoment renders an optional epoch-ms moment (a reminder) with a relative
@@ -715,7 +742,7 @@ func taskNoteDetail(noteID string) string {
 func init() {
 	addPagingFlags(tasksListCmd)
 	tasksListCmd.Flags().String("status", "", "Which tasks to list: active (default), today, done, or all")
-	tasksListCmd.Flags().String("due-before", "", "Only tasks due at or before this time (epoch-ms, RFC3339, YYYY-MM-DD, or \"in 2h\")")
+	tasksListCmd.Flags().String("due-before", "", "Only tasks due at or before this time (epoch-ms, RFC3339, YYYY-MM-DD for the end of that day, or \"in 2h\")")
 	tasksListCmd.Flags().String("note", "", "List the tasks belonging to this note instead (read-only)")
 
 	tasksCreateCmd.Flags().String("title", "", "Task title (required)")

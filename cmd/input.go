@@ -17,8 +17,9 @@ import (
 
 // parseTimeToEpochMS converts a flexible time input into UTC epoch
 // milliseconds, accepting: a raw epoch-ms integer; an RFC3339 timestamp
-// (2026-06-22T15:04:05Z); a date (2026-06-22); or a relative offset like
-// "in 2h", "in 30m", "in 3d". Used by reminder/time flags across commands.
+// (2026-06-22T15:04:05Z); a date (2026-06-22), which is the start of that day
+// in this computer's time zone; or a relative offset like "in 2h", "in 30m",
+// "in 3d". Used by reminder/time flags across commands.
 func parseTimeToEpochMS(s string) (int64, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -42,12 +43,57 @@ func parseTimeToEpochMS(s string) (int64, error) {
 		return t.UTC().UnixMilli(), nil
 	}
 
-	// Plain date (treated as midnight UTC).
-	if t, err := time.Parse("2006-01-02", s); err == nil {
-		return t.UTC().UnixMilli(), nil
+	// Plain date: the start of that day on this computer, because the user
+	// means the day on their own calendar. UTC midnight is the afternoon before
+	// in the Americas.
+	if y, m, d, ok := parsePlainDate(s); ok {
+		return startOfLocalDay(y, m, d).UnixMilli(), nil
 	}
 
 	return 0, fmt.Errorf("could not parse time %q (use epoch-ms, RFC3339, YYYY-MM-DD, or \"in 2h\")", s)
+}
+
+// parseDueBeforeToEpochMS reads a --due-before value. A plain date covers that
+// whole day, so "--due-before 2026-04-16" still lists what is due on the 16th;
+// a date-only task due sits at the day's last millisecond, so an earlier
+// cut-off would miss it. Every other form is read by parseTimeToEpochMS.
+func parseDueBeforeToEpochMS(s string) (int64, error) {
+	if y, m, d, ok := parsePlainDate(s); ok {
+		return endOfLocalDay(y, m, d).UnixMilli(), nil
+	}
+	return parseTimeToEpochMS(s)
+}
+
+// parsePlainDate reads a bare YYYY-MM-DD as a calendar day. The parts come from
+// the text, not from a moment in the local zone, so a day whose midnight the
+// local clocks skip is still that day.
+func parsePlainDate(s string) (int, time.Month, int, bool) {
+	t, err := time.Parse("2006-01-02", strings.TrimSpace(s))
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	y, m, d := t.Date()
+	return y, m, d, true
+}
+
+// startOfLocalDay is the first moment of a calendar day in this computer's
+// time zone. Where the clocks jump forward at midnight, 00:00 does not exist
+// and Go may resolve it to the evening before; the day then starts at the jump.
+func startOfLocalDay(y int, m time.Month, d int) time.Time {
+	t := time.Date(y, m, d, 0, 0, 0, 0, time.Local)
+	if ty, tm, td := t.Date(); ty != y || tm != m || td != d {
+		if _, next := t.ZoneBounds(); !next.IsZero() {
+			return next
+		}
+	}
+	return t
+}
+
+// endOfLocalDay is the last millisecond of a calendar day in this computer's
+// time zone. It is the moment the web app stores for a date-only task due, so
+// "due today" and overdue work on the server without knowing the user's zone.
+func endOfLocalDay(y int, m time.Month, d int) time.Time {
+	return time.Date(y, m, d, 23, 59, 59, int(999*time.Millisecond), time.Local)
 }
 
 // parseSimpleDuration parses durations including the day unit ("3d"), which

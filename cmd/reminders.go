@@ -25,7 +25,8 @@ allocates a fresh USN and syncs to every device.
 
 Times accept epoch milliseconds, an RFC3339 timestamp, a plain date
 (YYYY-MM-DD), or a relative offset like "in 2h" — all are converted to UTC
-epoch-ms before being sent.`,
+epoch-ms before being sent. A plain date is the start of that day in this
+computer's time zone; for --due-before it covers the whole day.`,
 }
 
 // remindersListCmd lists notes that currently have a reminder.
@@ -50,7 +51,7 @@ reminders are shown; use --status to include done or all reminders. Use
 		}
 		// --due-before accepts any human time form; the API wants epoch-ms.
 		if cmd.Flags().Changed("due-before") {
-			ms, perr := parseTimeToEpochMS(stringFlag(cmd, "due-before"))
+			ms, perr := parseDueBeforeToEpochMS(stringFlag(cmd, "due-before"))
 			if perr != nil {
 				return fmt.Errorf("invalid --due-before: %w", perr)
 			}
@@ -284,7 +285,7 @@ func reminderDoneDetail(n map[string]any) string {
 func init() {
 	addPagingFlags(remindersListCmd)
 	remindersListCmd.Flags().String("status", "", "Which reminders to list: active (default), done, or all")
-	remindersListCmd.Flags().String("due-before", "", "Only reminders due at or before this time (epoch-ms, RFC3339, YYYY-MM-DD, or \"in 2h\")")
+	remindersListCmd.Flags().String("due-before", "", "Only reminders due at or before this time (epoch-ms, RFC3339, YYYY-MM-DD for the end of that day, or \"in 2h\")")
 
 	remindersSetCmd.Flags().String("time", "", "When the reminder is due (epoch-ms, RFC3339, YYYY-MM-DD, or \"in 2h\")")
 

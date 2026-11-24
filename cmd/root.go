@@ -160,7 +160,7 @@ func init() {
 	pf.BoolVar(&jsonOutput, "json", false, "Output raw JSON instead of formatted tables")
 	pf.BoolVar(&noColorFlag, "no-color", false, "Disable ANSI color in output")
 	pf.BoolVarP(&verboseFlag, "verbose", "v", false, "Include request_id and HTTP status on errors")
-	pf.BoolVar(&utcFlag, "utc", false, "Render timestamps in UTC instead of local time")
+	pf.BoolVar(&utcFlag, "utc", false, "Render timestamps in UTC instead of local time (a date-only task due keeps its local day)")
 	pf.StringVar(&apiURLFlag, "api-url", "", "Override the API base URL (maintainer use; defaults to the production endpoint)")
 
 	// Every client in this process shares the server name, and the file carries
