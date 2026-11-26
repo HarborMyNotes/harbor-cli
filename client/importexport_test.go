@@ -426,6 +426,74 @@ func TestExportENEXNotFound(t *testing.T) {
 	}
 }
 
+// TestExportPDF verifies the PDF POST sends the ids in the order given with the
+// page break, and streams the PDF back.
+func TestExportPDF(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 200, "%PDF-1.3")
+	defer srv.Close()
+	resp, err := testClient(srv.URL).ExportPDF([]string{"n3", "n1", "n2"}, "continuous")
+	if err != nil {
+		t.Fatalf("ExportPDF error: %v", err)
+	}
+	defer resp.Body.Close()
+	if rec.Method != "POST" || rec.Path != "/export/pdf" {
+		t.Errorf("%s %s", rec.Method, rec.Path)
+	}
+	if rec.ContentType != "application/json" {
+		t.Errorf("content type = %q", rec.ContentType)
+	}
+	var body struct {
+		NoteIDs   []string `json:"note_ids"`
+		PageBreak string   `json:"page_break"`
+	}
+	if err := json.Unmarshal(rec.Body, &body); err != nil {
+		t.Fatalf("body is not JSON: %v (%s)", err, rec.Body)
+	}
+	if strings.Join(body.NoteIDs, ",") != "n3,n1,n2" {
+		t.Errorf("note_ids = %v, want the order given", body.NoteIDs)
+	}
+	if body.PageBreak != "continuous" {
+		t.Errorf("page_break = %q", body.PageBreak)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	if string(raw) != "%PDF-1.3" {
+		t.Errorf("raw body = %q", raw)
+	}
+}
+
+// TestExportPDFOmitsEmptyPageBreak pins that no page break leaves the field out,
+// so the server's own default applies.
+func TestExportPDFOmitsEmptyPageBreak(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 200, "%PDF-1.3")
+	defer srv.Close()
+	resp, err := testClient(srv.URL).ExportPDF([]string{"n1"}, "")
+	if err != nil {
+		t.Fatalf("ExportPDF error: %v", err)
+	}
+	resp.Body.Close()
+	if strings.Contains(string(rec.Body), "page_break") {
+		t.Errorf("an empty page break was sent: %s", rec.Body)
+	}
+}
+
+// TestExportPDFError verifies a refusal surfaces as an APIError carrying the
+// server's code and message, with no live response to close.
+func TestExportPDFError(t *testing.T) {
+	srv := newTestServer(t, nil, 422, `{"error":{"code":"too_many_notes","message":"A PDF can hold up to 50 notes."}}`)
+	defer srv.Close()
+	resp, err := testClient(srv.URL).ExportPDF([]string{"n1"}, "new_page")
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("expected error")
+	}
+	apiErr, ok := err.(*APIError)
+	if !ok || apiErr.Code != "too_many_notes" || apiErr.Message != "A PDF can hold up to 50 notes." {
+		t.Fatalf("want too_many_notes APIError, got %v", err)
+	}
+}
+
 // A retried part gets its own reader. The failed attempt's transport is held
 // in the middle of reading the chunk, and lets go once the retry is under way.
 // With a reader shared between the attempts, that late read would move the

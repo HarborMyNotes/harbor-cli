@@ -192,11 +192,132 @@ aborted; poll it with 'harbor import status' instead.`,
 // exportCmd is the parent for exporting Harbor data out to portable formats.
 var exportCmd = &cobra.Command{
 	Use:     "export",
-	Short:   "Export Harbor data to a portable format (Evernote ENEX)",
+	Short:   "Export notes to a file (Evernote ENEX, or one PDF of several notes)",
 	GroupID: groupAccount,
-	Long: `Export your notes back out of Harbor. The ENEX exporter writes a valid,
-round-trippable Evernote <en-export> document for a whole notebook or an explicit
-note selection.`,
+	Long: `Export your notes back out of Harbor, straight to a file.
+
+  enex  a valid, round-trippable Evernote <en-export> document for a whole
+        notebook or an explicit note selection
+  pdf   one PDF of up to 50 notes, in the order you list them
+
+A whole notebook as one PDF is an export job instead, because a big notebook
+takes minutes: 'harbor account export --format pdf --notebook <id>'.`,
+}
+
+// pdfPageBreaks are the page-break choices a PDF of several notes accepts:
+// every note on a new page, or each note running on after the one before it.
+var pdfPageBreaks = []string{"new_page", "continuous"}
+
+// pdfPageBreak reads and checks --page-break, so a typo fails before a request
+// is made rather than as a server validation error.
+func pdfPageBreak(cmd *cobra.Command) (string, error) {
+	value := strings.ToLower(strings.TrimSpace(stringFlag(cmd, "page-break")))
+	for _, valid := range pdfPageBreaks {
+		if value == valid {
+			return value, nil
+		}
+	}
+	return "", fmt.Errorf("--page-break must be one of %s", strings.Join(pdfPageBreaks, "|"))
+}
+
+// exportPDFCmd writes one PDF of several notes, built on the server.
+var exportPDFCmd = &cobra.Command{
+	Use:   "pdf",
+	Short: "Export several notes to one PDF",
+	Args:  cobra.NoArgs,
+	Long: `Make one PDF of up to 50 notes, in the order you list them. The PDF has an
+outline (bookmarks) with each note's title, and any attached PDFs come after
+all the notes.
+
+  --page-break new_page    (the default) every note starts on a new page
+  --page-break continuous  each note follows the one before it
+
+The file is saved under the name the server gives it ("Notes (3).pdf"), in the
+current directory unless --output says otherwise. --output takes a file path, a
+directory (the server's name, there), or - for stdout.
+
+Encrypted notes can't be made into a PDF: the server holds only ciphertext for
+them. They are left out and the count is printed. If every note is encrypted,
+the command fails and writes no file.
+
+For a whole notebook, use 'harbor account export --format pdf --notebook <id>'.
+That runs as an export job in the background, because a big notebook takes
+minutes.`,
+	Example: `  harbor export pdf --notes n1,n2,n3
+  harbor export pdf --notes n1,n2 --page-break continuous -o trip.pdf
+  harbor export pdf --notes n1,n2 --output ~/Downloads
+  harbor export pdf --notes n1,n2 --output - > notes.pdf`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		// The flags are checked before the credentials so a typo answers the typo.
+		notes := splitCSV(stringFlag(cmd, "notes"))
+		if len(notes) == 0 {
+			return errors.New("--notes is required (comma-separated note ids)")
+		}
+		pageBreak, err := pdfPageBreak(cmd)
+		if err != nil {
+			return err
+		}
+		out := stringFlag(cmd, "output")
+		if out == "" {
+			out = "."
+		}
+		c, _, err := loadClientFromConfig()
+		if err != nil {
+			return err
+		}
+
+		resp, err := c.ExportPDF(notes, pageBreak)
+		if err != nil {
+			return mapExportPDFError(err)
+		}
+		defer resp.Body.Close()
+
+		filename := filenameFromContentDisposition(resp.Header.Get("Content-Disposition"))
+		if filename == "" {
+			// Not "Notes (N).pdf": repeated and encrypted ids make len(notes) the
+			// wrong N, and only the server knows how many went in.
+			filename = "notes.pdf"
+		}
+		path := accountExportOutputPath(out, filename)
+		n, err := writeOutput(path, resp.Body)
+		if err != nil {
+			return err
+		}
+		if path != "-" {
+			fmt.Printf("Wrote %s to %s\n", bytesHuman(float64(n)), path)
+		}
+		// On stderr, so they never land inside a file piped from --output -.
+		if skipped := importExportSkipCount(resp.Header.Get("X-Skipped-Encrypted")); skipped > 0 {
+			fmt.Fprintf(os.Stderr, "%s %d encrypted %s left out (encrypted notes can't be made into a PDF)\n",
+				amberWarn("note:"), skipped, pluralize(skipped, "note", "notes"))
+		}
+		if skipped := importExportSkipCount(resp.Header.Get("X-Skipped-Attachments")); skipped > 0 {
+			fmt.Fprintf(os.Stderr, "%s %d attached %s could not be combined into the PDF\n",
+				amberWarn("warning:"), skipped, pluralize(skipped, "PDF", "PDFs"))
+		}
+		return nil
+	},
+}
+
+// mapExportPDFError rewords the refusals of a several-note PDF where the server's
+// sentence does not fit this command. It stays an APIError, so --json still
+// reports the server's code; every other refusal keeps the server's message.
+func mapExportPDFError(err error) error {
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+	friendly := *apiErr
+	switch apiErr.Code {
+	case "too_many_notes":
+		friendly.Message = "A PDF can hold up to 50 notes. For a whole notebook, use 'harbor account export --format pdf --notebook <id>'."
+	case "encrypted_not_exportable":
+		// The server's own sentence says to export from the client, which this is.
+		friendly.Message = "Every note you listed is encrypted, and encrypted notes can't be made into a PDF."
+	default:
+		return err
+	}
+	return &friendly
 }
 
 // exportEnexCmd streams a notebook or note selection out as a raw .enex file.
@@ -970,6 +1091,10 @@ func init() {
 	exportEnexCmd.Flags().String("notes", "", "Export exactly these note ids (comma-separated)")
 	exportEnexCmd.Flags().Bool("include-resources", false, "Inline each linked attachment's bytes as base64")
 	exportEnexCmd.Flags().String("output", "", "Output path, or - for stdout (required)")
-	exportCmd.AddCommand(exportEnexCmd)
+
+	exportPDFCmd.Flags().String("notes", "", "The note ids, comma-separated, in the order the PDF prints them (up to 50; required)")
+	exportPDFCmd.Flags().String("page-break", "new_page", "new_page (every note on a new page) or continuous (each note follows the one before it)")
+	exportPDFCmd.Flags().StringP("output", "o", "", "Where to write it: a path, a directory to take the server's filename, or - for stdout (default: the current directory)")
+	exportCmd.AddCommand(exportEnexCmd, exportPDFCmd)
 	rootCmd.AddCommand(exportCmd)
 }

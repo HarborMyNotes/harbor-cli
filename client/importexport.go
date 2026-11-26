@@ -200,6 +200,29 @@ func (c *Client) ExportENEX(notebookID string, noteIDs []string, includeResource
 	return c.rawPost(full, raw, "application/json")
 }
 
+// ExportPDF builds one PDF of several notes, printed in the order of noteIDs.
+// The body is the PDF itself, so it returns the live *http.Response and the
+// caller MUST close the body. The file name (Content-Disposition) and the counts
+// of encrypted notes and attached PDFs that were left out (X-Skipped-Encrypted,
+// X-Skipped-Attachments) ride in headers, which the caller reads first.
+// pageBreak is "new_page" or "continuous"; an empty one is omitted so the
+// server's default applies.
+func (c *Client) ExportPDF(noteIDs []string, pageBreak string) (*http.Response, error) {
+	body := map[string]any{"note_ids": noteIDs}
+	if pageBreak != "" {
+		body["page_break"] = pageBreak
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode request body: %w", err)
+	}
+	full, err := c.buildURL("/export/pdf", nil)
+	if err != nil {
+		return nil, err
+	}
+	return c.rawPost(full, raw, "application/json")
+}
+
 // rawPost performs a POST whose successful response is streamed back as a live
 // *http.Response (the caller closes the body) — the streaming sibling of doPost,
 // used by ENEX export which returns a raw file plus a header to read. On a

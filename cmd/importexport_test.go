@@ -1247,3 +1247,202 @@ func TestImportProgressClosesItsLine(t *testing.T) {
 		t.Errorf("off a terminal there is no line to close, got %q", out)
 	}
 }
+
+// pdfExportMock answers POST /export/pdf with a PDF named by the server and the
+// given skipped-count headers (empty = header absent).
+func pdfExportMock(t *testing.T, skippedEncrypted, skippedAttachments string) *apiMock {
+	t.Helper()
+	m := newAPIMock(t, map[string]mockReply{})
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/export/pdf" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/pdf")
+		w.Header().Set("Content-Disposition", `attachment; filename="Notes (2).pdf"; filename*=UTF-8''Notes%20%282%29.pdf`)
+		if skippedEncrypted != "" {
+			w.Header().Set("X-Skipped-Encrypted", skippedEncrypted)
+		}
+		if skippedAttachments != "" {
+			w.Header().Set("X-Skipped-Attachments", skippedAttachments)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("%PDF-1.3 two notes"))
+	}
+	return m
+}
+
+// TestExportPDFSendsIdsInOrderAndPageBreak pins the wire body: the ids exactly in
+// the order typed, and new_page unless --page-break says otherwise.
+func TestExportPDFSendsIdsInOrderAndPageBreak(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{nil, "new_page"},
+		{[]string{"--page-break", "continuous"}, "continuous"},
+		{[]string{"--page-break", "CONTINUOUS"}, "continuous"},
+	} {
+		t.Chdir(t.TempDir())
+		m := pdfExportMock(t, "", "")
+		args := append([]string{"export", "pdf", "--notes", "n3, n1,n2"}, tc.args...)
+		if _, err := runCLI(t, m, args...); err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		var body struct {
+			NoteIDs   []string `json:"note_ids"`
+			PageBreak string   `json:"page_break"`
+		}
+		if err := json.Unmarshal([]byte(m.rawBodyOf(t, "POST /api/v1/export/pdf")), &body); err != nil {
+			t.Fatalf("%v: body is not JSON: %v", args, err)
+		}
+		if strings.Join(body.NoteIDs, ",") != "n3,n1,n2" {
+			t.Errorf("%v: note_ids = %v, want the order typed", args, body.NoteIDs)
+		}
+		if body.PageBreak != tc.want {
+			t.Errorf("%v: page_break = %q, want %q", args, body.PageBreak, tc.want)
+		}
+	}
+}
+
+// TestExportPDFRefusesBadFlagsWithoutARequest proves a missing --notes and a bad
+// --page-break fail locally, before any request is spent.
+func TestExportPDFRefusesBadFlagsWithoutARequest(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"export", "pdf"}, "--notes is required"},
+		{[]string{"export", "pdf", "--notes", " , "}, "--notes is required"},
+		{[]string{"export", "pdf", "--notes", "n1", "--page-break", "new-page"}, "--page-break must be one of new_page|continuous"},
+		{[]string{"export", "pdf", "--notes", "n1", "--page-break", ""}, "--page-break must be one of new_page|continuous"},
+	} {
+		m := newAPIMock(t, map[string]mockReply{})
+		_, err := runCLI(t, m, tc.args...)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%v: err = %v, want %q", tc.args, err, tc.want)
+		}
+		if len(m.calls()) != 0 {
+			t.Errorf("%v: no request should have been made, got %v", tc.args, m.calls())
+		}
+	}
+}
+
+// TestExportPDFWritesTheFile saves the PDF under the server's name by default,
+// at the path given with -o, and inside a directory given with --output.
+func TestExportPDFWritesTheFile(t *testing.T) {
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+	out, err := runCLI(t, pdfExportMock(t, "", ""), "export", "pdf", "--notes", "n1,n2")
+	if err != nil {
+		t.Fatalf("export pdf: %v", err)
+	}
+	if got, rerr := os.ReadFile("Notes (2).pdf"); rerr != nil || string(got) != "%PDF-1.3 two notes" {
+		t.Errorf("default target = (%q, %v), want the PDF under the server's name", got, rerr)
+	}
+	if !strings.Contains(out, "Wrote") || !strings.Contains(out, "Notes (2).pdf") {
+		t.Errorf("stdout = %q, want the write report", out)
+	}
+
+	if _, err := runCLI(t, pdfExportMock(t, "", ""), "export", "pdf", "--notes", "n1,n2", "-o", "trip.pdf"); err != nil {
+		t.Fatalf("export pdf -o: %v", err)
+	}
+	if got, rerr := os.ReadFile("trip.pdf"); rerr != nil || string(got) != "%PDF-1.3 two notes" {
+		t.Errorf("-o trip.pdf = (%q, %v)", got, rerr)
+	}
+
+	dir := t.TempDir()
+	if _, err := runCLI(t, pdfExportMock(t, "", ""), "export", "pdf", "--notes", "n1,n2", "--output", dir); err != nil {
+		t.Fatalf("export pdf --output dir: %v", err)
+	}
+	if names := dirNames(t, dir); len(names) != 1 || names[0] != "Notes (2).pdf" {
+		t.Errorf("directory target holds %v, want the server's name", names)
+	}
+}
+
+// TestExportPDFReportsSkippedCountsOnStderr prints both left-out counts on stderr,
+// so stdout stays the bare PDF with --output -, and says nothing when the
+// headers are absent or zero.
+func TestExportPDFReportsSkippedCountsOnStderr(t *testing.T) {
+	t.Chdir(t.TempDir())
+	var out string
+	stderr := captureStderr(t, func() {
+		var err error
+		out, err = runCLI(t, pdfExportMock(t, "3", "1"), "export", "pdf", "--notes", "n1,n2", "--output", "-")
+		if err != nil {
+			t.Fatalf("export pdf: %v", err)
+		}
+	})
+	if out != "%PDF-1.3 two notes" {
+		t.Errorf("stdout = %q, want only the PDF", out)
+	}
+	for _, want := range []string{"3 encrypted notes left out", "1 attached PDF could not be combined"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr = %q, want %q", stderr, want)
+		}
+	}
+
+	for _, header := range []string{"", "0"} {
+		stderr = captureStderr(t, func() {
+			if _, err := runCLI(t, pdfExportMock(t, header, header), "export", "pdf", "--notes", "n1,n2"); err != nil {
+				t.Fatalf("export pdf: %v", err)
+			}
+		})
+		if strings.Contains(stderr, "left out") || strings.Contains(stderr, "could not be combined") {
+			t.Errorf("skipped headers %q still reported: %q", header, stderr)
+		}
+	}
+}
+
+// TestExportPDFRefusalShowsTheServerMessage runs real refusals through the
+// command: no file is written, the code survives for --json, too_many_notes
+// points at the notebook export, and other codes keep the server's sentence.
+func TestExportPDFRefusalShowsTheServerMessage(t *testing.T) {
+	for _, tc := range []struct {
+		status        int
+		code, message string
+		want          []string
+	}{
+		{422, "too_many_notes", "A PDF can hold up to 50 notes.", []string{"up to 50 notes", "harbor account export --format pdf --notebook"}},
+		{422, "encrypted_not_exportable", "Encrypted notes cannot be exported by the server; export from the client where the content is decrypted.", []string{"Every note you listed is encrypted"}},
+		{429, "export_busy", "Busy, try again in a moment.", []string{"Busy, try again in a moment."}},
+		{422, "export_timed_out", "This PDF took too long to build. Try fewer notes.", []string{"Try fewer notes."}},
+	} {
+		dir := t.TempDir()
+		t.Chdir(dir)
+		m := newAPIMock(t, map[string]mockReply{
+			"POST /api/v1/export/pdf": {Status: tc.status, Body: apiErrorBody(tc.code, tc.message)},
+		})
+		_, err := runCLI(t, m, "export", "pdf", "--notes", "n1,n2")
+		if err == nil {
+			t.Fatalf("%s: a refused export was reported as written", tc.code)
+		}
+		var apiErr *client.APIError
+		if !errors.As(err, &apiErr) || apiErr.Code != tc.code {
+			t.Errorf("%s: err = %#v, want an APIError keeping the code", tc.code, err)
+		}
+		stderr := captureStderr(t, func() { renderError(err) })
+		for _, want := range tc.want {
+			if !strings.Contains(stderr, want) {
+				t.Errorf("%s: stderr = %q, want %q", tc.code, stderr, want)
+			}
+		}
+		if names := dirNames(t, dir); len(names) != 0 {
+			t.Errorf("%s: a file was written for a refused export: %v", tc.code, names)
+		}
+	}
+}
+
+// TestMapExportPDFErrorPassesOthersThrough leaves a non-API error and an
+// unrelated code exactly as they came in.
+func TestMapExportPDFErrorPassesOthersThrough(t *testing.T) {
+	plain := errors.New("request failed")
+	if got := mapExportPDFError(plain); got != plain {
+		t.Errorf("plain error changed: %v", got)
+	}
+	notFound := apiErr("notes_not_found")
+	if got := mapExportPDFError(notFound); got != error(notFound) {
+		t.Errorf("notes_not_found changed: %v", got)
+	}
+}

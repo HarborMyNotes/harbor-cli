@@ -89,18 +89,18 @@ var accountCmd = &cobra.Command{
 	GroupID: groupAccount,
 	Long: `Whole-account operations.
 
-  export        start an export job (ENEX, HTML or Markdown, whole account or one notebook)
+  export        start an export job (ENEX, HTML, Markdown or a notebook PDF)
   exports       show what this account's export slots hold right now
-  export-status poll an export job and download the ZIP when it completes
+  export-status poll an export job and download the file when it completes
   export-delete delete an export's archive, freeing that format's slot
   clear         destroy everything IN the account, keeping the account (destructive)
   clear-status  show the account's current or last clear
   delete        schedule account deletion after a grace period (destructive)
   cancel-delete cancel a pending deletion within the grace window
 
-You hold at most one live export PER FORMAT — one ENEX, one HTML and one
-Markdown — and scoping an export to a single notebook does not create a slot of
-its own. Exports run one at a time server-wide, so a new one may sit "queued"
+You hold at most one live export PER FORMAT — one ENEX, one HTML, one Markdown
+and one PDF — and scoping an export to a single notebook does not create a slot
+of its own. Exports run one at a time server-wide, so a new one may sit "queued"
 (waiting its turn) before it starts. A finished archive is kept for 72 hours,
 then deleted.
 
@@ -119,7 +119,7 @@ mistake for the other.`,
 // instead of starting a second one; a completed, unexpired one is refused.
 var accountExportCmd = &cobra.Command{
 	Use:   "export",
-	Short: "Start a data export (ENEX, HTML or Markdown, whole account or one notebook)",
+	Short: "Start a data export (ENEX, HTML, Markdown or a notebook PDF)",
 	Args:  cobra.NoArgs,
 	Long: `Start an asynchronous export job.
 
@@ -132,18 +132,23 @@ var accountExportCmd = &cobra.Command{
                   notebooks, with your attachments alongside — opens in
                   Obsidian, Bear, iA Writer or any plain-text editor, and Harbor
                   can import it back
+  --format pdf    one PDF of ONE notebook (needs --notebook), oldest note first,
+                  with an outline of note titles and attached PDFs at the end.
+                  --page-break new_page (the default) starts every note on a new
+                  page; --page-break continuous runs each note on after the last
 
-All three include your attachments and an index of everything inside, and all
-three skip encrypted notes: the server holds only ciphertext for those, so it
-cannot render them. The count is reported with the finished export.
+The three ZIP formats include your attachments and an index of everything
+inside. Every format skips encrypted notes: the server holds only ciphertext for
+those, so it cannot render them. The count is reported with the finished export.
 
 With --notebook the export covers a single notebook instead of the whole
-account, for any format. It is still an ordinary export job, so it gets the
-same progress, ready email, 72-hour retention, delete action and export slot.
+account. It is still an ordinary export job, so it gets the same progress,
+ready email, 72-hour retention, delete action and export slot. A PDF always
+covers one notebook; for a few notes, use 'harbor export pdf --notes ...'.
 
 You hold one export per format. Starting a second of the SAME format while one
 is ready is refused — delete it or wait for it to expire; the other formats are
-unaffected. Because exports run one at a time server-wide, a new job may report
+unaffected. So a ready PDF of one notebook blocks a PDF of another until then. Because exports run one at a time server-wide, a new job may report
 "queued" (waiting its turn) for a while before it starts building.
 
 Nothing has to stay running here. The archive is built on the server and a link
@@ -151,26 +156,34 @@ to it is emailed to you when it is done, so you can close this terminal — and
 'harbor account exports' finds the job again afterwards.
 
 Poll it with 'harbor account export-status <id>', or pass --wait to poll here
-until it finishes. --download implies --wait and saves the ZIP straight to disk.`,
+until it finishes. --download implies --wait and saves the finished file (the
+ZIP, or the .pdf) straight to disk.`,
 	Example: `  harbor account export
   harbor account export --format html
   harbor account export --format markdown
   harbor account export --format enex --notebook 5b1f2c9a
+  harbor account export --format pdf --notebook 5b1f2c9a --download .
+  harbor account export --format pdf --notebook 5b1f2c9a --page-break continuous
   harbor account export --wait --download harbor-export.zip
   harbor account export --json`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, _, err := loadClientFromConfig()
-		if err != nil {
-			return err
-		}
-
+		// The flags are checked before the credentials so a typo answers the typo.
 		format, err := accountExportFormat(cmd)
 		if err != nil {
 			return err
 		}
 		notebook := stringFlag(cmd, "notebook")
+		pageBreak, err := accountExportPageBreak(cmd, format, notebook)
+		if err != nil {
+			return err
+		}
 
-		data, err := c.StartAccountExport(format, notebook)
+		c, _, err := loadClientFromConfig()
+		if err != nil {
+			return err
+		}
+
+		data, err := c.StartAccountExport(format, notebook, pageBreak)
 		if err != nil {
 			return mapAccountExportStartError(err, notebook)
 		}
@@ -202,8 +215,9 @@ var accountExportsCmd = &cobra.Command{
 	Use:   "exports",
 	Short: "Show this account's current exports (one per format)",
 	Args:  cobra.NoArgs,
-	Long: `List the most recent export per format — at most three rows, one ENEX, one
-HTML and one Markdown. A format you have never exported is simply absent.
+	Long: `List the most recent export per format — at most four rows, one ENEX, one
+HTML, one Markdown and one PDF. A format you have never exported is simply
+absent.
 
 Export state lives on the server, not in this shell: this is how you find the
 export you started on another machine (or before you closed the terminal and
@@ -225,11 +239,11 @@ or deleted — is still shown, because it explains where a download went.`,
 	},
 }
 
-// accountExportStatusCmd polls an export job and, with --download, saves the ZIP
-// when the job is completed (by following the presigned URL).
+// accountExportStatusCmd polls an export job and, with --download, saves the
+// finished file when the job is completed (by following the presigned URL).
 var accountExportStatusCmd = &cobra.Command{
 	Use:   "export-status <id>",
-	Short: "Poll an export job and optionally download the ZIP",
+	Short: "Poll an export job and optionally download the finished file",
 	Args:  cobra.ExactArgs(1),
 	Long: `Poll an export job by id.
 
@@ -238,10 +252,11 @@ its turn behind the server-wide one-at-a-time lock and says where it is in the
 line. A completed job reports when it finished and when its archive expires,
 plus a short-lived presigned download URL.
 
-Pass --download <path> to fetch and save the ZIP (use - for stdout); if <path>
-is a directory the server's own filename is used. --wait polls until the job
-reaches a final state first, so --wait --download is a one-shot "export and
-save". Lost the id? 'harbor account exports' reads it back off the server.`,
+Pass --download <path> to fetch and save the finished file — the ZIP, or the
+.pdf of a PDF export — as it is (use - for stdout); if <path> is a directory the
+server's own filename is used. --wait polls until the job reaches a final state
+first, so --wait --download is a one-shot "export and save". Lost the id?
+'harbor account exports' reads it back off the server.`,
 	Example: `  harbor account export-status 0f9c2b1e-...
   harbor account export-status 0f9c2b1e-... --download account-export.zip
   harbor account export-status 0f9c2b1e-... --wait --download ~/Downloads`,
@@ -432,10 +447,10 @@ const accountExportNextStep = "Pick it up any time with 'harbor account exports'
 // the point has been made.
 const accountExportQueueSlipNote = "Another export moved ahead of yours — the line is shared with every other account, so a position can go up as well as down."
 
-// accountExportFormats are the archive kinds the server accepts. The CLI checks
-// the value itself so a typo costs a round-trip and a validation error rather
-// than an export of the wrong thing.
-var accountExportFormats = []string{"enex", "html", "markdown"}
+// accountExportFormats are the export kinds the server accepts. The CLI checks
+// the value itself so a typo fails here rather than costing a round-trip and a
+// validation error.
+var accountExportFormats = []string{"enex", "html", "markdown", "pdf"}
 
 // accountExportTerminalStates are the statuses an export never moves out of.
 // completed/failed are the job's own outcomes; expired/deleted are terminal
@@ -457,6 +472,23 @@ func accountExportFormat(cmd *cobra.Command) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("--format must be one of %s", strings.Join(accountExportFormats, "|"))
+}
+
+// accountExportPageBreak checks the flags a notebook PDF adds and returns the
+// page break to send: the --page-break value for --format pdf, and "" for every
+// other format. Both refusals happen before any request, because the server
+// would only refuse them after a round-trip.
+func accountExportPageBreak(cmd *cobra.Command, format, notebook string) (string, error) {
+	if format != "pdf" {
+		if cmd.Flags().Changed("page-break") {
+			return "", errors.New("--page-break only applies to --format pdf")
+		}
+		return "", nil
+	}
+	if notebook == "" {
+		return "", errors.New("--format pdf needs --notebook: a PDF export covers one notebook (for a few notes, use 'harbor export pdf --notes ...')")
+	}
+	return pdfPageBreak(cmd)
 }
 
 // accountExportIsTerminal reports whether an export status is final, i.e. polling
@@ -504,8 +536,8 @@ func accountWaitAndMaybeDownload(cmd *cobra.Command, c *client.Client, id, out s
 	if err != nil {
 		return err
 	}
-	// With --download - the archive IS stdout, so nothing human may go there: a
-	// status card in front of the ZIP bytes produces a file that is not a ZIP.
+	// With --download - the file IS stdout, so nothing human may go there: a
+	// status card in front of the ZIP or PDF bytes breaks the file.
 	// Progress already went to stderr, and a failure still comes back as an error.
 	if out != "-" {
 		display := displayExportJob
@@ -1269,10 +1301,11 @@ func displayExportJobCard(data []byte, downloading bool) {
 	if format := str(j, "format"); format != "" {
 		pairs = append(pairs, [2]string{"Format", accountExportFormatLabel(format)})
 	}
-	pairs = append(pairs,
-		[2]string{"Scope", accountExportScopeLabel(j)},
-		[2]string{"Status", colorizeStatus(status)},
-	)
+	pairs = append(pairs, [2]string{"Scope", accountExportScopeLabel(j)})
+	if pageBreak := str(j, "page_break"); pageBreak != "" {
+		pairs = append(pairs, [2]string{"Page break", accountExportPageBreakLabel(pageBreak)})
+	}
+	pairs = append(pairs, [2]string{"Status", colorizeStatus(status)})
 
 	// A queued export is waiting its turn behind the server-wide one-at-a-time
 	// lock — that is a position in a line, not a stalled job and not 0% progress.
@@ -1293,6 +1326,9 @@ func displayExportJobCard(data []byte, downloading bool) {
 	if filename := str(j, "filename"); filename != "" {
 		pairs = append(pairs, [2]string{"File", filename})
 	}
+	if skipped := int(num(j, "skipped_encrypted")); skipped > 0 {
+		pairs = append(pairs, [2]string{"Left out", fmt.Sprintf("%d encrypted %s", skipped, pluralize(skipped, "note", "notes"))})
+	}
 	if et := str(j, "error_text"); et != "" {
 		pairs = append(pairs, [2]string{"Error", et})
 	}
@@ -1311,7 +1347,7 @@ func displayExportJobCard(data []byte, downloading bool) {
 	}
 }
 
-// displayExportList renders the account's export slots — at most three rows, one
+// displayExportList renders the account's export slots — at most four rows, one
 // per format. An account with no exports gets a plain sentence and the command
 // that starts one, not an empty table.
 func displayExportList(data []byte) {
@@ -1408,8 +1444,22 @@ func accountExportFormatLabel(format string) string {
 		return "ENEX"
 	case "markdown":
 		return "Markdown"
+	case "pdf":
+		return "PDF"
 	default:
 		return format
+	}
+}
+
+// accountExportPageBreakLabel renders a PDF export's page-break choice for humans.
+func accountExportPageBreakLabel(pageBreak string) string {
+	switch pageBreak {
+	case "new_page":
+		return "each note on a new page"
+	case "continuous":
+		return "continuous (each note follows the one before it)"
+	default:
+		return pageBreak
 	}
 }
 
@@ -1596,14 +1646,15 @@ func displayDeletionScheduled(data []byte) {
 }
 
 func init() {
-	accountExportCmd.Flags().String("format", "", "Archive format: enex (default) or html")
+	accountExportCmd.Flags().String("format", "", "Export format: enex (default), html, markdown or pdf (pdf needs --notebook)")
 	accountExportCmd.Flags().String("notebook", "", "Export only this notebook id (default: the whole account)")
+	accountExportCmd.Flags().String("page-break", "new_page", "PDF only: new_page (every note on a new page) or continuous (each note follows the one before it)")
 	accountExportCmd.Flags().Bool("wait", false, "Poll until the export finishes instead of returning the job id")
-	accountExportCmd.Flags().String("download", "", "Save the finished ZIP here (implies --wait; - for stdout, a directory to use the server's filename)")
+	accountExportCmd.Flags().String("download", "", "Save the finished file here, as it is (implies --wait; - for stdout, a directory to use the server's filename)")
 	accountExportCmd.Flags().Duration("poll-interval", 5*time.Second, "How often to poll while waiting")
 	accountExportCmd.Flags().Duration("timeout", 0, "Give up waiting after this long (0 = no limit)")
 
-	accountExportStatusCmd.Flags().String("download", "", "Save the completed export ZIP here (- for stdout, a directory to use the server's filename)")
+	accountExportStatusCmd.Flags().String("download", "", "Save the finished file here, as it is (- for stdout, a directory to use the server's filename)")
 	accountExportStatusCmd.Flags().Bool("wait", false, "Poll until the export reaches a final state")
 	accountExportStatusCmd.Flags().Duration("poll-interval", 5*time.Second, "How often to poll while waiting")
 	accountExportStatusCmd.Flags().Duration("timeout", 0, "Give up waiting after this long (0 = no limit)")
