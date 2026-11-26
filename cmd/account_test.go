@@ -705,6 +705,32 @@ func TestAccountExportPDFSendsNotebookAndPageBreak(t *testing.T) {
 	}
 }
 
+// TestAccountExportPDFWarnsWhenHandedAnotherPageBreak notes on stderr when the
+// server hands back a running PDF of the same notebook with the other page
+// break, and stays quiet when the page break matches or is not reported.
+func TestAccountExportPDFWarnsWhenHandedAnotherPageBreak(t *testing.T) {
+	for _, tc := range []struct {
+		got  string
+		warn bool
+	}{
+		{`,"page_break":"new_page"`, true},
+		{`,"page_break":"continuous"`, false},
+		{``, false},
+	} {
+		m := newAPIMock(t, map[string]mockReply{
+			"POST /api/v1/account/export": {Status: 202, Body: `{"data":{"export_job_id":"e1","status":"running","format":"pdf","notebook_id":"nb1"` + tc.got + `}}`},
+		})
+		stderr := captureStderr(t, func() {
+			if _, err := runCLI(t, m, "account", "export", "--format", "pdf", "--notebook", "nb1", "--page-break", "continuous"); err != nil {
+				t.Fatalf("account export: %v", err)
+			}
+		})
+		if warned := strings.Contains(stderr, "--page-break new_page, not continuous"); warned != tc.warn {
+			t.Errorf("handed back %q: warned = %v, want %v (stderr %q)", tc.got, warned, tc.warn, stderr)
+		}
+	}
+}
+
 // TestAccountExportPDFRefusalsSendNothing proves the PDF checks are local: no
 // notebook, a bad page break, and a page break on a ZIP format all fail before
 // any request is made.

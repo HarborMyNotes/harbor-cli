@@ -682,7 +682,7 @@ stderr, as does a count of attached PDFs that could not be combined; if every
 note is encrypted it fails and writes no file. More than 50 notes is refused —
 for a whole notebook use `harbor account export --format pdf --notebook <id>`.
 A `429 export_busy` ("Busy, try again in a moment.") means the server is
-already building two of these; run it again shortly.
+already building as many of these as it allows at once; run it again shortly.
 
 ```bash
 harbor export pdf --notes "$A,$B,$C"                          # Notes (3).pdf, here

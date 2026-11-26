@@ -1404,7 +1404,8 @@ func TestExportPDFRefusalShowsTheServerMessage(t *testing.T) {
 		code, message string
 		want          []string
 	}{
-		{422, "too_many_notes", "A PDF can hold up to 50 notes.", []string{"up to 50 notes", "harbor account export --format pdf --notebook"}},
+		// A limit other than 50 proves the server's sentence is shown, not a copy.
+		{422, "too_many_notes", "A PDF can hold up to 40 notes.", []string{"A PDF can hold up to 40 notes. For a whole notebook", "harbor account export --format pdf --notebook"}},
 		{422, "encrypted_not_exportable", "Encrypted notes cannot be exported by the server; export from the client where the content is decrypted.", []string{"Every note you listed is encrypted"}},
 		{429, "export_busy", "Busy, try again in a moment.", []string{"Busy, try again in a moment."}},
 		{422, "export_timed_out", "This PDF took too long to build. Try fewer notes.", []string{"Try fewer notes."}},
@@ -1444,5 +1445,23 @@ func TestMapExportPDFErrorPassesOthersThrough(t *testing.T) {
 	notFound := apiErr("notes_not_found")
 	if got := mapExportPDFError(notFound); got != error(notFound) {
 		t.Errorf("notes_not_found changed: %v", got)
+	}
+}
+
+// TestExportPDFFallsBackToAPlainName saves the PDF as notes.pdf when the server
+// sends no file name, rather than failing or guessing a note count.
+func TestExportPDFFallsBackToAPlainName(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	m := newAPIMock(t, map[string]mockReply{})
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write([]byte("%PDF-1.3"))
+	}
+	if _, err := runCLI(t, m, "export", "pdf", "--notes", "n1,n1,n2"); err != nil {
+		t.Fatalf("export pdf: %v", err)
+	}
+	if names := dirNames(t, dir); len(names) != 1 || names[0] != "notes.pdf" {
+		t.Errorf("saved as %v, want notes.pdf", names)
 	}
 }

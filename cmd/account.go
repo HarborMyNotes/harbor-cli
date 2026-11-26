@@ -148,8 +148,9 @@ covers one notebook; for a few notes, use 'harbor export pdf --notes ...'.
 
 You hold one export per format. Starting a second of the SAME format while one
 is ready is refused — delete it or wait for it to expire; the other formats are
-unaffected. So a ready PDF of one notebook blocks a PDF of another until then. Because exports run one at a time server-wide, a new job may report
-"queued" (waiting its turn) for a while before it starts building.
+unaffected. So a ready PDF of one notebook blocks a PDF of another until then.
+Because exports run one at a time server-wide, a new job may report "queued"
+(waiting its turn) for a while before it starts building.
 
 Nothing has to stay running here. The archive is built on the server and a link
 to it is emailed to you when it is done, so you can close this terminal — and
@@ -192,7 +193,7 @@ ZIP, or the .pdf) straight to disk.`,
 		// necessarily the one you asked for: an already in-flight export of this
 		// format is handed back as-is. Say so rather than let the user believe
 		// their --notebook took effect.
-		accountWarnScopeMismatch(data, notebook)
+		accountWarnScopeMismatch(data, notebook, pageBreak)
 
 		out := stringFlag(cmd, "download")
 		if !boolFlag(cmd, "wait") && out == "" {
@@ -503,24 +504,28 @@ func accountExportIsTerminal(status string) bool {
 }
 
 // accountWarnScopeMismatch prints a notice when the job the server handed back
-// does not cover the notebook that was asked for.
+// does not cover the notebook, or use the page break, that was asked for.
 //
 // Starting an export while one of that format is already queued or running
 // returns the EXISTING job, so the 202 describes a scope the caller may not have
 // requested. Silently rendering it would tell someone their notebook export
 // started when what they actually have is the whole-account export from ten
-// minutes ago.
-func accountWarnScopeMismatch(data []byte, wantNotebook string) {
+// minutes ago. A PDF of the right notebook can still carry the other page
+// break, which nobody would notice until they opened the file.
+func accountWarnScopeMismatch(data []byte, wantNotebook, wantPageBreak string) {
 	if wantNotebook == "" || jsonOutput {
 		return
 	}
 	job := parseJSON(client.UnwrapData(data))
-	got := str(job, "notebook_id")
-	if got == wantNotebook {
+	if got := str(job, "notebook_id"); got != wantNotebook {
+		fmt.Fprintf(os.Stderr, "%s an export of this format was already running, so that job was returned instead — it covers %s, not the notebook you asked for.\n",
+			colorize("note:", text.FgYellow), accountExportScopeLabel(job))
 		return
 	}
-	fmt.Fprintf(os.Stderr, "%s an export of this format was already running, so that job was returned instead — it covers %s, not the notebook you asked for.\n",
-		colorize("note:", text.FgYellow), accountExportScopeLabel(job))
+	if got := str(job, "page_break"); wantPageBreak != "" && got != "" && got != wantPageBreak {
+		fmt.Fprintf(os.Stderr, "%s a PDF export of this notebook was already running, so that job was returned instead — it uses --page-break %s, not %s.\n",
+			colorize("note:", text.FgYellow), got, wantPageBreak)
+	}
 }
 
 // accountWaitAndMaybeDownload polls an export to a final state and then, when

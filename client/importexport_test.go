@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -459,6 +460,35 @@ func TestExportPDF(t *testing.T) {
 	raw, _ := io.ReadAll(resp.Body)
 	if string(raw) != "%PDF-1.3" {
 		t.Errorf("raw body = %q", raw)
+	}
+}
+
+// TestExportPDFWaitsForASlowBuild proves the PDF call outlasts the stall timeout
+// while the server builds, and that the same wait would stop the ENEX export.
+// The server sends nothing until the whole PDF is built, so a stall timer that
+// is shorter than the build budget gives up on a PDF that is on its way.
+func TestExportPDFWaitsForASlowBuild(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write([]byte("%PDF-1.3"))
+	}))
+	defer srv.Close()
+	c := testClient(srv.URL)
+	c.StallTimeout = 100 * time.Millisecond
+
+	resp, err := c.ExportPDF([]string{"n1"}, "new_page")
+	if err != nil {
+		t.Fatalf("ExportPDF gave up on a slow build: %v", err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(raw) != "%PDF-1.3" {
+		t.Errorf("body = %q", raw)
+	}
+
+	if _, err := c.ExportENEX("nb1", nil, false); !errors.As(err, new(*StallError)) {
+		t.Errorf("ExportENEX error = %v, want the ordinary stall timeout to apply", err)
 	}
 }
 

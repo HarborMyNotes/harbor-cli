@@ -299,9 +299,10 @@ minutes.`,
 	},
 }
 
-// mapExportPDFError rewords the refusals of a several-note PDF where the server's
-// sentence does not fit this command. It stays an APIError, so --json still
-// reports the server's code; every other refusal keeps the server's message.
+// mapExportPDFError adds to or rewords the refusals of a several-note PDF where
+// the server's sentence alone does not fit this command. It stays an APIError,
+// so --json still reports the server's code; every other refusal keeps the
+// server's message.
 func mapExportPDFError(err error) error {
 	var apiErr *client.APIError
 	if !errors.As(err, &apiErr) {
@@ -310,7 +311,9 @@ func mapExportPDFError(err error) error {
 	friendly := *apiErr
 	switch apiErr.Code {
 	case "too_many_notes":
-		friendly.Message = "A PDF can hold up to 50 notes. For a whole notebook, use 'harbor account export --format pdf --notebook <id>'."
+		// The server's sentence carries the limit, so it is kept and only the
+		// way forward is added.
+		friendly.Message = strings.TrimSpace(apiErr.Message + " For a whole notebook, use 'harbor account export --format pdf --notebook <id>'.")
 	case "encrypted_not_exportable":
 		// The server's own sentence says to export from the client, which this is.
 		friendly.Message = "Every note you listed is encrypted, and encrypted notes can't be made into a PDF."
