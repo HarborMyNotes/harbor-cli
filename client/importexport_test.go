@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -423,6 +424,103 @@ func TestExportENEXNotFound(t *testing.T) {
 	apiErr, ok := err.(*APIError)
 	if !ok || apiErr.Code != "not_found" || apiErr.Status != 404 {
 		t.Fatalf("want not_found APIError, got %v", err)
+	}
+}
+
+// TestExportPDF verifies the PDF POST sends the ids in the order given with the
+// page break, and streams the PDF back.
+func TestExportPDF(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 200, "%PDF-1.3")
+	defer srv.Close()
+	resp, err := testClient(srv.URL).ExportPDF([]string{"n3", "n1", "n2"}, "continuous")
+	if err != nil {
+		t.Fatalf("ExportPDF error: %v", err)
+	}
+	defer resp.Body.Close()
+	if rec.Method != "POST" || rec.Path != "/export/pdf" {
+		t.Errorf("%s %s", rec.Method, rec.Path)
+	}
+	if rec.ContentType != "application/json" {
+		t.Errorf("content type = %q", rec.ContentType)
+	}
+	var body struct {
+		NoteIDs   []string `json:"note_ids"`
+		PageBreak string   `json:"page_break"`
+	}
+	if err := json.Unmarshal(rec.Body, &body); err != nil {
+		t.Fatalf("body is not JSON: %v (%s)", err, rec.Body)
+	}
+	if strings.Join(body.NoteIDs, ",") != "n3,n1,n2" {
+		t.Errorf("note_ids = %v, want the order given", body.NoteIDs)
+	}
+	if body.PageBreak != "continuous" {
+		t.Errorf("page_break = %q", body.PageBreak)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	if string(raw) != "%PDF-1.3" {
+		t.Errorf("raw body = %q", raw)
+	}
+}
+
+// TestExportPDFWaitsForASlowBuild proves the PDF call outlasts the stall timeout
+// while the server builds, and that the same wait would stop the ENEX export.
+// The server sends nothing until the whole PDF is built, so a stall timer that
+// is shorter than the build budget gives up on a PDF that is on its way.
+func TestExportPDFWaitsForASlowBuild(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write([]byte("%PDF-1.3"))
+	}))
+	defer srv.Close()
+	c := testClient(srv.URL)
+	c.StallTimeout = 100 * time.Millisecond
+
+	resp, err := c.ExportPDF([]string{"n1"}, "new_page")
+	if err != nil {
+		t.Fatalf("ExportPDF gave up on a slow build: %v", err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(raw) != "%PDF-1.3" {
+		t.Errorf("body = %q", raw)
+	}
+
+	if _, err := c.ExportENEX("nb1", nil, false); !errors.As(err, new(*StallError)) {
+		t.Errorf("ExportENEX error = %v, want the ordinary stall timeout to apply", err)
+	}
+}
+
+// TestExportPDFOmitsEmptyPageBreak pins that no page break leaves the field out,
+// so the server's own default applies.
+func TestExportPDFOmitsEmptyPageBreak(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 200, "%PDF-1.3")
+	defer srv.Close()
+	resp, err := testClient(srv.URL).ExportPDF([]string{"n1"}, "")
+	if err != nil {
+		t.Fatalf("ExportPDF error: %v", err)
+	}
+	resp.Body.Close()
+	if strings.Contains(string(rec.Body), "page_break") {
+		t.Errorf("an empty page break was sent: %s", rec.Body)
+	}
+}
+
+// TestExportPDFError verifies a refusal surfaces as an APIError carrying the
+// server's code and message, with no live response to close.
+func TestExportPDFError(t *testing.T) {
+	srv := newTestServer(t, nil, 422, `{"error":{"code":"too_many_notes","message":"A PDF can hold up to 50 notes."}}`)
+	defer srv.Close()
+	resp, err := testClient(srv.URL).ExportPDF([]string{"n1"}, "new_page")
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("expected error")
+	}
+	apiErr, ok := err.(*APIError)
+	if !ok || apiErr.Code != "too_many_notes" || apiErr.Message != "A PDF can hold up to 50 notes." {
+		t.Fatalf("want too_many_notes APIError, got %v", err)
 	}
 }
 

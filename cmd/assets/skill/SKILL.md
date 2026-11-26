@@ -10,7 +10,7 @@ description: >-
   assistant.
 ---
 
-<!-- Harbor agent skill • v1.9.3 -->
+<!-- Harbor agent skill • v1.9.4 -->
 <!-- Copyright (c) 2026 Cloudmanic Labs, LLC. All rights reserved. Date: 2026-06-22 -->
 
 # Harbor CLI — managing notes from the terminal
@@ -545,6 +545,8 @@ has copy-paste recipes and the full allowlist.
 | Create a note | `harbor notes create --title … --stdin` |
 | Read a note | `harbor notes get <id> --format markdown --json` |
 | Save a note to a file | `harbor notes export <id> --output .` |
+| Several notes as one PDF | `harbor export pdf --notes <id1>,<id2> --output .` |
+| A whole notebook as one PDF | `harbor account export --format pdf --notebook <id> --download .` |
 | Edit a note (targeted) | read-modify-write → `harbor notes update <id> --file …` |
 | Add to the end | `harbor notes append <id> --content …` |
 | List / filter notes | `harbor notes list [--notebook …] [--tag …] --json` |

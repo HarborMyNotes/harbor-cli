@@ -291,6 +291,25 @@ func TestDisplayExportJobStates(t *testing.T) {
 			body: `{"data":{"export_job_id":"e1","status":"queued","format":"html"}}`,
 			want: []string{"e1", "queued", "HTML", "whole account"},
 		},
+		{
+			name: "a finished notebook PDF shows its page break, file and the encrypted notes left out",
+			body: `{"data":{"id":"e1","format":"pdf","status":"completed","notebook_id":"nb1","notebook_name":"Diary",` +
+				`"page_break":"continuous","skipped_encrypted":2,"filename":"Diary.pdf","download_url":"https://s3/x?sig=1",` +
+				`"completed_at":1749744400000,"result_expires_at":1750003600000}}`,
+			want: []string{"PDF", "notebook Diary", "Page break", "continuous", "Diary.pdf", "Left out", "2 encrypted notes"},
+		},
+		{
+			name: "a new-page PDF with nothing left out says so plainly",
+			body: `{"data":{"id":"e1","format":"pdf","status":"running","notebook_id":"nb1","page_break":"new_page","skipped_encrypted":0}}`,
+			want: []string{"each note on a new page"},
+			deny: []string{"Left out"},
+		},
+		{
+			name: "a ZIP export has no page-break row",
+			body: `{"data":{"id":"e1","format":"enex","status":"completed","skipped_encrypted":1,"download_url":"https://s3/x"}}`,
+			want: []string{"1 encrypted note"},
+			deny: []string{"Page break", "1 encrypted notes"},
+		},
 	}
 
 	for _, tc := range cases {
@@ -428,7 +447,7 @@ func TestAccountExportFormatFlag(t *testing.T) {
 	cmd := accountExportCmd
 	defer resetFlags(cmd)
 
-	for _, ok := range []string{"enex", "html", "markdown", "HTML", "Markdown", " enex "} {
+	for _, ok := range []string{"enex", "html", "markdown", "pdf", "HTML", "Markdown", "PDF", " enex "} {
 		_ = cmd.Flags().Set("format", ok)
 		got, err := accountExportFormat(cmd)
 		if err != nil {
@@ -444,9 +463,9 @@ func TestAccountExportFormatFlag(t *testing.T) {
 		t.Errorf("unset --format = (%q, %v), want the server's default", got, err)
 	}
 
-	_ = cmd.Flags().Set("format", "pdf")
+	_ = cmd.Flags().Set("format", "docx")
 	if _, err := accountExportFormat(cmd); err == nil {
-		t.Error("--format pdf should be rejected before a request is made")
+		t.Error("--format docx should be rejected before a request is made")
 	}
 }
 
@@ -648,11 +667,135 @@ func TestAccountExportSendsFormatAndNotebook(t *testing.T) {
 // local: a typo must not cost a round-trip.
 func TestAccountExportRejectsBadFormatWithoutCallingAPI(t *testing.T) {
 	m := newAPIMock(t, map[string]mockReply{})
-	if _, err := runCLI(t, m, "account", "export", "--format", "pdf"); err == nil {
-		t.Fatal("expected --format pdf to fail")
+	if _, err := runCLI(t, m, "account", "export", "--format", "docx"); err == nil {
+		t.Fatal("expected --format docx to fail")
 	}
 	if len(m.calls()) != 0 {
 		t.Errorf("no request should have been made, got %v", m.calls())
+	}
+}
+
+// TestAccountExportPDFSendsNotebookAndPageBreak proves a notebook PDF reaches the
+// wire with its page break: new_page when the flag is left alone, and the value
+// given when it is set.
+func TestAccountExportPDFSendsNotebookAndPageBreak(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{nil, "new_page"},
+		{[]string{"--page-break", "continuous"}, "continuous"},
+		{[]string{"--page-break", " New_Page "}, "new_page"},
+	} {
+		m := newAPIMock(t, map[string]mockReply{
+			"POST /api/v1/account/export": {Status: 202, Body: `{"data":{"export_job_id":"e1","status":"queued","format":"pdf","notebook_id":"nb1","notebook_name":"Diary"}}`},
+		})
+		args := append([]string{"account", "export", "--format", "pdf", "--notebook", "nb1"}, tc.args...)
+		out, err := runCLI(t, m, args...)
+		if err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		body := m.bodyOf(t, "POST /api/v1/account/export")
+		if body["format"] != "pdf" || body["notebook_id"] != "nb1" || body["page_break"] != tc.want {
+			t.Errorf("%v: body = %v, want page_break %q", args, body, tc.want)
+		}
+		if !strings.Contains(out, "PDF") || !strings.Contains(out, "Diary") {
+			t.Errorf("%v: output should name the PDF it started:\n%s", args, out)
+		}
+	}
+}
+
+// TestAccountExportPDFWarnsWhenHandedAnotherPageBreak notes on stderr when the
+// server hands back a running PDF of the same notebook with the other page
+// break, and stays quiet when the page break matches or is not reported.
+func TestAccountExportPDFWarnsWhenHandedAnotherPageBreak(t *testing.T) {
+	for _, tc := range []struct {
+		got  string
+		warn bool
+	}{
+		{`,"page_break":"new_page"`, true},
+		{`,"page_break":"continuous"`, false},
+		{``, false},
+	} {
+		m := newAPIMock(t, map[string]mockReply{
+			"POST /api/v1/account/export": {Status: 202, Body: `{"data":{"export_job_id":"e1","status":"running","format":"pdf","notebook_id":"nb1"` + tc.got + `}}`},
+		})
+		stderr := captureStderr(t, func() {
+			if _, err := runCLI(t, m, "account", "export", "--format", "pdf", "--notebook", "nb1", "--page-break", "continuous"); err != nil {
+				t.Fatalf("account export: %v", err)
+			}
+		})
+		if warned := strings.Contains(stderr, "--page-break new_page, not continuous"); warned != tc.warn {
+			t.Errorf("handed back %q: warned = %v, want %v (stderr %q)", tc.got, warned, tc.warn, stderr)
+		}
+	}
+}
+
+// TestAccountExportPDFRefusalsSendNothing proves the PDF checks are local: no
+// notebook, a bad page break, and a page break on a ZIP format all fail before
+// any request is made.
+func TestAccountExportPDFRefusalsSendNothing(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--format", "pdf"}, "--format pdf needs --notebook"},
+		{[]string{"--format", "PDF", "--page-break", "continuous"}, "--format pdf needs --notebook"},
+		{[]string{"--format", "pdf", "--notebook", "nb1", "--page-break", "new-page"}, "--page-break must be one of new_page|continuous"},
+		{[]string{"--format", "html", "--notebook", "nb1", "--page-break", "continuous"}, "--page-break only applies to --format pdf"},
+		{[]string{"--page-break", "new_page"}, "--page-break only applies to --format pdf"},
+	} {
+		m := newAPIMock(t, map[string]mockReply{})
+		_, err := runCLI(t, m, append([]string{"account", "export"}, tc.args...)...)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%v: err = %v, want %q", tc.args, err, tc.want)
+		}
+		if len(m.calls()) != 0 {
+			t.Errorf("%v: no request should have been made, got %v", tc.args, m.calls())
+		}
+	}
+}
+
+// TestAccountExportZipFormatsSendNoPageBreak keeps page_break off the wire for
+// every format but pdf, where the server has no use for it.
+func TestAccountExportZipFormatsSendNoPageBreak(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"POST /api/v1/account/export": {Status: 202, Body: `{"data":{"export_job_id":"e1","status":"queued","format":"markdown"}}`},
+	})
+	if _, err := runCLI(t, m, "account", "export", "--format", "markdown", "--notebook", "nb1"); err != nil {
+		t.Fatalf("account export: %v", err)
+	}
+	if body := m.bodyOf(t, "POST /api/v1/account/export"); body["page_break"] != nil {
+		t.Errorf("page_break sent with a ZIP format: %v", body)
+	}
+}
+
+// TestAccountExportPDFDownloadSavesThePDF lands a finished notebook PDF on disk
+// under the server's .pdf name, byte for byte, with no unzipping or renaming.
+func TestAccountExportPDFDownloadSavesThePDF(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"POST /api/v1/account/export": {Status: 202, Body: `{"data":{"export_job_id":"e1","status":"queued","format":"pdf","notebook_id":"nb1"}}`},
+	})
+	m.routes["GET /dl/Diary.pdf"] = mockReply{Status: 200, Body: "%PDF-1.7 diary"}
+	m.routes["GET /api/v1/account/export/e1"] = mockReply{Status: 200, Body: fmt.Sprintf(
+		`{"data":{"id":"e1","format":"pdf","status":"completed","notebook_id":"nb1","notebook_name":"Diary",`+
+			`"page_break":"new_page","skipped_encrypted":0,"total_units":3,"done_units":3,"filename":"Diary.pdf",`+
+			`"download_url":%q,"completed_at":1749744400000,"result_expires_at":1750003600000}}`, m.srv.URL+"/dl/Diary.pdf")}
+
+	dir := t.TempDir()
+	out, err := runCLI(t, m, "account", "export", "--format", "pdf", "--notebook", "nb1", "--download", dir, "--poll-interval", "1ms")
+	if err != nil {
+		t.Fatalf("account export --format pdf --download: %v", err)
+	}
+	got, rerr := os.ReadFile(filepath.Join(dir, "Diary.pdf"))
+	if rerr != nil {
+		t.Fatalf("PDF not written: %v", rerr)
+	}
+	if string(got) != "%PDF-1.7 diary" {
+		t.Errorf("PDF contents = %q", got)
+	}
+	if !strings.Contains(out, "Wrote") {
+		t.Errorf("download report missing:\n%s", out)
 	}
 }
 
@@ -1486,6 +1629,18 @@ func TestAccountExportNextStepLeadsWithTheCommand(t *testing.T) {
 	}
 }
 
+// TestAccountExportFormatLabelNamesPDF pins the label and its article, so the
+// 409 refusal reads "you already have a PDF export", not "a pdf" or "an PDF".
+func TestAccountExportFormatLabelNamesPDF(t *testing.T) {
+	if got := accountExportFormatLabel("pdf"); got != "PDF" {
+		t.Errorf("accountExportFormatLabel(pdf) = %q, want PDF", got)
+	}
+	msg := accountExportExistsMessage(map[string]any{"format": "pdf", "notebook_name": "Diary", "export_job_id": "e9"})
+	if !strings.Contains(msg, `a PDF export of the notebook "Diary"`) {
+		t.Errorf("refusal = %q", msg)
+	}
+}
+
 // TestAccountExportFormatLabelNamesMarkdown keeps the display name out of the
 // wire value's hands. The refusal reads "you already have a Markdown export",
 // and falling through to the raw code would print it lower-case among two
@@ -1531,19 +1686,19 @@ func TestAccountExportAcceptsMarkdown(t *testing.T) {
 	}
 }
 
-// TestAccountExportRejectionNamesAllThree keeps the error current with the list.
-// A user who mistypes is being told what IS available, so a stale sentence there
-// hides the format they wanted.
-func TestAccountExportRejectionNamesAllThree(t *testing.T) {
+// TestAccountExportRejectionNamesEveryFormat keeps the error current with the
+// list. A user who mistypes is being told what IS available, so a stale sentence
+// there hides the format they wanted.
+func TestAccountExportRejectionNamesEveryFormat(t *testing.T) {
 	cmd := accountExportCmd
 	defer resetFlags(cmd)
-	_ = cmd.Flags().Set("format", "pdf")
+	_ = cmd.Flags().Set("format", "docx")
 
 	_, err := accountExportFormat(cmd)
 	if err == nil {
-		t.Fatal("--format pdf was accepted")
+		t.Fatal("--format docx was accepted")
 	}
-	for _, want := range []string{"enex", "html", "markdown"} {
+	for _, want := range []string{"enex", "html", "markdown", "pdf"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the refusal never offers %q:\n%s", want, err)
 		}

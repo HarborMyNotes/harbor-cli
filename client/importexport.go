@@ -200,18 +200,48 @@ func (c *Client) ExportENEX(notebookID string, noteIDs []string, includeResource
 	return c.rawPost(full, raw, "application/json")
 }
 
+// exportPDFWait is the least time ExportPDF waits for the server to answer. The
+// server builds the whole PDF before it sends a byte, and may take up to 120
+// seconds (PDF_EXPORT_MULTI_TIMEOUT_SECONDS) to do it, so the usual one-minute
+// stall timeout would give up on a PDF that is still being built.
+const exportPDFWait = 150 * time.Second
+
+// ExportPDF builds one PDF of several notes, printed in the order of noteIDs.
+// The body is the PDF itself, so it returns the live *http.Response and the
+// caller MUST close the body. The file name (Content-Disposition) and the counts
+// of encrypted notes and attached PDFs that were left out (X-Skipped-Encrypted,
+// X-Skipped-Attachments) ride in headers, which the caller reads first.
+// pageBreak is "new_page" or "continuous"; an empty one is omitted so the
+// server's default applies.
+func (c *Client) ExportPDF(noteIDs []string, pageBreak string) (*http.Response, error) {
+	body := map[string]any{"note_ids": noteIDs}
+	if pageBreak != "" {
+		body["page_break"] = pageBreak
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode request body: %w", err)
+	}
+	full, err := c.buildURL("/export/pdf", nil)
+	if err != nil {
+		return nil, err
+	}
+	return c.rawPostWithRefresh(full, raw, "application/json", true, exportPDFWait)
+}
+
 // rawPost performs a POST whose successful response is streamed back as a live
 // *http.Response (the caller closes the body) — the streaming sibling of doPost,
-// used by ENEX export which returns a raw file plus a header to read. On a
-// non-2xx response it drains and closes the body and returns a decoded APIError,
+// for the exports that return a raw file plus headers to read. On a non-2xx
+// response it drains and closes the body and returns a decoded APIError,
 // retrying once after a transparent token refresh on a 401 invalid_token.
 func (c *Client) rawPost(fullURL string, body []byte, contentType string) (*http.Response, error) {
-	return c.rawPostWithRefresh(fullURL, body, contentType, true)
+	return c.rawPostWithRefresh(fullURL, body, contentType, true, 0)
 }
 
 // rawPostWithRefresh is rawPost's implementation; allowRefresh is set false on
-// the single retry so a failed refresh can never loop.
-func (c *Client) rawPostWithRefresh(fullURL string, body []byte, contentType string, allowRefresh bool) (*http.Response, error) {
+// the single retry so a failed refresh can never loop. minWait raises the stall
+// timeout for a server known to work longer than that before it answers.
+func (c *Client) rawPostWithRefresh(fullURL string, body []byte, contentType string, allowRefresh bool, minWait time.Duration) (*http.Response, error) {
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
@@ -225,7 +255,7 @@ func (c *Client) rawPostWithRefresh(fullURL string, body []byte, contentType str
 	}
 	c.setCommonHeaders(req)
 
-	resp, err := c.sendStreaming(c.streamClient(), req)
+	resp, err := c.sendWatched(c.streamClient(), req, false, minWait)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
@@ -242,7 +272,7 @@ func (c *Client) rawPostWithRefresh(fullURL string, body []byte, contentType str
 	if allowRefresh && resp.StatusCode == http.StatusUnauthorized && apiErr.Code == "invalid_token" && c.OnUnauthorized != nil {
 		if newTok, ok := c.refresh(); ok {
 			c.AccessToken = newTok
-			return c.rawPostWithRefresh(fullURL, body, contentType, false)
+			return c.rawPostWithRefresh(fullURL, body, contentType, false, minWait)
 		}
 	}
 	return nil, apiErr

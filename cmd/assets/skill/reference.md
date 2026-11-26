@@ -558,9 +558,9 @@ output; `reset` is the revocation path.
 
 | Command | What it does | Key flags |
 |---|---|---|
-| `harbor account export` | Start an export job | `--format enex\|html\|markdown`, `--notebook <id>`, `--wait`, `--download <path>` |
+| `harbor account export` | Start an export job | `--format enex\|html\|markdown\|pdf`, `--notebook <id>` (`pdf` needs it), `--page-break new_page\|continuous` (`pdf` only), `--wait`, `--download <path>` |
 | `harbor account exports` | Show the current export per format | |
-| `harbor account export-status <id>` | Poll / download the ZIP | `--download <path>`, `--wait` |
+| `harbor account export-status <id>` | Poll / download the finished file | `--download <path>`, `--wait` |
 | `harbor account export-delete <id>` | Delete an export, freeing its slot | `--yes` |
 | `harbor account clear` | **Empty** the account, keeping it | `--confirm "CLEAR MY ACCOUNT"`, `--yes`, `--no-wait` |
 | `harbor account clear-status` | The account's current or last clear | |
@@ -582,9 +582,10 @@ The server answers as soon as the job is **queued**, not when it is done, so
 handed the job instead). A clear also destroys the server-side encryption
 keystore, and the CLI drops its cached copy to match.
 
-**Exports.** You hold one export per format — one ENEX, one HTML, one Markdown —
-and scoping to a notebook does not create a slot of its own. Starting a second of the same format while
-one is ready is refused; delete it or wait for it to expire (72 hours). Exports
+**Exports.** You hold one export per format — one ENEX, one HTML, one Markdown,
+one PDF — and scoping to a notebook does not create a slot of its own. Starting a second of the same format while
+one is ready is refused; delete it or wait for it to expire (72 hours). So a
+ready PDF of one notebook blocks a PDF of another until then. Exports
 run one at a time server-wide, so a new job may sit `queued` (waiting its turn)
 before it starts; progress is counted in **notes**. Lost the job id? `harbor
 account exports` reads it back off the server — export state lives there, not in
@@ -592,8 +593,20 @@ your shell. One-shot: `harbor account export --wait --download ~/Downloads`.
 
 `--format markdown` gives one `.md` per note in folders matching the notebooks,
 attachments alongside — the shape Obsidian, Bear and iA Writer read, and the one
-Harbor can import back. All three formats skip encrypted notes (the server holds
-only ciphertext) and report the count.
+Harbor can import back. Every format skips encrypted notes (the server holds
+only ciphertext) and reports the count.
+
+`--format pdf` is **one PDF of one notebook**, and needs `--notebook` — the CLI
+refuses it without one before sending anything. Notes go oldest first, the PDF
+has an outline (bookmarks) of note titles, and attached PDFs come at the end.
+`--page-break new_page` (the default) starts every note on a new page;
+`continuous` runs each note on after the one before it. `--download` saves the
+`.pdf` as it is (named after the notebook), not a ZIP.
+
+```bash
+harbor account export --format pdf --notebook "$NB_ID" --download .
+harbor account export --format pdf --notebook "$NB_ID" --page-break continuous --wait
+```
 
 **One note to a file** is `harbor notes export <id>`, a different command from
 the account job: it returns the file directly rather than queueing anything. It
@@ -634,7 +647,7 @@ into the note — use `notes get --format markdown` for that.
 
 ---
 
-## Import / Export (Evernote ENEX)
+## Import / Export (Evernote ENEX, PDF)
 
 | Command | What it does | Key flags |
 |---|---|---|
@@ -642,6 +655,7 @@ into the note — use `notes get --format markdown` for that.
 | `harbor import status <job-id>` | Poll an import job | |
 | `harbor import abort <job-id>` | Cancel an import still awaiting its bytes | |
 | `harbor export enex` | Export notes to `.enex` | `--notebook` *or* `--notes id1,id2`, `--include-resources`, `--output` (`-`=stdout) |
+| `harbor export pdf` | Several notes as **one PDF** (up to 50) | `--notes id1,id2` (required, printed in this order), `--page-break new_page\|continuous` (default `new_page`), `--output`/`-o` (a file, a directory, or `-`=stdout; default: the server's name, here) |
 
 A completion email is sent only when you are not waiting for the result:
 `--no-wait` asks for one, the default waiting mode does not, and
@@ -660,6 +674,20 @@ delete) and streams instead of building the document in memory. Not a drop-in:
 the job path writes a ZIP and, being the GDPR archive, includes notes in the
 trash that this command leaves out. `--notes` is **not** deprecated and stays
 here — a note selection has no successor.
+
+**`harbor export pdf`** answers at once with one PDF of up to 50 notes, in the
+order of `--notes`, with an outline of note titles. The file is named by the
+server (`Notes (3).pdf`). Encrypted notes are left out and the count goes to
+stderr, as does a count of attached PDFs that could not be combined; if every
+note is encrypted it fails and writes no file. More than 50 notes is refused —
+for a whole notebook use `harbor account export --format pdf --notebook <id>`.
+A `429 export_busy` ("Busy, try again in a moment.") means the server is
+already building as many of these as it allows at once; run it again shortly.
+
+```bash
+harbor export pdf --notes "$A,$B,$C"                          # Notes (3).pdf, here
+harbor export pdf --notes "$A,$B" --page-break continuous -o trip.pdf
+```
 
 ---
 

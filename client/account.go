@@ -3,14 +3,17 @@
 
 package client
 
-// StartAccountExport starts an export job. Both arguments are optional: an empty
-// pair starts a whole-account ENEX export. format selects the archive kind —
-// "enex" (the GDPR ZIP: one ENEX per notebook, the attachment bytes, a
-// manifest), "html" (a self-contained, browsable offline website) or "markdown"
-// (one .md per note in folders matching the notebooks, attachments alongside) —
-// and notebookID scopes the export to a single notebook, for any format.
-// Returns the data-wrapped job ({export_job_id, status, format, notebook_id,
-// notebook_name}); the response status is 202 Accepted.
+// StartAccountExport starts an export job. Every argument is optional: all empty
+// starts a whole-account ENEX export. format selects the kind — "enex" (the GDPR
+// ZIP: one ENEX per notebook, the attachment bytes, a manifest), "html" (a
+// self-contained, browsable offline website), "markdown" (one .md per note in
+// folders matching the notebooks, attachments alongside) or "pdf" (one PDF of a
+// single notebook, oldest note first) — and notebookID scopes the export to a
+// single notebook. "pdf" needs a notebookID; the server refuses it without one.
+// pageBreak ("new_page" or "continuous") applies to "pdf" only. Empty values are
+// omitted so the server's defaults apply. Returns the data-wrapped job
+// ({export_job_id, status, format, notebook_id, notebook_name}); the response
+// status is 202 Accepted.
 //
 // An account holds at most one live export PER FORMAT, and scope does not create
 // a slot of its own. A queued/running export of the same format is handed back rather
@@ -18,7 +21,7 @@ package client
 // export_exists whose details carry export_job_id, format, scope, notebook_id,
 // notebook_name and result_expires_at — everything needed to explain the refusal
 // without a second request.
-func (c *Client) StartAccountExport(format, notebookID string) ([]byte, error) {
+func (c *Client) StartAccountExport(format, notebookID, pageBreak string) ([]byte, error) {
 	body := map[string]any{}
 	if format != "" {
 		body["format"] = format
@@ -26,12 +29,15 @@ func (c *Client) StartAccountExport(format, notebookID string) ([]byte, error) {
 	if notebookID != "" {
 		body["notebook_id"] = notebookID
 	}
+	if pageBreak != "" {
+		body["page_break"] = pageBreak
+	}
 	return c.doPost("/account/export", body)
 }
 
 // ListAccountExports returns what this account's export slots hold right now:
-// the most recent export per format (at most three entries — one ENEX, one HTML,
-// one Markdown),
+// the most recent export per format (at most four entries — one ENEX, one HTML,
+// one Markdown, one PDF),
 // each in exactly the shape GetAccountExport returns, including a freshly minted
 // download_url for a ready one. A format with no export history is simply absent
 // from the array, and an account that has never exported returns an empty one.
@@ -58,7 +64,8 @@ func (c *Client) DeleteAccountExport(id string) ([]byte, error) {
 // presigned download_url, the filename the archive should be saved as, and a
 // result_expires_at. Progress is reported in NOTES via total_units/done_units, a
 // queued job carries its 1-based queue_position, a completed one its
-// completed_at, and a failed one its error_text.
+// completed_at and skipped_encrypted, and a failed one its error_text. A pdf
+// export also carries its page_break.
 func (c *Client) GetAccountExport(id string) ([]byte, error) {
 	return c.doGet("/account/export/"+id, nil)
 }

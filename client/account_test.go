@@ -15,7 +15,7 @@ func TestStartAccountExport(t *testing.T) {
 	var rec recordedRequest
 	srv := newTestServer(t, &rec, 202, `{"data":{"export_job_id":"e1","status":"queued"}}`)
 	defer srv.Close()
-	if _, err := testClient(srv.URL).StartAccountExport("", ""); err != nil {
+	if _, err := testClient(srv.URL).StartAccountExport("", "", ""); err != nil {
 		t.Fatalf("StartAccountExport error: %v", err)
 	}
 	if rec.Method != "POST" {
@@ -36,7 +36,7 @@ func TestStartAccountExportOmitsUnsetFields(t *testing.T) {
 	var rec recordedRequest
 	srv := newTestServer(t, &rec, 202, `{"data":{"export_job_id":"e1","status":"queued"}}`)
 	defer srv.Close()
-	if _, err := testClient(srv.URL).StartAccountExport("", ""); err != nil {
+	if _, err := testClient(srv.URL).StartAccountExport("", "", ""); err != nil {
 		t.Fatalf("StartAccountExport error: %v", err)
 	}
 	if body := string(rec.Body); body != "{}" {
@@ -50,11 +50,32 @@ func TestStartAccountExportScoped(t *testing.T) {
 	var rec recordedRequest
 	srv := newTestServer(t, &rec, 202, `{"data":{"export_job_id":"e1","status":"queued","format":"html","notebook_id":"nb1","notebook_name":"Recipes"}}`)
 	defer srv.Close()
-	if _, err := testClient(srv.URL).StartAccountExport("html", "nb1"); err != nil {
+	if _, err := testClient(srv.URL).StartAccountExport("html", "nb1", ""); err != nil {
 		t.Fatalf("StartAccountExport error: %v", err)
 	}
 	if !containsAll(string(rec.Body), `"format"`, `"html"`, `"notebook_id"`, `"nb1"`) {
 		t.Errorf("body missing scope fields: %s", rec.Body)
+	}
+	if strings.Contains(string(rec.Body), "page_break") {
+		t.Errorf("an empty page break was sent: %s", rec.Body)
+	}
+}
+
+// TestStartAccountExportPDF verifies a notebook PDF sends its page break beside
+// the format and notebook, under the names the API expects.
+func TestStartAccountExportPDF(t *testing.T) {
+	var rec recordedRequest
+	srv := newTestServer(t, &rec, 202, `{"data":{"export_job_id":"e1","status":"queued","format":"pdf","notebook_id":"nb1"}}`)
+	defer srv.Close()
+	if _, err := testClient(srv.URL).StartAccountExport("pdf", "nb1", "continuous"); err != nil {
+		t.Fatalf("StartAccountExport error: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body, &body); err != nil {
+		t.Fatalf("body is not JSON: %v (%s)", err, rec.Body)
+	}
+	if body["format"] != "pdf" || body["notebook_id"] != "nb1" || body["page_break"] != "continuous" {
+		t.Errorf("body = %v", body)
 	}
 }
 
@@ -101,7 +122,7 @@ func TestStartAccountExportConflictDetails(t *testing.T) {
 	srv := newTestServer(t, nil, 409, body)
 	defer srv.Close()
 
-	_, err := testClient(srv.URL).StartAccountExport("enex", "nb1")
+	_, err := testClient(srv.URL).StartAccountExport("enex", "nb1", "")
 	if err == nil {
 		t.Fatal("expected a 409 error")
 	}
