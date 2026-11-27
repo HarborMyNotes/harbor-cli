@@ -61,7 +61,7 @@ when the server is not ready, making it usable in scripts and health checks.`,
 		// Exit non-zero when not ready, AFTER printing, so the table is always
 		// shown and scripts get a meaningful exit code.
 		if !readyOK {
-			return errors.New("server is not ready")
+			return statusFailure(healthErr, readyErr)
 		}
 		return nil
 	},
@@ -130,6 +130,19 @@ handlers it documents.`,
 // ===========================================================================
 // Helpers
 // ===========================================================================
+
+// statusFailure is the error `status` exits with when the server is not ready.
+// Harbor being down for maintenance gets the maintenance error, so the message
+// and the retryable exit code match every other command; anything else is a
+// plain "not ready".
+func statusFailure(healthErr, readyErr error) error {
+	for _, err := range []error{readyErr, healthErr} {
+		if client.IsMaintenance(err) {
+			return err
+		}
+	}
+	return errors.New("server is not ready")
+}
 
 // operationalStatusEquals reports whether a bare operational body (e.g.
 // {"status":"ok"}) has a top-level "status" field equal to want.

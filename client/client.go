@@ -282,11 +282,11 @@ func (c *Client) requestWithStatus(method, fullURL string, body []byte, contentT
 	}
 	c.LastRequestID = resp.Header.Get("X-Request-Id")
 
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	if succeeded(resp) {
 		return respBody, resp.StatusCode, nil
 	}
 
-	apiErr := parseAPIError(respBody, resp.StatusCode, c.LastRequestID)
+	apiErr := responseError(resp, respBody, c.LastRequestID)
 	if allowRefresh && resp.StatusCode == http.StatusUnauthorized && apiErr.Code == "invalid_token" && c.OnUnauthorized != nil {
 		if newTok, ok := c.refresh(); ok {
 			c.AccessToken = newTok
@@ -294,6 +294,12 @@ func (c *Client) requestWithStatus(method, fullURL string, body []byte, contentT
 		}
 	}
 	return nil, resp.StatusCode, apiErr
+}
+
+// succeeded reports whether an API response is a real success: a 2xx that did
+// not come from the downtime page.
+func succeeded(resp *http.Response) bool {
+	return resp.StatusCode >= 200 && resp.StatusCode < 300 && !isMaintenanceResponse(resp)
 }
 
 // rawRequest is request's streaming sibling for downloads. On success it
@@ -312,7 +318,7 @@ func (c *Client) rawRequest(method, fullURL string, allowRefresh bool) (*http.Re
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	c.noteServerName(resp)
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	if succeeded(resp) {
 		c.LastRequestID = resp.Header.Get("X-Request-Id")
 		return resp, nil
 	}
@@ -320,7 +326,7 @@ func (c *Client) rawRequest(method, fullURL string, allowRefresh bool) (*http.Re
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	c.LastRequestID = resp.Header.Get("X-Request-Id")
-	apiErr := parseAPIError(body, resp.StatusCode, c.LastRequestID)
+	apiErr := responseError(resp, body, c.LastRequestID)
 	if allowRefresh && resp.StatusCode == http.StatusUnauthorized && apiErr.Code == "invalid_token" && c.OnUnauthorized != nil {
 		if newTok, ok := c.refresh(); ok {
 			c.AccessToken = newTok

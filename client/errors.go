@@ -5,11 +5,27 @@ package client
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"mime"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 )
+
+// CodeMaintenance is the error code for a response that came from Harbor's
+// downtime page rather than from the API server.
+const CodeMaintenance = "maintenance"
+
+// MaintenanceMessage is the sentence every Harbor app shows when its servers
+// are down for maintenance. The words are shared across apps, so keep them
+// exactly as they are.
+const MaintenanceMessage = "Harbor is down for maintenance. Try again in a few minutes."
+
+// maintenanceHeader marks every response the downtime page sends.
+const maintenanceHeader = "X-Harbor-Maintenance"
 
 // APIError is the typed form of the Harbor error envelope:
 //
@@ -24,6 +40,11 @@ type APIError struct {
 	Details   map[string]any `json:"details"`
 	RequestID string         `json:"request_id"`
 	Status    int            `json:"-"`
+
+	// RetryAfterSeconds is the response's Retry-After header in seconds, so a
+	// script reading --json can wait that long before it tries again. Nil when
+	// the response had no usable Retry-After.
+	RetryAfterSeconds *int `json:"retry_after_seconds,omitempty"`
 }
 
 // errorEnvelope is the wire shape carrying an APIError.
@@ -32,10 +53,15 @@ type errorEnvelope struct {
 }
 
 // Error renders a concise single-line description. Richer rendering (bulleted
-// details, dim request id) lives in the cmd display layer.
+// details, dim request id) lives in the cmd display layer. A maintenance error
+// is the message alone, because "maintenance: Harbor is down for maintenance"
+// says the same thing twice wherever an error is printed inline.
 func (e *APIError) Error() string {
 	if e == nil {
 		return "unknown API error"
+	}
+	if e.Code == CodeMaintenance && e.Message != "" {
+		return e.Message
 	}
 	msg := e.Message
 	if msg == "" {
@@ -59,6 +85,86 @@ func (e *APIError) DetailLines() []string {
 	}
 	sort.Strings(lines)
 	return lines
+}
+
+// IsMaintenance reports whether err is Harbor's servers being down for
+// maintenance. Nothing was decided by the server, so the same request can work
+// once Harbor is back.
+func IsMaintenance(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.Code == CodeMaintenance
+}
+
+// isMaintenanceResponse reports whether resp came from Harbor's downtime page
+// rather than from the API server. That is the case when the response carries
+// the maintenance header, or when it is a 502, 503 or 504 whose body is not
+// JSON. The API server's own 502/503/504 answers (a search timeout, a draining
+// sync stream) are always JSON, so they are never mistaken for downtime.
+func isMaintenanceResponse(resp *http.Response) bool {
+	if strings.TrimSpace(resp.Header.Get(maintenanceHeader)) == "1" {
+		return true
+	}
+	switch resp.StatusCode {
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return !isJSONContentType(resp.Header.Get("Content-Type"))
+	}
+	return false
+}
+
+// isJSONContentType reports whether a Content-Type header names a JSON body,
+// with or without parameters such as charset.
+func isJSONContentType(contentType string) bool {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return false
+	}
+	return mediaType == "application/json" || strings.HasSuffix(mediaType, "+json")
+}
+
+// responseError builds the error for a failed response. A response from the
+// downtime page becomes the maintenance error whatever its body says; anything
+// else is decoded from the body. Retry-After is kept on both, so a script can
+// see how long to wait.
+func responseError(resp *http.Response, body []byte, requestID string) *APIError {
+	var apiErr *APIError
+	if isMaintenanceResponse(resp) {
+		apiErr = &APIError{
+			Code:      CodeMaintenance,
+			Message:   MaintenanceMessage,
+			Status:    resp.StatusCode,
+			RequestID: requestID,
+		}
+	} else {
+		apiErr = parseAPIError(body, resp.StatusCode, requestID)
+	}
+	apiErr.RetryAfterSeconds = retryAfterSeconds(resp.Header.Get("Retry-After"), time.Now())
+	return apiErr
+}
+
+// retryAfterSeconds reads a Retry-After header, which is either a number of
+// seconds or an HTTP date. A date in the past means "now", so it is 0. It
+// returns nil for a missing or unreadable header.
+func retryAfterSeconds(header string, now time.Time) *int {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return nil
+	}
+	if secs, err := strconv.Atoi(header); err == nil {
+		if secs < 0 {
+			return nil
+		}
+		return &secs
+	}
+	when, err := http.ParseTime(header)
+	if err != nil {
+		return nil
+	}
+	secs := 0
+	if wait := when.Sub(now); wait > 0 {
+		// Round up, so a script never comes back a moment too early.
+		secs = int((wait + time.Second - 1) / time.Second)
+	}
+	return &secs
 }
 
 // parseAPIError decodes a non-2xx response body into an APIError. When the body

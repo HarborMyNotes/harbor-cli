@@ -345,6 +345,23 @@ func TestRenderErrorPlainModeStaysHumanReadable(t *testing.T) {
 	}
 }
 
+// TestRenderErrorMaintenanceShowsOnlyTheSentence pins the maintenance branch:
+// no "code:" line under the sentence, while --verbose still shows the status.
+func TestRenderErrorMaintenanceShowsOnlyTheSentence(t *testing.T) {
+	failure := &client.APIError{Code: client.CodeMaintenance, Message: client.MaintenanceMessage, Status: 503}
+
+	if got := renderedError(t, failure); got != "Error: Harbor is down for maintenance. Try again in a few minutes.\n" {
+		t.Errorf("stderr = %q, want the sentence alone", got)
+	}
+
+	verboseFlag = true
+	defer func() { verboseFlag = false }()
+	got := renderedError(t, failure)
+	if strings.Contains(got, "code:") || !strings.Contains(got, "http: 503") {
+		t.Errorf("verbose stderr = %q, want the http status and no code line", got)
+	}
+}
+
 // TestRenderErrorRoutesPlanLimitsToTheirOwnExplanation pins the branch in
 // renderError itself: without it a plan limit would fall back to a bullet list
 // of the gate's internals (gate, remediation_action, current…).

@@ -450,8 +450,8 @@ func TestLocalFileErrorsAreNotNetworkFailures(t *testing.T) {
 }
 
 // TestHTTPErrorIsNotMistakenForANetworkFailure guards the classification seam:
-// an answer from the server — even a 503 — is not a transport failure, and
-// telling a script to retry a rejection would loop it forever.
+// an answer from the API server — even a JSON 503 — is not a transport failure,
+// and telling a script to retry a rejection would loop it forever.
 func TestHTTPErrorIsNotMistakenForANetworkFailure(t *testing.T) {
 	m := newAPIMock(t, map[string]mockReply{
 		"GET /api/v1/usage": {Status: 503, Body: apiErrorBody("timeout", "upstream unavailable")},
@@ -465,6 +465,119 @@ func TestHTTPErrorIsNotMistakenForANetworkFailure(t *testing.T) {
 	}
 	if got := exitCodeFor(err); got != exitError {
 		t.Errorf("exit code = %d, want %d", got, exitError)
+	}
+}
+
+// downtimeMock is a stub API that answers every request the way Harbor's
+// proxy does while the servers are down. Today's proxy sends an HTML 502/503/504
+// with no header; withHeader adds the maintenance header and a JSON body, the
+// answer the proxy sends once it labels its downtime page.
+func downtimeMock(t *testing.T, status int, withHeader bool, retryAfter string) *apiMock {
+	t.Helper()
+	m := newAPIMock(t, nil)
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		if retryAfter != "" {
+			w.Header().Set("Retry-After", retryAfter)
+		}
+		if withHeader {
+			w.Header().Set("X-Harbor-Maintenance", "1")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(apiErrorBody("maintenance", "Harbor is down for maintenance. Try again in a few minutes.")))
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte("<html><h1>We'll be right back</h1></html>"))
+	}
+	return m
+}
+
+// renderedError returns what Execute prints to stderr for err, with colour off
+// so the text can be compared exactly.
+func renderedError(t *testing.T, err error) string {
+	t.Helper()
+	noColorFlag, colorReady = true, false
+	defer func() { noColorFlag, colorReady = false, false }()
+	return captureStderr(t, func() { renderError(err) })
+}
+
+// TestMaintenanceExitsRetryable is what a script relies on: Harbor's downtime
+// page exits 3, the "try again later" code, with the shared sentence.
+func TestMaintenanceExitsRetryable(t *testing.T) {
+	cases := []struct {
+		name       string
+		status     int
+		withHeader bool
+	}{
+		{"html 503", 503, false},
+		{"html 502", 502, false},
+		{"html 504", 504, false},
+		{"maintenance header", 503, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := downtimeMock(t, tc.status, tc.withHeader, "")
+			_, err := runCLI(t, m, "usage")
+			if err == nil {
+				t.Fatal("a maintenance response must fail")
+			}
+			if got := exitCodeFor(err); got != exitNetwork {
+				t.Errorf("exit code = %d, want %d", got, exitNetwork)
+			}
+			errOut := renderedError(t, err)
+			if errOut != "Error: Harbor is down for maintenance. Try again in a few minutes.\n" {
+				t.Errorf("stderr = %q, want exactly the maintenance line", errOut)
+			}
+		})
+	}
+}
+
+// TestMaintenanceJSONError pins the --json form: the error envelope with the
+// maintenance code and sentence, plus retry_after_seconds when the response
+// said how long to wait.
+func TestMaintenanceJSONError(t *testing.T) {
+	for _, retryAfter := range []string{"30", ""} {
+		t.Run("Retry-After="+retryAfter, func(t *testing.T) {
+			m := downtimeMock(t, 503, false, retryAfter)
+			_, err := runCLI(t, m, "usage", "--json")
+			if err == nil {
+				t.Fatal("a maintenance response must fail")
+			}
+			if got := exitCodeFor(err); got != exitNetwork {
+				t.Errorf("exit code = %d, want %d", got, exitNetwork)
+			}
+			jsonOutput = true
+			errOut := captureStderr(t, func() { renderError(err) })
+
+			var decoded map[string]map[string]any
+			if jerr := json.Unmarshal([]byte(errOut), &decoded); jerr != nil {
+				t.Fatalf("stderr is not JSON: %v\n%s", jerr, errOut)
+			}
+			e := decoded["error"]
+			if e["code"] != "maintenance" || e["message"] != "Harbor is down for maintenance. Try again in a few minutes." {
+				t.Errorf("error = %v, want the maintenance code and sentence", e)
+			}
+			got, has := e["retry_after_seconds"]
+			switch {
+			case retryAfter == "30" && got != float64(30):
+				t.Errorf("retry_after_seconds = %v, want 30", got)
+			case retryAfter == "" && has:
+				t.Errorf("retry_after_seconds = %v, want it left out without Retry-After", got)
+			}
+		})
+	}
+}
+
+// TestMaintenanceIsNotSentTwice proves the CLI leaves retrying to the script:
+// one command, one request, even when the server says when to come back.
+func TestMaintenanceIsNotSentTwice(t *testing.T) {
+	m := downtimeMock(t, 503, false, "1")
+	if _, err := runCLI(t, m, "usage"); err == nil {
+		t.Fatal("a maintenance response must fail")
+	}
+	if calls := m.calls(); len(calls) != 1 {
+		t.Errorf("requests = %v, want exactly one", calls)
 	}
 }
 

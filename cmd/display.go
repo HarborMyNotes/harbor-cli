@@ -602,7 +602,9 @@ func renderError(err error) {
 			header = apiErr.Error()
 		}
 		fmt.Fprintln(os.Stderr, colorize("Error: ", text.FgRed, text.Bold)+header)
-		if apiErr.Code != "" {
+		// The maintenance sentence is the whole story; its code would only
+		// repeat it. Every Harbor app shows that sentence and nothing more.
+		if apiErr.Code != "" && apiErr.Code != client.CodeMaintenance {
 			fmt.Fprintln(os.Stderr, dim("  code: "+apiErr.Code))
 		}
 		for _, line := range apiErr.DetailLines() {

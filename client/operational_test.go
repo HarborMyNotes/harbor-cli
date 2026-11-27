@@ -4,6 +4,8 @@
 package client
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -57,7 +59,13 @@ func TestReadyHitsOrigin(t *testing.T) {
 // status command recovers to render the per-check table even when degraded.
 func TestReadyNotReadySurfacesAPIError(t *testing.T) {
 	body := `{"status":"not_ready","checks":{"s3":{"ok":false,"latency_ms":2003,"error":"timeout"}}}`
-	srv := newTestServer(t, nil, 503, body)
+	// The server marks this 503 as JSON, which is what keeps it from reading as
+	// Harbor's downtime page.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(503)
+		_, _ = w.Write([]byte(body))
+	}))
 	defer srv.Close()
 
 	_, err := NewClient(srv.URL+"/api/v1", "").Ready()
@@ -73,6 +81,22 @@ func TestReadyNotReadySurfacesAPIError(t *testing.T) {
 	}
 	if !strings.Contains(apiErr.Message, "not_ready") {
 		t.Errorf("error message should carry the readiness body, got %q", apiErr.Message)
+	}
+}
+
+// TestReadyDuringMaintenance proves the downtime page on /ready is the
+// maintenance error, not a "not ready" body the status command tries to read.
+func TestReadyDuringMaintenance(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(503)
+		_, _ = w.Write([]byte("<html>We'll be right back</html>"))
+	}))
+	defer srv.Close()
+
+	_, err := NewClient(srv.URL+"/api/v1", "").Ready()
+	if !IsMaintenance(err) {
+		t.Fatalf("error = %v, want the maintenance error", err)
 	}
 }
 

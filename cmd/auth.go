@@ -221,6 +221,12 @@ func whoamiEnvToken(cmd *cobra.Command, creds *config.Credentials) error {
 	case tokenRejected:
 		fmt.Println(dim("The server rejected this token: " + err.Error()))
 	case tokenUnknown:
+		// The scope explanation below would send the reader looking for a
+		// problem with their token while Harbor itself is down.
+		if client.IsMaintenance(err) {
+			fmt.Println(dim("Could not check this token — " + err.Error()))
+			break
+		}
 		detail := "the server's answer did not look like a profile"
 		if err != nil {
 			detail = err.Error()
@@ -434,6 +440,9 @@ to use a token for a single command without saving it.`,
 // short-lived session is retired afterward so nothing but the PAT lingers.
 func loginViaBrowser(scope string, noBrowser, showToken bool) error {
 	base := resolveBaseURL(nil)
+	if err := checkNotInMaintenance(base); err != nil {
+		return err
+	}
 
 	// 1. PKCE verifier/challenge + a CSRF state.
 	verifier, err := generateCodeVerifier()
@@ -510,6 +519,20 @@ func loginViaBrowser(scope string, noBrowser, showToken bool) error {
 	}
 
 	reportLogin(creds, showToken, pat.Token)
+	return nil
+}
+
+// checkNotInMaintenance stops a browser sign-in before it starts when Harbor is
+// down for maintenance: the browser would only show the downtime page, and the
+// CLI would wait minutes for a sign-in that cannot finish. Any other outcome of
+// the probe lets the sign-in go ahead, so a probe that fails for an unrelated
+// reason never blocks a login that would have worked.
+func checkNotInMaintenance(base string) error {
+	probe := client.NewClient(base, "")
+	probe.Verbose = verboseFlag
+	if _, err := probe.Health(); client.IsMaintenance(err) {
+		return err
+	}
 	return nil
 }
 
