@@ -693,6 +693,9 @@ func accountDownloadExport(c *client.Client, id, out string, data []byte) error 
 // export" rather than "HTTP 403".
 func accountExportGoneError(c *client.Client, id string) error {
 	data, err := c.GetAccountExport(id)
+	if client.IsMaintenance(err) {
+		return err
+	}
 	if err != nil {
 		return errors.New("the export archive is no longer available — start a new export")
 	}
@@ -928,8 +931,9 @@ var accountClearGate = newAccountGate("clear", accountClearConfirmation)
 // again", not "give up" — reporting an error there would tell someone their
 // account may not be empty when the deletion is proceeding regardless.
 //
-// Two things end the wait early: a terminal status, and the server saying twice
-// that no clear job exists. Everything else waits for the ceiling, which says
+// Three things end the wait early: a terminal status, the server saying twice
+// that no clear job exists, and Harbor being down for maintenance for longer
+// than accountClearDownWindow. Everything else waits for the ceiling, which says
 // the job is still running rather than implying it went wrong.
 //
 // Progress is suppressed entirely under --json, and goes to stderr otherwise:
@@ -946,8 +950,26 @@ func accountPollClear(c *client.Client, interval, timeout time.Duration) ([]byte
 	last := []byte(nil)
 	lastStatus := ""
 	missing := 0
+	var downSince time.Time
 	for {
 		data, err := c.GetAccountClear()
+
+		// A restart of a few seconds serves the same downtime page as real
+		// maintenance, so the wait rides it out. Past the window it stops
+		// polling a server that is down, and says the clear carries on.
+		if client.IsMaintenance(err) {
+			if downSince.IsZero() {
+				downSince = time.Now()
+			}
+			if time.Since(downSince) >= accountClearDownWindow {
+				if !jsonOutput {
+					fmt.Fprintln(os.Stderr, dim("Stopped waiting. The clear keeps running on the server — check it with 'harbor account clear-status' once Harbor is back."))
+				}
+				return last, err
+			}
+		} else {
+			downSince = time.Time{}
+		}
 
 		// The one failure that is an ANSWER: the server says there is no clear
 		// job. A POST created one moments ago, so waiting fifteen minutes to
@@ -993,6 +1015,10 @@ func accountPollClear(c *client.Client, interval, timeout time.Duration) ([]byte
 		accountClearSleep(interval)
 	}
 }
+
+// accountClearDownWindow is how long the clear wait keeps polling while Harbor
+// answers with its downtime page. A variable so a test can shorten it.
+var accountClearDownWindow = 2 * time.Minute
 
 // accountClearSleep is the poll loop's wait, as a variable so a test can drive
 // the loop without spending real seconds in it.

@@ -490,9 +490,11 @@ has copy-paste recipes and the full allowlist.
   `--meta KEY=VALUE` on create/update, read or change it with
   `harbor notes|notebooks|stacks meta <id|name>`, and filter lists with
   `--meta-eq KEY=VALUE` / `--meta-has KEY`. See reference.md → Metadata.
-- **Exit codes:** `0` success, `1` any error, `3` the API was unreachable (worth
-  retrying), `4` a plan limit blocked the write (never worth retrying). Safe to
-  branch on `$?`. Errors go to stderr — with `--json` they are the error
+- **Exit codes:** `0` success, `1` any error, `3` the API was unreachable or
+  Harbor is down for maintenance (worth retrying; with `--json` the error `code`
+  is `maintenance` and may carry `retry_after_seconds`), `4` a plan limit
+  blocked the write (never worth retrying). Safe to branch on `$?`. Errors go
+  to stderr — with `--json` they are the error
   envelope, so you parse one shape either way. `0` always means the work
   happened: an unknown subcommand is an error rather than a help screen, and the
   two commands whose failures arrive inside a `200` — `sync push` (refused

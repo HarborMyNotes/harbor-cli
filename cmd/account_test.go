@@ -2327,3 +2327,56 @@ func TestClearDropsTheKeystoreBeforeItWaits(t *testing.T) {
 		t.Fatal("the command never waited, so this proved nothing")
 	}
 }
+
+// TestClearPollStopsDuringMaintenance proves the clear wait stops once Harbor
+// has served its downtime page for longer than the window, instead of polling
+// a down server until its ceiling.
+func TestClearPollStopsDuringMaintenance(t *testing.T) {
+	noClearSleep(t)
+	orig := accountClearDownWindow
+	accountClearDownWindow = 0
+	t.Cleanup(func() { accountClearDownWindow = orig })
+	m := downtimeMock(t, 503, false, "")
+
+	_, err := accountPollClear(testClientFor(m), time.Millisecond, 5*time.Second)
+	if !client.IsMaintenance(err) {
+		t.Fatalf("error = %v, want the maintenance error", err)
+	}
+	if calls := m.calls(); len(calls) != 1 {
+		t.Errorf("requests = %v, want one poll", calls)
+	}
+}
+
+// TestClearPollRidesOutABriefDowntimePage proves a restart that serves the
+// downtime page for a moment does not end the wait.
+func TestClearPollRidesOutABriefDowntimePage(t *testing.T) {
+	noClearSleep(t)
+	polls := 0
+	m := newAPIMock(t, map[string]mockReply{})
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		polls++
+		if polls <= 2 {
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		writeJSON(w, 200, json.RawMessage(`{"data":{"clear_job_id":"c1","status":"completed","started_at":1,"finished_at":2}}`))
+	}
+
+	data, err := accountPollClear(testClientFor(m), time.Millisecond, 5*time.Second)
+	if err != nil {
+		t.Fatalf("a brief downtime page ended the wait: %v", err)
+	}
+	if !strings.Contains(string(data), `"completed"`) {
+		t.Errorf("the poll did not reach the finished job:\n%s", data)
+	}
+}
+
+// TestExportGoneKeepsTheMaintenanceError proves a failed re-read of an export
+// says Harbor is down, not that the archive is gone.
+func TestExportGoneKeepsTheMaintenanceError(t *testing.T) {
+	m := downtimeMock(t, 503, false, "")
+	if err := accountExportGoneError(testClientFor(m), "e1"); !client.IsMaintenance(err) {
+		t.Errorf("error = %v, want the maintenance error", err)
+	}
+}

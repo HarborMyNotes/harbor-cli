@@ -260,7 +260,7 @@ func (c *Client) rawPostWithRefresh(fullURL string, body []byte, contentType str
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	c.noteServerName(resp)
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	if succeeded(resp) {
 		c.LastRequestID = resp.Header.Get("X-Request-Id")
 		return resp, nil
 	}
@@ -268,7 +268,7 @@ func (c *Client) rawPostWithRefresh(fullURL string, body []byte, contentType str
 	errBody, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	c.LastRequestID = resp.Header.Get("X-Request-Id")
-	apiErr := parseAPIError(errBody, resp.StatusCode, c.LastRequestID)
+	apiErr := responseError(resp, errBody, c.LastRequestID)
 	if allowRefresh && resp.StatusCode == http.StatusUnauthorized && apiErr.Code == "invalid_token" && c.OnUnauthorized != nil {
 		if newTok, ok := c.refresh(); ok {
 			c.AccessToken = newTok

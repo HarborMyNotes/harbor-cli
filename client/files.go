@@ -342,7 +342,10 @@ func retryStep[T any](ctx context.Context, step func() (T, error), also func(err
 }
 
 // transientAPIError reports whether an API call failed in a way a retry can
-// fix: the request got no answer, or the server answered 5xx or 429.
+// fix: the request got no answer, or the server answered 5xx or 429. Harbor's
+// downtime page counts too: a restart of a few seconds serves the same page, and
+// the retries are few and short, so real maintenance still ends the upload with
+// the maintenance error.
 func transientAPIError(err error) bool {
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {

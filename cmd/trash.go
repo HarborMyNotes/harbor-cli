@@ -138,6 +138,11 @@ then says the trash is empty. Ctrl-C stops the waiting, not the emptying.`,
 		// On a failed or unfinished job only --json prints: a script still gets the
 		// job as far as it got, while a person reads the error alone.
 		if err != nil && !jsonOutput {
+			// The maintenance sentence alone would hide that notes are already
+			// gone and the job carries on without this process.
+			if client.IsMaintenance(err) {
+				fmt.Fprintln(os.Stderr, dim(trashStillEmptyingNote))
+			}
 			return err
 		}
 		printResult(data, displayEmptyTrash)
@@ -205,10 +210,15 @@ var trashEmptyPollInterval = time.Second
 
 // trashEmptyRetryWindow is how long checks may keep failing before the wait gives
 // up. A failed check does not mean a failed job — the job runs on the server
-// either way — so a short outage or a deploy is waited out. It is a span of
+// either way — so a short outage or a deploy is waited out, including a restart
+// that briefly serves Harbor's downtime page. It is a span of
 // time, not a count, because one check can take the client's full timeout to
 // fail. A variable so tests can shorten it.
 var trashEmptyRetryWindow = 2 * time.Minute
+
+// trashStillEmptyingNote is said before the maintenance error when the wait for
+// a big Empty Trash ends because Harbor is down.
+const trashStillEmptyingNote = "Stopped waiting. The trash may still be emptying on the server — run 'harbor trash list' once Harbor is back."
 
 // trashEmptyFailedFallback is shown when the server marks the job failed but
 // sends no sentence of its own.
@@ -379,6 +389,12 @@ func (e *trashWaitError) ExitCode() int { return e.code }
 // It says the trash may still be emptying, because the job does not depend on
 // this process.
 func trashPollFailed(err error) error {
+	// The maintenance error goes out as it is, so it prints the same sentence
+	// and --json code as every other command. The caller adds that the trash
+	// may still be emptying.
+	if client.IsMaintenance(err) {
+		return err
+	}
 	return &trashWaitError{
 		msg: fmt.Sprintf("Stopped waiting: could not check on the trash (%v). It may still be emptying on the server — "+
 			"run 'harbor trash list' to see what is left.", err),

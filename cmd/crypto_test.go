@@ -658,3 +658,31 @@ func TestAnUnreadableNotebookStillProceedsWithoutAPassphrase(t *testing.T) {
 		t.Errorf("--encrypt is useless advice with no key to encrypt with:\n%q", warned)
 	}
 }
+
+// TestNotesCreateDuringMaintenanceSkipsTheEncryptionWarning proves a create
+// that meets Harbor's downtime page prints only the maintenance error: no
+// warning about writing a note unencrypted, because nothing is written.
+func TestNotesCreateDuringMaintenanceSkipsTheEncryptionWarning(t *testing.T) {
+	for _, args := range [][]string{
+		{"notes", "create", "--title", "x", "--content", "y"},
+		{"notes", "create", "--notebook", "nb1", "--title", "x", "--content", "y"},
+	} {
+		t.Run(strings.Join(args[2:4], " "), func(t *testing.T) {
+			m := downtimeMock(t, 503, false, "")
+			t.Setenv("HARBOR_PASSPHRASE", "")
+			resetSession()
+
+			var err error
+			stderr := captureStderr(t, func() { _, err = runCLI(t, m, args...) })
+			if !client.IsMaintenance(err) {
+				t.Fatalf("error = %v, want the maintenance error", err)
+			}
+			if stderr != "" {
+				t.Errorf("stderr before the error = %q, want nothing", stderr)
+			}
+			if calls := m.calls(); len(calls) != 1 {
+				t.Errorf("requests = %v, want only the notebook lookup", calls)
+			}
+		})
+	}
+}

@@ -180,18 +180,19 @@ func init() {
 // Exit codes. A script has to decide what to do about a failure without
 // reading English, so the two classes worth reacting to differently get their
 // own code: a plan limit is the user's account saying "no" (retrying will never
-// help — free up room or upgrade), and an unreachable API is transient (retry
-// with backoff). Everything else stays exitError, so existing scripts that only
-// test for non-zero keep working, and 2 is left alone because too much of the
-// world already reads it as "bad usage".
+// help — free up room or upgrade), and an unreachable or down-for-maintenance
+// API is transient (retry with backoff). Everything else stays exitError, so
+// existing scripts that only test for non-zero keep working, and 2 is left alone
+// because too much of the world already reads it as "bad usage".
 const (
 	// exitOK is a successful run.
 	exitOK = 0
 	// exitError is any failure without a more specific code.
 	exitError = 1
 	// exitNetwork means the API could not be reached at all (DNS, connection
-	// refused, TLS, or a client-side timeout) — nothing was decided by the
-	// server, so the same command may well succeed later.
+	// refused, TLS, or a client-side timeout) or Harbor is down for
+	// maintenance — nothing was decided by the server, so the same command may
+	// well succeed later.
 	exitNetwork = 3
 	// exitPlanLimit means an entitlement gate blocked the write: a plan cap for
 	// that resource, or the whole-account read-only freeze.
@@ -342,6 +343,11 @@ func exitCodeFor(err error) int {
 	}
 	if isPlanLimitError(err) {
 		return exitPlanLimit
+	}
+	// Harbor's downtime page is an HTTP answer, but not from the API server, so
+	// it is retryable exactly like a server that cannot be reached.
+	if client.IsMaintenance(err) {
+		return exitNetwork
 	}
 	if isNetworkError(err) {
 		return exitNetwork

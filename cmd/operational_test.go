@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -162,3 +163,41 @@ type errString string
 
 // Error returns the underlying message, satisfying the error interface.
 func (e errString) Error() string { return string(e) }
+
+// TestStatusFailure proves `status` exits with the maintenance error while
+// Harbor is down, so its exit code is the retryable 3, and keeps the plain
+// "not ready" for a server that answered but is not ready.
+func TestStatusFailure(t *testing.T) {
+	down := &client.APIError{Code: client.CodeMaintenance, Message: client.MaintenanceMessage, Status: 503}
+	notReady := &client.APIError{Code: "timeout", Message: `{"status":"not_ready"}`, Status: 503}
+
+	if err := statusFailure(down, down); !client.IsMaintenance(err) {
+		t.Errorf("both probes down: error = %v, want the maintenance error", err)
+	}
+	if err := statusFailure(down, nil); !client.IsMaintenance(err) {
+		t.Errorf("health down: error = %v, want the maintenance error", err)
+	}
+	err := statusFailure(nil, notReady)
+	if client.IsMaintenance(err) || err == nil || err.Error() != "server is not ready" {
+		t.Errorf("not ready: error = %v, want \"server is not ready\"", err)
+	}
+	if err := statusFailure(errors.New("dial tcp: refused"), nil); err == nil || err.Error() != "server is not ready" {
+		t.Errorf("unreachable: error = %v, want \"server is not ready\"", err)
+	}
+}
+
+// TestStatusDuringMaintenance runs the real command against the downtime page:
+// the table still prints, then it exits 3 with the maintenance sentence.
+func TestStatusDuringMaintenance(t *testing.T) {
+	m := downtimeMock(t, 503, false, "")
+	out, err := runCLI(t, m, "status")
+	if !client.IsMaintenance(err) {
+		t.Fatalf("error = %v, want the maintenance error", err)
+	}
+	if exitCodeFor(err) != exitNetwork {
+		t.Errorf("exit code = %d, want %d", exitCodeFor(err), exitNetwork)
+	}
+	if !strings.Contains(out, "Liveness") {
+		t.Errorf("the status table was not printed:\n%s", out)
+	}
+}

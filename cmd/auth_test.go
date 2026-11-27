@@ -710,3 +710,204 @@ func TestLogoutWithoutSessionClearsServerNames(t *testing.T) {
 		t.Errorf("servers.json survived logout (stat err %v)", err)
 	}
 }
+
+// maintenanceServer answers every request the way Harbor's proxy does while
+// the servers are down, and counts the requests it saw.
+func maintenanceServer(t *testing.T) (*httptest.Server, *int) {
+	t.Helper()
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("<html><h1>We'll be right back</h1></html>"))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &calls
+}
+
+// saveSession writes a credentials file into a fresh HOME and returns its
+// path and bytes, so a test can prove the file was left exactly as it was.
+func saveSession(t *testing.T, creds *config.Credentials) (string, []byte) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("HARBOR_TOKEN", "")
+	if err := config.Save(creds); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, ".config", "harbor", "credentials.json")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path, before
+}
+
+// assertSessionUnchanged fails when the credentials file is gone or different.
+func assertSessionUnchanged(t *testing.T, path string, before []byte) {
+	t.Helper()
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("credentials file is gone after a maintenance response: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Errorf("credentials changed after a maintenance response:\nbefore %s\nafter  %s", before, after)
+	}
+}
+
+// TestLoginWithTokenDuringMaintenanceKeepsTheSession proves a pasted-token
+// login that meets the downtime page reports maintenance and leaves the saved
+// session alone.
+func TestLoginWithTokenDuringMaintenanceKeepsTheSession(t *testing.T) {
+	srv, _ := maintenanceServer(t)
+	path, before := saveSession(t, &config.Credentials{APIURL: srv.URL + "/api/v1", Email: "you@example.com", AccessToken: "hbp_saved"})
+	t.Setenv("HARBOR_API_URL", srv.URL+"/api/v1")
+	resetCommandState(t)
+
+	var err error
+	_ = captureStdout(t, func() { err = loginWithToken("hbp_new", false) })
+	if !client.IsMaintenance(err) {
+		t.Fatalf("error = %v, want the maintenance error", err)
+	}
+	if exitCodeFor(err) != exitNetwork {
+		t.Errorf("exit code = %d, want %d", exitCodeFor(err), exitNetwork)
+	}
+	assertSessionUnchanged(t, path, before)
+}
+
+// TestBrowserLoginStopsBeforeTheBrowserDuringMaintenance proves the browser
+// sign-in checks first: during downtime the browser would only show the
+// downtime page, so the CLI says so instead of opening it and waiting.
+func TestBrowserLoginStopsBeforeTheBrowserDuringMaintenance(t *testing.T) {
+	srv, _ := maintenanceServer(t)
+	path, before := saveSession(t, &config.Credentials{APIURL: srv.URL + "/api/v1", Email: "you@example.com", AccessToken: "hbp_saved"})
+	t.Setenv("HARBOR_API_URL", srv.URL+"/api/v1")
+	resetCommandState(t)
+
+	// If the check is missing, finish the loopback step so the test fails fast
+	// instead of waiting out the sign-in timeout.
+	orig := openBrowser
+	defer func() { openBrowser = orig }()
+	opened := false
+	openBrowser = func(raw string) error {
+		opened = true
+		u, err := url.Parse(raw)
+		if err != nil {
+			return err
+		}
+		q := u.Query()
+		go func() {
+			if resp, gerr := http.Get(q.Get("redirect_uri") + "?code=ac_1&state=" + url.QueryEscape(q.Get("state"))); gerr == nil {
+				resp.Body.Close()
+			}
+		}()
+		return nil
+	}
+
+	var err error
+	_ = captureStdout(t, func() { err = loginViaBrowser("", false, false) })
+	if !client.IsMaintenance(err) {
+		t.Fatalf("error = %v, want the maintenance error", err)
+	}
+	if opened {
+		t.Error("the browser was opened while Harbor was down for maintenance")
+	}
+	assertSessionUnchanged(t, path, before)
+}
+
+// TestAuthRefreshDuringMaintenanceKeepsTheSession proves `auth refresh` that
+// meets the downtime page reports maintenance and keeps the refresh token.
+func TestAuthRefreshDuringMaintenanceKeepsTheSession(t *testing.T) {
+	srv, _ := maintenanceServer(t)
+	path, before := saveSession(t, &config.Credentials{
+		APIURL: srv.URL + "/api/v1", Email: "you@example.com",
+		AccessToken: "at_old", RefreshToken: "rt_keep", ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
+	})
+	t.Setenv("HARBOR_API_URL", "")
+	resetCommandState(t)
+
+	err := authRefreshCmd.RunE(authRefreshCmd, nil)
+	if !client.IsMaintenance(err) {
+		t.Fatalf("error = %v, want the maintenance error", err)
+	}
+	assertSessionUnchanged(t, path, before)
+}
+
+// TestTransparentRefreshDuringMaintenanceKeepsTheSession covers the refresh no
+// one asks for: an expired session refreshes before the command runs. When
+// that refresh meets the downtime page the command reports maintenance, exits
+// 3, and the saved session is untouched.
+func TestTransparentRefreshDuringMaintenanceKeepsTheSession(t *testing.T) {
+	srv, calls := maintenanceServer(t)
+	path, before := saveSession(t, &config.Credentials{
+		APIURL: srv.URL + "/api/v1", Email: "you@example.com",
+		AccessToken: "at_expired", RefreshToken: "rt_keep", ExpiresAt: time.Now().Add(-time.Hour).UnixMilli(),
+	})
+	t.Setenv("HARBOR_API_URL", "")
+	resetCommandState(t)
+	prepareCommandTree()
+
+	rootCmd.SetArgs([]string{"usage"})
+	var err error
+	_ = captureStdout(t, func() { err = rootCmd.Execute() })
+	if !client.IsMaintenance(err) {
+		t.Fatalf("error = %v, want the maintenance error", err)
+	}
+	if exitCodeFor(err) != exitNetwork {
+		t.Errorf("exit code = %d, want %d", exitCodeFor(err), exitNetwork)
+	}
+	if *calls != 2 {
+		t.Errorf("requests = %d, want 2 (the refresh, then the command)", *calls)
+	}
+	assertSessionUnchanged(t, path, before)
+}
+
+// TestWhoamiEnvTokenDuringMaintenance proves whoami says Harbor is down rather
+// than sending the reader to look for a scope problem with their token.
+func TestWhoamiEnvTokenDuringMaintenance(t *testing.T) {
+	srv, _ := maintenanceServer(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("HARBOR_TOKEN", "hbp_env-token")
+	t.Setenv("HARBOR_API_URL", srv.URL)
+	resetCommandState(t)
+
+	var err error
+	out := captureStdout(t, func() { err = runWhoami(whoamiCmd, nil) })
+	if err != nil {
+		t.Errorf("whoami error = %v, want nil (could not tell is not a rejection)", err)
+	}
+	if !strings.Contains(out, "Harbor is down for maintenance. Try again in a few minutes.") {
+		t.Errorf("whoami did not say Harbor is down:\n%s", out)
+	}
+	if strings.Contains(out, "scoped without 'profile'") {
+		t.Errorf("whoami blamed the token's scopes during maintenance:\n%s", out)
+	}
+}
+
+// TestLoginMaintenanceCheckGivesUpQuickly proves a server that never answers
+// delays the browser by the short probe timeout, and then lets the sign-in go
+// ahead.
+func TestLoginMaintenanceCheckGivesUpQuickly(t *testing.T) {
+	// The server answers after 3 s, so a check without its short timeout fails
+	// this test in seconds rather than after the default 30.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(3 * time.Second):
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+
+	orig := loginProbeTimeout
+	loginProbeTimeout = 50 * time.Millisecond
+	defer func() { loginProbeTimeout = orig }()
+
+	start := time.Now()
+	if err := checkNotInMaintenance(srv.URL + "/api/v1"); err != nil {
+		t.Errorf("error = %v, want nil so the sign-in goes ahead", err)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("the check took %s, want about the probe timeout", took)
+	}
+}

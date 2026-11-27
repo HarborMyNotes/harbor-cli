@@ -568,6 +568,138 @@ func TestRefreshFailureDoesNotLoop(t *testing.T) {
 	}
 }
 
+// maintenanceTransports lists the three request-building sites, so the
+// maintenance tests below cover every way the client talks to the API.
+func maintenanceTransports() []struct {
+	name string
+	call func(c *Client) error
+} {
+	return []struct {
+		name string
+		call func(c *Client) error
+	}{
+		{"requestWithStatus", func(c *Client) error { _, e := c.doGet("/notes", nil); return e }},
+		{"rawRequest", func(c *Client) error {
+			resp, e := c.doGetRaw("/files/abc/raw", nil)
+			if e == nil {
+				resp.Body.Close()
+			}
+			return e
+		}},
+		{"rawPostWithRefresh", func(c *Client) error {
+			resp, e := c.ExportENEX("nb1", nil, false)
+			if e == nil {
+				resp.Body.Close()
+			}
+			return e
+		}},
+	}
+}
+
+// TestMaintenanceOnEveryTransport proves each transport turns Harbor's
+// downtime page into the maintenance error, sends the request once (no retry),
+// and never tries a token refresh because of it.
+func TestMaintenanceOnEveryTransport(t *testing.T) {
+	replies := map[string]func(w http.ResponseWriter){
+		"html 503": func(w http.ResponseWriter) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Header().Set("Retry-After", "30")
+			w.WriteHeader(503)
+			_, _ = w.Write([]byte("<html><h1>We'll be right back</h1></html>"))
+		},
+		"html 502": func(w http.ResponseWriter) {
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(502)
+		},
+		"html 504": func(w http.ResponseWriter) {
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(504)
+		},
+		"json with the maintenance header": func(w http.ResponseWriter) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Harbor-Maintenance", "1")
+			w.Header().Set("Retry-After", "30")
+			w.WriteHeader(503)
+			_, _ = w.Write([]byte(`{"error":{"code":"maintenance","message":"Harbor is down for maintenance. Try again in a few minutes."}}`))
+		},
+		"200 with the maintenance header": func(w http.ResponseWriter) {
+			w.Header().Set("X-Harbor-Maintenance", "1")
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte("<html>down</html>"))
+		},
+	}
+	for replyName, reply := range replies {
+		for _, tc := range maintenanceTransports() {
+			t.Run(replyName+"/"+tc.name, func(t *testing.T) {
+				var calls int
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls++
+					reply(w)
+				}))
+				defer srv.Close()
+
+				c := testClient(srv.URL)
+				c.OnUnauthorized = func() (string, bool) {
+					t.Error("a maintenance response triggered a token refresh")
+					return "", false
+				}
+				err := tc.call(c)
+				var apiErr *APIError
+				if !errors.As(err, &apiErr) || apiErr.Code != CodeMaintenance {
+					t.Fatalf("error = %v, want the maintenance error", err)
+				}
+				if apiErr.Message != MaintenanceMessage {
+					t.Errorf("message = %q, want %q", apiErr.Message, MaintenanceMessage)
+				}
+				if calls != 1 {
+					t.Errorf("server calls = %d, want 1 (no automatic retry)", calls)
+				}
+			})
+		}
+	}
+}
+
+// TestMaintenanceCarriesRetryAfter proves the Retry-After header reaches the
+// error a command prints.
+func TestMaintenanceCarriesRetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(503)
+	}))
+	defer srv.Close()
+
+	_, err := testClient(srv.URL).doGet("/notes", nil)
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.RetryAfterSeconds == nil || *apiErr.RetryAfterSeconds != 30 {
+		t.Fatalf("error = %#v, want retry_after_seconds 30", err)
+	}
+}
+
+// TestServersOwnJSON503IsNotMaintenance is the counterweight on every
+// transport: a JSON 503 from the API server keeps its own code and message.
+func TestServersOwnJSON503IsNotMaintenance(t *testing.T) {
+	for _, tc := range maintenanceTransports() {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.WriteHeader(503)
+				_, _ = w.Write([]byte(`{"error":{"code":"timeout","message":"Search took too long."}}`))
+			}))
+			defer srv.Close()
+
+			err := tc.call(testClient(srv.URL))
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("error = %v, want an *APIError", err)
+			}
+			if apiErr.Code != "timeout" || apiErr.Message != "Search took too long." {
+				t.Errorf("code/message = %q / %q, want the server's own", apiErr.Code, apiErr.Message)
+			}
+		})
+	}
+}
+
 func TestPrettyJSON(t *testing.T) {
 	out, err := PrettyJSON([]byte(`{"b":2,"a":1}`))
 	if err != nil {

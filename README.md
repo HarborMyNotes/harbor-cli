@@ -311,7 +311,7 @@ code; everything else is `1`.
 |---|---|
 | `0` | Success. |
 | `1` | An error occurred (a human-readable message is printed to stderr). |
-| `3` | The API could not be reached — DNS, refused connection, TLS, or timeout. Nothing was decided by the server, so a retry may work. |
+| `3` | The API could not be reached — DNS, refused connection, TLS, or timeout — or Harbor is down for maintenance. Nothing was decided by the server, so a retry may work. |
 | `4` | A plan limit blocked the write: either the resource is at your plan's cap, or the account is read-only for being over its limits. Retrying will never help — free up room or upgrade. |
 
 ```sh
@@ -327,6 +327,14 @@ esac
 With `--json`, errors are written to stderr as the API's error envelope
 (`{"error": {code, message, details, request_id}}`) rather than prose, so a
 script parses one shape whether the command succeeded or failed.
+
+While Harbor is down for maintenance, a command that needs the server prints
+`Error: Harbor is down for maintenance. Try again in a few minutes.` and exits
+`3`. With `--json` the envelope's `code` is `maintenance`. Any error whose
+response said how long to wait (`Retry-After`) also carries
+`retry_after_seconds`. The CLI does not retry on its own — your script decides —
+except that an upload step and the `--wait` of `trash empty` and `account clear`
+ride out a short blip before they stop. A maintenance answer never signs you out.
 
 **A command never exits `0` for work it did not do.** That includes the cases
 where the server answers `200`:

@@ -483,8 +483,12 @@ type conversionReport struct {
 	Failed    []conversionFailure `json:"failed"`
 
 	// Complete is false when the notebook sweep could not read the whole
-	// notebook, i.e. there may be notes it never even considered.
+	// notebook, or the run stopped early, i.e. there may be notes it never even
+	// considered.
 	Complete bool `json:"complete"`
+
+	// NotTried lists the notes a run that stopped early never reached.
+	NotTried []string `json:"not_tried,omitempty"`
 }
 
 // runConversion applies one note's conversion to every target and reports what
@@ -495,7 +499,9 @@ type conversionReport struct {
 // one note that cannot be converted — a stranded task, a body sealed under
 // another passphrase — is no reason to leave the other ninety-nine unfixed. Every
 // failure is reported and the command still exits non-zero, so a script cannot
-// mistake a partial run for a clean one.
+// mistake a partial run for a clean one. The one exception is Harbor being down
+// for maintenance, which every later note would hit too: the run stops there and
+// reports the notes it never tried.
 func runConversion(ids []string, complete bool, verb string, apply func(id string) (bool, error)) error {
 	report := conversionReport{
 		Converted: []string{},
@@ -508,9 +514,15 @@ func runConversion(ids []string, complete bool, verb string, apply func(id strin
 	// instead of being flattened into a per-line summary.
 	single := len(ids) == 1
 
-	for _, id := range ids {
+	// down is set when Harbor turns out to be down for maintenance. Every note
+	// after it would fail the same way, so the run stops there and ends with that
+	// error, which keeps its retryable exit code.
+	var down error
+	for i, id := range ids {
 		converted, err := apply(id)
 		switch {
+		case client.IsMaintenance(err):
+			down = err
 		case err != nil:
 			if single {
 				return err
@@ -530,6 +542,16 @@ func runConversion(ids []string, complete bool, verb string, apply func(id strin
 				fmt.Println(dim(fmt.Sprintf("· %s already %s — skipped", id, verb)))
 			}
 		}
+		if down != nil {
+			report.NotTried = append([]string{}, ids[i:]...)
+			report.Complete = false
+			break
+		}
+	}
+
+	// Nothing happened before Harbor went down, so there is no report to show.
+	if down != nil && len(report.Converted)+len(report.Skipped)+len(report.Failed) == 0 {
+		return down
 	}
 
 	if jsonOutput {
@@ -540,6 +562,9 @@ func runConversion(ids []string, complete bool, verb string, apply func(id strin
 		fmt.Println(string(out))
 	} else {
 		printConversionSummary(report, verb)
+	}
+	if down != nil {
+		return down
 	}
 	if n := len(report.Failed); n > 0 {
 		return fmt.Errorf("%d of %d %s could not be %s — each failure is listed above",
@@ -570,8 +595,13 @@ func printConversionSummary(report conversionReport, verb string) {
 	if n := len(report.Failed); n > 0 {
 		fmt.Printf(" %s", redWarn(fmt.Sprintf("%d failed.", n)))
 	}
+	if n := len(report.NotTried); n > 0 {
+		fmt.Printf(" %d not tried.", n)
+	}
 	fmt.Println()
-	if !report.Complete {
+	// A run that stopped early names what it skipped; the sweep warning is for a
+	// notebook that could not be listed in full, which is a different gap.
+	if !report.Complete && len(report.NotTried) == 0 {
 		printIncompleteSweepWarning()
 	}
 }
