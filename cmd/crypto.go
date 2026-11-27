@@ -314,6 +314,9 @@ func shouldEncryptCreate(cmd *cobra.Command, c *client.Client, notebookID string
 	// The lookup also reports whether it could ANSWER, not just what the answer was;
 	// see below and notebookWantsEncryption.
 	nb := notebookWantsEncryption(c, notebookID)
+	if nb.Down != nil {
+		return false, nb.Down
+	}
 
 	// FAIL CLOSED, matching --encrypt just above and the conversion commands
 	// (conversionKey, cmd/notes_convert.go). The notebook says its notes are
@@ -414,12 +417,17 @@ func warnEncryptionUnknown(notebookID string) {
 // will not be there on a retry, and it cannot have an encryption setting to read.
 // Folding it in with "the read did not work" is how a mistyped id ends up
 // answered with "re-run to try again".
+//
+// Down is the maintenance error when Harbor's downtime page answered the lookup.
+// The write that follows cannot succeed either, so callers stop with it rather
+// than warn about an encryption setting nobody could read.
 type notebookEncryption struct {
 	ID      string
 	Name    string
 	Wants   bool
 	Known   bool
 	Missing bool
+	Down    error
 }
 
 // notebookWantsEncryption reports what the target notebook (or the default
@@ -458,6 +466,9 @@ func notebookWantsEncryption(c *client.Client, notebookID string) notebookEncryp
 		if err != nil {
 			var apiErr *client.APIError
 			out.Missing = errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound
+			if client.IsMaintenance(err) {
+				out.Down = err
+			}
 			return out
 		}
 		nb := parseJSON(client.UnwrapData(data))
@@ -482,7 +493,7 @@ func notebookWantsEncryption(c *client.Client, notebookID string) notebookEncryp
 	// never got this far; now every create walks it, so it has to be right. Unknown
 	// already has defined behaviour at the call site (say so, then proceed), and that
 	// is where this belongs rather than in a third state of its own.
-	_, _ = walkCollection(
+	_, walkErr := walkCollection(
 		func(params map[string]string) ([]byte, error) { return c.ListNotebooks(params) },
 		func(raw json.RawMessage) bool {
 			n := parseJSON(raw)
@@ -495,6 +506,9 @@ func notebookWantsEncryption(c *client.Client, notebookID string) notebookEncryp
 			out.Known = true
 			return false
 		})
+	if !out.Known && client.IsMaintenance(walkErr) {
+		out.Down = walkErr
+	}
 	return out
 }
 

@@ -342,10 +342,15 @@ func retryStep[T any](ctx context.Context, step func() (T, error), also func(err
 }
 
 // transientAPIError reports whether an API call failed in a way a retry can
-// fix: the request got no answer, or the server answered 5xx or 429.
+// fix: the request got no answer, or the server answered 5xx or 429. Harbor
+// being down for maintenance is not retried: it lasts minutes, not seconds, and
+// the user or their script decides when to try again.
 func transientAPIError(err error) bool {
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
+		if apiErr.Code == CodeMaintenance {
+			return false
+		}
 		return apiErr.Status >= 500 || apiErr.Status == http.StatusTooManyRequests
 	}
 	var urlErr *url.Error

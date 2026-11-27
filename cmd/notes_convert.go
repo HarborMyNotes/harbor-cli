@@ -508,9 +508,15 @@ func runConversion(ids []string, complete bool, verb string, apply func(id strin
 	// instead of being flattened into a per-line summary.
 	single := len(ids) == 1
 
+	// down is set when Harbor turns out to be down for maintenance. Every note
+	// after it would fail the same way, so the run stops there and ends with that
+	// error, which keeps its retryable exit code.
+	var down error
 	for _, id := range ids {
 		converted, err := apply(id)
 		switch {
+		case client.IsMaintenance(err):
+			down = err
 		case err != nil:
 			if single {
 				return err
@@ -530,6 +536,14 @@ func runConversion(ids []string, complete bool, verb string, apply func(id strin
 				fmt.Println(dim(fmt.Sprintf("· %s already %s — skipped", id, verb)))
 			}
 		}
+		if down != nil {
+			break
+		}
+	}
+
+	// Nothing happened before Harbor went down, so there is no report to show.
+	if down != nil && len(report.Converted)+len(report.Skipped)+len(report.Failed) == 0 {
+		return down
 	}
 
 	if jsonOutput {
@@ -540,6 +554,9 @@ func runConversion(ids []string, complete bool, verb string, apply func(id strin
 		fmt.Println(string(out))
 	} else {
 		printConversionSummary(report, verb)
+	}
+	if down != nil {
+		return down
 	}
 	if n := len(report.Failed); n > 0 {
 		return fmt.Errorf("%d of %d %s could not be %s — each failure is listed above",

@@ -181,9 +181,9 @@ func init() {
 // reading English, so the two classes worth reacting to differently get their
 // own code: a plan limit is the user's account saying "no" (retrying will never
 // help — free up room or upgrade), and an unreachable or down-for-maintenance
-// API is transient (retry with backoff). Everything else stays exitError, so existing scripts that only
-// test for non-zero keep working, and 2 is left alone because too much of the
-// world already reads it as "bad usage".
+// API is transient (retry with backoff). Everything else stays exitError, so
+// existing scripts that only test for non-zero keep working, and 2 is left alone
+// because too much of the world already reads it as "bad usage".
 const (
 	// exitOK is a successful run.
 	exitOK = 0

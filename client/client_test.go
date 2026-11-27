@@ -601,7 +601,7 @@ func maintenanceTransports() []struct {
 // and never tries a token refresh because of it.
 func TestMaintenanceOnEveryTransport(t *testing.T) {
 	replies := map[string]func(w http.ResponseWriter){
-		"html 503 (today's proxy)": func(w http.ResponseWriter) {
+		"html 503": func(w http.ResponseWriter) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Header().Set("Retry-After", "30")
 			w.WriteHeader(503)

@@ -1267,3 +1267,47 @@ func TestEncryptDoesNotClaimAnythingAboutAttachmentBytes(t *testing.T) {
 		t.Error("the help states the limitation without saying what it means in practice")
 	}
 }
+
+// TestBulkConversionStopsWhenHarborIsDown proves a run stops at the first
+// maintenance answer — every later note would fail the same way — still shows
+// what it already did, and ends with the maintenance error so it exits 3.
+func TestBulkConversionStopsWhenHarborIsDown(t *testing.T) {
+	down := &client.APIError{Code: client.CodeMaintenance, Message: client.MaintenanceMessage, Status: 503}
+	attempted := []string{}
+	var err error
+	out := captureStdout(t, func() {
+		err = runConversion([]string{"a", "b", "c"}, true, "encrypted", func(id string) (bool, error) {
+			attempted = append(attempted, id)
+			if id == "b" {
+				return false, down
+			}
+			return true, nil
+		})
+	})
+
+	if !client.IsMaintenance(err) {
+		t.Fatalf("err = %v, want the maintenance error", err)
+	}
+	if !reflect.DeepEqual(attempted, []string{"a", "b"}) {
+		t.Errorf("attempted = %v, want the run to stop at the maintenance answer", attempted)
+	}
+	if !strings.Contains(out, "a encrypted") {
+		t.Errorf("the note converted before Harbor went down was not reported:\n%s", out)
+	}
+}
+
+// TestBulkConversionDownFromTheStartPrintsNoReport proves a run that never got
+// an answer prints only the maintenance error, not an empty report.
+func TestBulkConversionDownFromTheStartPrintsNoReport(t *testing.T) {
+	down := &client.APIError{Code: client.CodeMaintenance, Message: client.MaintenanceMessage, Status: 503}
+	var err error
+	out := captureStdout(t, func() {
+		err = runConversion([]string{"a", "b"}, true, "decrypted", func(string) (bool, error) { return false, down })
+	})
+	if err != down {
+		t.Errorf("err = %v, want the maintenance error itself", err)
+	}
+	if out != "" {
+		t.Errorf("stdout = %q, want nothing", out)
+	}
+}

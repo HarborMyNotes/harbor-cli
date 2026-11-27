@@ -2327,3 +2327,18 @@ func TestClearDropsTheKeystoreBeforeItWaits(t *testing.T) {
 		t.Fatal("the command never waited, so this proved nothing")
 	}
 }
+
+// TestClearPollStopsDuringMaintenance proves the clear wait stops at the first
+// maintenance answer instead of polling a down server until its ceiling.
+func TestClearPollStopsDuringMaintenance(t *testing.T) {
+	noClearSleep(t)
+	m := downtimeMock(t, 503, false, "")
+
+	_, err := accountPollClear(testClientFor(m), time.Millisecond, 5*time.Second)
+	if !client.IsMaintenance(err) {
+		t.Fatalf("error = %v, want the maintenance error", err)
+	}
+	if calls := m.calls(); len(calls) != 1 {
+		t.Errorf("requests = %v, want one poll", calls)
+	}
+}

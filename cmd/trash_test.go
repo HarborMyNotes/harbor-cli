@@ -16,6 +16,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/HarborMyNotes/harbor-cli/client"
 )
 
 // TestDisplayTrash checks the trash list renders titles and the paging footer.
@@ -933,5 +935,27 @@ func TestTrashEmptyWithJobKeepsExpunged(t *testing.T) {
 	}
 	if str(trashEmptyJobOf(out), "status") != "completed" {
 		t.Errorf("job not replaced: %s", out)
+	}
+}
+
+// TestTrashWaitStopsAtOnceDuringMaintenance proves the wait does not keep
+// polling a server that is down: one check, then the maintenance error as it
+// is, so it prints the shared sentence and exits 3.
+func TestTrashWaitStopsAtOnceDuringMaintenance(t *testing.T) {
+	down := &client.APIError{Code: client.CodeMaintenance, Message: client.MaintenanceMessage, Status: 503}
+	calls := 0
+	fetch := func(string) ([]byte, error) {
+		calls++
+		return nil, down
+	}
+	_, err := trashWaitForEmpty(context.Background(), fetch, []byte(bigTrashAccepted), &trashEmptyProgress{})
+	if err != down {
+		t.Errorf("err = %v, want the maintenance error itself", err)
+	}
+	if calls != 1 {
+		t.Errorf("checked %d times, want 1", calls)
+	}
+	if got := exitCodeFor(err); got != exitNetwork {
+		t.Errorf("exit code = %d, want %d", got, exitNetwork)
 	}
 }

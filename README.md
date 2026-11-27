@@ -328,11 +328,12 @@ With `--json`, errors are written to stderr as the API's error envelope
 (`{"error": {code, message, details, request_id}}`) rather than prose, so a
 script parses one shape whether the command succeeded or failed.
 
-While Harbor is down for maintenance, every command prints
+While Harbor is down for maintenance, a command that needs the server prints
 `Error: Harbor is down for maintenance. Try again in a few minutes.` and exits
-`3`. With `--json` the envelope's `code` is `maintenance`, and when the server
-said how long to wait it also carries `retry_after_seconds`. The CLI never
-retries on its own — your script decides. Your saved login is never removed.
+`3`. With `--json` the envelope's `code` is `maintenance`. Any error whose
+response said how long to wait (`Retry-After`) also carries
+`retry_after_seconds`. The CLI does not retry a maintenance answer on its own —
+your script decides — and a maintenance answer never signs you out.
 
 **A command never exits `0` for work it did not do.** That includes the cases
 where the server answers `200`:

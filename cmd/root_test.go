@@ -466,12 +466,14 @@ func TestHTTPErrorIsNotMistakenForANetworkFailure(t *testing.T) {
 	if got := exitCodeFor(err); got != exitError {
 		t.Errorf("exit code = %d, want %d", got, exitError)
 	}
+	if got := renderedError(t, err); got != "Error: upstream unavailable\n  code: timeout\n" {
+		t.Errorf("stderr = %q, want the server's own message and code", got)
+	}
 }
 
-// downtimeMock is a stub API that answers every request the way Harbor's
-// proxy does while the servers are down. Today's proxy sends an HTML 502/503/504
-// with no header; withHeader adds the maintenance header and a JSON body, the
-// answer the proxy sends once it labels its downtime page.
+// downtimeMock is a stub API that answers every request with Harbor's downtime
+// page: an HTML 502/503/504 with no header, or, with withHeader, the
+// maintenance header and a JSON body.
 func downtimeMock(t *testing.T, status int, withHeader bool, retryAfter string) *apiMock {
 	t.Helper()
 	m := newAPIMock(t, nil)

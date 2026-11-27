@@ -111,14 +111,11 @@ func isMaintenanceResponse(resp *http.Response) bool {
 	return false
 }
 
-// isJSONContentType reports whether a Content-Type header names a JSON body,
+// isJSONContentType reports whether a Content-Type header is application/json,
 // with or without parameters such as charset.
 func isJSONContentType(contentType string) bool {
 	mediaType, _, err := mime.ParseMediaType(contentType)
-	if err != nil {
-		return false
-	}
-	return mediaType == "application/json" || strings.HasSuffix(mediaType, "+json")
+	return err == nil && mediaType == "application/json"
 }
 
 // responseError builds the error for a failed response. A response from the

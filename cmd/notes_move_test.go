@@ -17,6 +17,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/HarborMyNotes/harbor-cli/client"
+	"github.com/HarborMyNotes/harbor-cli/config"
 	"github.com/HarborMyNotes/harbor-cli/crypto"
 )
 
@@ -2016,5 +2018,20 @@ func TestAMissingUSNOnBothSidesDoesNotDiscountAVersion(t *testing.T) {
 	}
 	if got := patchesTo(mm, moveNoteID); got != 0 {
 		t.Errorf("the refusal still wrote %d times", got)
+	}
+}
+
+// TestMoveDuringMaintenanceReportsMaintenance proves a move whose destination
+// lookup meets Harbor's downtime page says Harbor is down, not that the
+// notebook's encryption setting could not be read.
+func TestMoveDuringMaintenanceReportsMaintenance(t *testing.T) {
+	m := downtimeMock(t, 503, false, "")
+	resetSession()
+	note := map[string]any{"id": moveNoteID, "notebook_id": nbPlain}
+
+	_, err := prepareNoteMove(testClientFor(m), &config.Credentials{}, moveNoteID,
+		map[string]any{"notebook_id": nbLocked}, note, false)
+	if !client.IsMaintenance(err) {
+		t.Fatalf("error = %v, want the maintenance error", err)
 	}
 }

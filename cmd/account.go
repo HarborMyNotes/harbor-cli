@@ -949,6 +949,13 @@ func accountPollClear(c *client.Client, interval, timeout time.Duration) ([]byte
 	for {
 		data, err := c.GetAccountClear()
 
+		// Harbor is down for maintenance: stop waiting rather than poll a server
+		// that is down. 'harbor account clear-status' shows the clear once it is
+		// back.
+		if client.IsMaintenance(err) {
+			return last, err
+		}
+
 		// The one failure that is an ANSWER: the server says there is no clear
 		// job. A POST created one moments ago, so waiting fifteen minutes to
 		// report a clear "still running" would be telling the user something

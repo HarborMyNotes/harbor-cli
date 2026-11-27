@@ -353,6 +353,11 @@ func trashEmptyJobFailure(data []byte) error {
 // network dropped, the server was busy, or it hit a server error. Anything else
 // (signed out, no such job) will fail the same way again.
 func trashPollRetryable(err error) bool {
+	// Maintenance lasts minutes, so the wait ends at once rather than polling a
+	// server that is down. A retry later joins the same job.
+	if client.IsMaintenance(err) {
+		return false
+	}
 	if isNetworkError(err) {
 		return true
 	}
@@ -379,6 +384,11 @@ func (e *trashWaitError) ExitCode() int { return e.code }
 // It says the trash may still be emptying, because the job does not depend on
 // this process.
 func trashPollFailed(err error) error {
+	// The maintenance error goes out as it is, so it prints the same sentence
+	// and --json code as every other command.
+	if client.IsMaintenance(err) {
+		return err
+	}
 	return &trashWaitError{
 		msg: fmt.Sprintf("Stopped waiting: could not check on the trash (%v). It may still be emptying on the server — "+
 			"run 'harbor trash list' to see what is left.", err),

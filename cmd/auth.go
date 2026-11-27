@@ -43,6 +43,10 @@ const cliScopes = "notes notebooks tags sync files search profile"
 // recognize a stored PAT (vs. a legacy session access token).
 const patTokenPrefix = "hbp_"
 
+// loginProbeTimeout bounds the maintenance check that runs before the browser
+// opens. A variable so a test can shorten it.
+var loginProbeTimeout = 5 * time.Second
+
 // loginTimeout bounds how long we wait for the browser redirect before aborting.
 const loginTimeout = 5 * time.Minute
 
@@ -530,6 +534,9 @@ func loginViaBrowser(scope string, noBrowser, showToken bool) error {
 func checkNotInMaintenance(base string) error {
 	probe := client.NewClient(base, "")
 	probe.Verbose = verboseFlag
+	// Short, so a network that drops packets delays the browser by seconds, not
+	// by the default request timeout.
+	probe.HTTPClient.Timeout = loginProbeTimeout
 	if _, err := probe.Health(); client.IsMaintenance(err) {
 		return err
 	}

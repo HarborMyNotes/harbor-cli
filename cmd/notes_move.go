@@ -92,6 +92,9 @@ func prepareNoteMove(c *client.Client, creds *config.Credentials, noteID string,
 	// whether a notebook requires encryption is the server's answer and has
 	// nothing to do with whether this shell happens to hold a passphrase.
 	nb := notebookEncryptionOf(c, dest)
+	if nb.Down != nil {
+		return noteMovePlan{}, nb.Down
+	}
 
 	if note == nil {
 		var err error

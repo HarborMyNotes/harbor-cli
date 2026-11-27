@@ -70,7 +70,7 @@ func TestAPIErrorImplementsError(t *testing.T) {
 }
 
 // downtimeResponse builds a response the way Harbor's proxy serves its
-// downtime page today: an HTML body with no maintenance header.
+// downtime page: an HTML body with no maintenance header.
 func downtimeResponse(status int) *http.Response {
 	h := http.Header{}
 	h.Set("Content-Type", "text/html; charset=utf-8")
@@ -109,7 +109,7 @@ func TestIsMaintenanceResponse(t *testing.T) {
 		{"json 503", jsonResponse(503), false},
 		{"json 502", jsonResponse(502), false},
 		{"json 504", jsonResponse(504), false},
-		{"+json 503", plusJSON, false},
+		{"+json 503", plusJSON, true},
 		{"html 500", downtimeResponse(500), false},
 		{"html 404", downtimeResponse(404), false},
 		{"header on a json 503", withHeader(jsonResponse(503), "1"), true},
@@ -225,5 +225,21 @@ func TestIsMaintenanceFindsAWrappedError(t *testing.T) {
 	}
 	if IsMaintenance(errors.New("maintenance")) || IsMaintenance(nil) {
 		t.Error("IsMaintenance matched something that is not a maintenance error")
+	}
+}
+
+// TestResponseErrorKeepsRetryAfterOnOtherErrors proves Retry-After reaches
+// --json on any error that sends it, such as a rate limit, not only on
+// maintenance.
+func TestResponseErrorKeepsRetryAfterOnOtherErrors(t *testing.T) {
+	resp := jsonResponse(http.StatusTooManyRequests)
+	resp.Header.Set("Retry-After", "12")
+	e := responseError(resp, []byte(`{"error":{"code":"rate_limited","message":"Slow down."}}`), "")
+
+	if e.Code != "rate_limited" {
+		t.Errorf("code = %q, want rate_limited", e.Code)
+	}
+	if e.RetryAfterSeconds == nil || *e.RetryAfterSeconds != 12 {
+		t.Errorf("retry_after_seconds = %v, want 12", e.RetryAfterSeconds)
 	}
 }

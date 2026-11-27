@@ -1072,6 +1072,9 @@ func TestUploadRetriesTheAPIStepsOnATemporaryError(t *testing.T) {
 			first = commits.Add(1) == 1
 		}
 		if first {
+			// JSON, as the API server sends it: an HTML 503 would be the
+			// downtime page, which is not retried.
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte(busy))
 			return
@@ -1202,6 +1205,7 @@ func TestUploadStopsRetryingAnAPIStepAfterTheLastAttempt(t *testing.T) {
 	stub := newUploadStub(t)
 	stub.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		checks.Add(1)
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadGateway)
 		_, _ = w.Write([]byte(`{"error":{"code":"internal_error","message":"down"}}`))
 	})
@@ -1212,6 +1216,28 @@ func TestUploadStopsRetryingAnAPIStepAfterTheLastAttempt(t *testing.T) {
 	}
 	if n := checks.Load(); n != fileUploadAttempts {
 		t.Errorf("check tried %d times, want %d", n, fileUploadAttempts)
+	}
+}
+
+// Harbor's downtime page is reported at once, not retried: it lasts minutes,
+// and the user or their script decides when to try again.
+func TestUploadDoesNotRetryMaintenance(t *testing.T) {
+	var checks atomic.Int32
+	stub := newUploadStub(t)
+	stub.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		checks.Add(1)
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("<html>We'll be right back</html>"))
+	})
+	path := writeFile(t, "down.bin", []byte("harbor down"))
+
+	_, err := stub.client(t).UploadFile(context.Background(), path, "", "", 0)
+	if !IsMaintenance(err) {
+		t.Fatalf("error = %v, want the maintenance error", err)
+	}
+	if n := checks.Load(); n != 1 {
+		t.Errorf("check tried %d times, want 1", n)
 	}
 }
 

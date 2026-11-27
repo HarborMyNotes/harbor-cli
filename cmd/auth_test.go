@@ -884,3 +884,27 @@ func TestWhoamiEnvTokenDuringMaintenance(t *testing.T) {
 		t.Errorf("whoami blamed the token's scopes during maintenance:\n%s", out)
 	}
 }
+
+// TestLoginMaintenanceCheckGivesUpQuickly proves a server that never answers
+// delays the browser by the short probe timeout, and then lets the sign-in go
+// ahead.
+func TestLoginMaintenanceCheckGivesUpQuickly(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	orig := loginProbeTimeout
+	loginProbeTimeout = 50 * time.Millisecond
+	defer func() { loginProbeTimeout = orig }()
+
+	start := time.Now()
+	if err := checkNotInMaintenance(srv.URL + "/api/v1"); err != nil {
+		t.Errorf("error = %v, want nil so the sign-in goes ahead", err)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("the check took %s, want about the probe timeout", took)
+	}
+}
