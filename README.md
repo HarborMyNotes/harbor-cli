@@ -332,8 +332,9 @@ While Harbor is down for maintenance, a command that needs the server prints
 `Error: Harbor is down for maintenance. Try again in a few minutes.` and exits
 `3`. With `--json` the envelope's `code` is `maintenance`. Any error whose
 response said how long to wait (`Retry-After`) also carries
-`retry_after_seconds`. The CLI does not retry a maintenance answer on its own —
-your script decides — and a maintenance answer never signs you out.
+`retry_after_seconds`. The CLI does not retry on its own — your script decides —
+except that an upload step and the `--wait` of `trash empty` and `account clear`
+ride out a short blip before they stop. A maintenance answer never signs you out.
 
 **A command never exits `0` for work it did not do.** That includes the cases
 where the server answers `200`:

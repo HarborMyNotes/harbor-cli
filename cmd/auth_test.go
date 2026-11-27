@@ -889,12 +889,15 @@ func TestWhoamiEnvTokenDuringMaintenance(t *testing.T) {
 // delays the browser by the short probe timeout, and then lets the sign-in go
 // ahead.
 func TestLoginMaintenanceCheckGivesUpQuickly(t *testing.T) {
-	release := make(chan struct{})
+	// The server answers after 3 s, so a check without its short timeout fails
+	// this test in seconds rather than after the default 30.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-release
+		select {
+		case <-time.After(3 * time.Second):
+		case <-r.Context().Done():
+		}
 	}))
 	defer srv.Close()
-	defer close(release)
 
 	orig := loginProbeTimeout
 	loginProbeTimeout = 50 * time.Millisecond
@@ -904,7 +907,7 @@ func TestLoginMaintenanceCheckGivesUpQuickly(t *testing.T) {
 	if err := checkNotInMaintenance(srv.URL + "/api/v1"); err != nil {
 		t.Errorf("error = %v, want nil so the sign-in goes ahead", err)
 	}
-	if took := time.Since(start); took > 2*time.Second {
+	if took := time.Since(start); took > time.Second {
 		t.Errorf("the check took %s, want about the probe timeout", took)
 	}
 }

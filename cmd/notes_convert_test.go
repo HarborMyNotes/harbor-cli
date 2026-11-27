@@ -1294,6 +1294,36 @@ func TestBulkConversionStopsWhenHarborIsDown(t *testing.T) {
 	if !strings.Contains(out, "a encrypted") {
 		t.Errorf("the note converted before Harbor went down was not reported:\n%s", out)
 	}
+	if !strings.Contains(out, "2 not tried") {
+		t.Errorf("the summary does not count the notes never tried:\n%s", out)
+	}
+}
+
+// TestBulkConversionStoppedJSONReportsWhatWasNotTried proves the --json report
+// of a stopped run lists the notes it never reached and is not complete.
+func TestBulkConversionStoppedJSONReportsWhatWasNotTried(t *testing.T) {
+	jsonOutput = true
+	defer func() { jsonOutput = false }()
+	down := &client.APIError{Code: client.CodeMaintenance, Message: client.MaintenanceMessage, Status: 503}
+
+	out := captureStdout(t, func() {
+		_ = runConversion([]string{"a", "b", "c"}, true, "encrypted", func(id string) (bool, error) {
+			if id == "b" {
+				return false, down
+			}
+			return true, nil
+		})
+	})
+	var report conversionReport
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("stdout is not the report: %v\n%s", err, out)
+	}
+	if report.Complete {
+		t.Error("a stopped run reported complete: true")
+	}
+	if !reflect.DeepEqual(report.NotTried, []string{"b", "c"}) {
+		t.Errorf("not_tried = %v, want [b c]", report.NotTried)
+	}
 }
 
 // TestBulkConversionDownFromTheStartPrintsNoReport proves a run that never got

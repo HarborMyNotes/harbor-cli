@@ -394,7 +394,7 @@ func warnEncryptionUnknown(notebookID string) {
 }
 
 // notebookEncryption is everything a notebook lookup established about one
-// notebook, and it is four facts rather than one bool because each of them is
+// notebook, and it is several facts rather than one bool because each of them is
 // answerable on its own and the callers branch on different ones.
 //
 // ID is the RESOLVED id — the notebook the server will actually act on, which is
@@ -483,7 +483,8 @@ func notebookWantsEncryption(c *client.Client, notebookID string) notebookEncryp
 	// known is set inside the visit callback and NOWHERE else, so it is true exactly
 	// when a notebook flagged is_default was actually read — which is the only thing
 	// that can answer the question. Once it is set, whatever the walk did afterwards
-	// cannot unmake that answer, so the walk's own result is deliberately discarded.
+	// cannot unmake that answer, so the walk's error is read only when no default
+	// was found, to tell Harbor being down apart from an ordinary failure.
 	//
 	// A COMPLETED WALK THAT NEVER FOUND A DEFAULT IS "UNKNOWN", NOT "NO". It used to
 	// report known=true, which read back at the call site as "the default notebook

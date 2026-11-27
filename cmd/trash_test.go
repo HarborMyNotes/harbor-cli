@@ -938,24 +938,67 @@ func TestTrashEmptyWithJobKeepsExpunged(t *testing.T) {
 	}
 }
 
-// TestTrashWaitStopsAtOnceDuringMaintenance proves the wait does not keep
-// polling a server that is down: one check, then the maintenance error as it
-// is, so it prints the shared sentence and exits 3.
-func TestTrashWaitStopsAtOnceDuringMaintenance(t *testing.T) {
-	down := &client.APIError{Code: client.CodeMaintenance, Message: client.MaintenanceMessage, Status: 503}
-	calls := 0
-	fetch := func(string) ([]byte, error) {
-		calls++
-		return nil, down
+// downtimeTrashMock answers the Empty Trash with bigTrashAccepted and the
+// first downPolls job checks with Harbor's downtime page, then with a
+// completed job. A negative downPolls means every check gets the page.
+func downtimeTrashMock(t *testing.T, downPolls int) *apiMock {
+	t.Helper()
+	m := newAPIMock(t, nil)
+	n := 0
+	m.handler = func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case emptyTrashRoute:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(bigTrashAccepted))
+		case trashJobRoute:
+			n++
+			if downPolls < 0 || n <= downPolls {
+				w.Header().Set("Content-Type", "text/html")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte("<html>We'll be right back</html>"))
+				return
+			}
+			reply := jobReply("completed", 15843)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(reply.Status)
+			_, _ = w.Write([]byte(reply.Body))
+		default:
+			t.Errorf("unrouted request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
 	}
-	_, err := trashWaitForEmpty(context.Background(), fetch, []byte(bigTrashAccepted), &trashEmptyProgress{})
-	if err != down {
-		t.Errorf("err = %v, want the maintenance error itself", err)
+	return m
+}
+
+// TestTrashWaitRidesOutABriefDowntimePage proves a restart that serves the
+// downtime page for a moment does not end the wait.
+func TestTrashWaitRidesOutABriefDowntimePage(t *testing.T) {
+	fastTrashPoll(t)
+	m := downtimeTrashMock(t, 2)
+
+	if _, err := runCLI(t, m, "trash", "empty", "--yes"); err != nil {
+		t.Fatalf("trash empty: %v", err)
 	}
-	if calls != 1 {
-		t.Errorf("checked %d times, want 1", calls)
+}
+
+// TestTrashWaitEndsWithMaintenance proves a wait that outlasts its retry
+// window while Harbor is down ends with the maintenance error itself (exit 3),
+// after saying the trash may still be emptying.
+func TestTrashWaitEndsWithMaintenance(t *testing.T) {
+	fastTrashPoll(t)
+	shortRetryWindow(t, 20*time.Millisecond)
+	m := downtimeTrashMock(t, -1)
+
+	var err error
+	stderr := captureStderr(t, func() { _, err = runCLI(t, m, "trash", "empty", "--yes") })
+	if !client.IsMaintenance(err) {
+		t.Fatalf("err = %v, want the maintenance error", err)
 	}
 	if got := exitCodeFor(err); got != exitNetwork {
 		t.Errorf("exit code = %d, want %d", got, exitNetwork)
+	}
+	if !strings.Contains(stderr, "may still be emptying") {
+		t.Errorf("stderr = %q, want the note that the trash may still be emptying", stderr)
 	}
 }

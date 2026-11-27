@@ -1219,9 +1219,10 @@ func TestUploadStopsRetryingAnAPIStepAfterTheLastAttempt(t *testing.T) {
 	}
 }
 
-// Harbor's downtime page is reported at once, not retried: it lasts minutes,
-// and the user or their script decides when to try again.
-func TestUploadDoesNotRetryMaintenance(t *testing.T) {
+// Harbor's downtime page gets the same few short retries as a 5xx, because a
+// restart of a few seconds serves the same page. Real maintenance outlasts
+// them, and the upload ends with the maintenance error.
+func TestUploadEndsWithMaintenanceAfterItsRetries(t *testing.T) {
 	var checks atomic.Int32
 	stub := newUploadStub(t)
 	stub.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1236,8 +1237,8 @@ func TestUploadDoesNotRetryMaintenance(t *testing.T) {
 	if !IsMaintenance(err) {
 		t.Fatalf("error = %v, want the maintenance error", err)
 	}
-	if n := checks.Load(); n != 1 {
-		t.Errorf("check tried %d times, want 1", n)
+	if n := checks.Load(); n != fileUploadAttempts {
+		t.Errorf("check tried %d times, want %d", n, fileUploadAttempts)
 	}
 }
 
