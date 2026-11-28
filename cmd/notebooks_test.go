@@ -268,3 +268,93 @@ func TestDisplayNotebookShowsMetadata(t *testing.T) {
 		t.Errorf("metadata row missing:\n%s", out)
 	}
 }
+
+// TestDisplayNotebooksShowsColorName covers the COLOR column and the Color row.
+func TestDisplayNotebooksShowsColorName(t *testing.T) {
+	out := captureStdout(t, func() {
+		displayNotebooks([]byte(`{"data":[{"id":"nb1","name":"Ideas","color":"#a855f7"},{"id":"nb2","name":"Plain","color":""}],"paging":{"total":2}}`))
+	})
+	if !strings.Contains(out, "COLOR") || !strings.Contains(out, "purple") {
+		t.Errorf("color column missing:\n%s", out)
+	}
+	out = captureStdout(t, func() {
+		displayNotebook([]byte(`{"id":"nb1","name":"Ideas","color":"#14b8a6"}`))
+	})
+	if !strings.Contains(out, "Color") || !strings.Contains(out, "teal") {
+		t.Errorf("color row missing:\n%s", out)
+	}
+}
+
+// TestNotebooksCreateSendsColor covers --color on create.
+func TestNotebooksCreateSendsColor(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"POST /api/v1/notebooks": {Status: 201, Body: `{"id":"nb1","name":"Ideas","color":"#a855f7"}`},
+	})
+	if _, err := runCLI(t, m, "notebooks", "create", "--name", "Ideas", "--color", "purple"); err != nil {
+		t.Fatalf("notebooks create: %v", err)
+	}
+	if got := m.rawBodyOf(t, "POST /api/v1/notebooks"); got != `{"color":"#a855f7","name":"Ideas"}` {
+		t.Errorf("body = %s", got)
+	}
+}
+
+// TestNotebooksWithoutColorSendNoColorKey proves neither create nor a rename
+// sends a color key unless --color is given.
+func TestNotebooksWithoutColorSendNoColorKey(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"POST /api/v1/notebooks":      {Status: 201, Body: `{"id":"nb1","name":"Work"}`},
+		"PATCH /api/v1/notebooks/nb1": {Status: 200, Body: `{"id":"nb1","name":"Renamed"}`},
+	})
+	if _, err := runCLI(t, m, "notebooks", "create", "--name", "Work", "--stack", "Projects"); err != nil {
+		t.Fatalf("notebooks create: %v", err)
+	}
+	if _, err := runCLI(t, m, "notebooks", "update", "nb1", "--name", "Renamed"); err != nil {
+		t.Fatalf("notebooks update: %v", err)
+	}
+	if _, ok := m.bodyOf(t, "POST /api/v1/notebooks")["color"]; ok {
+		t.Errorf("a create without --color sent a color key")
+	}
+	if got := m.rawBodyOf(t, "PATCH /api/v1/notebooks/nb1"); got != `{"name":"Renamed"}` {
+		t.Errorf("rename body = %s", got)
+	}
+}
+
+// TestNotebooksUpdateColorOnly covers --color as the only flag: it goes to the
+// notebook's own PATCH, not the metadata route, and none sends "".
+func TestNotebooksUpdateColorOnly(t *testing.T) {
+	for in, want := range map[string]string{
+		"Slate": `{"color":"#64748b"}`,
+		"none":  `{"color":""}`,
+	} {
+		m := newAPIMock(t, map[string]mockReply{
+			"PATCH /api/v1/notebooks/nb1": {Status: 200, Body: `{"id":"nb1","name":"Work"}`},
+		})
+		if _, err := runCLI(t, m, "notebooks", "update", "nb1", "--color", in); err != nil {
+			t.Fatalf("notebooks update --color %s: %v", in, err)
+		}
+		if calls := strings.Join(m.calls(), ", "); calls != "PATCH /api/v1/notebooks/nb1" {
+			t.Errorf("--color %s: calls = %s", in, calls)
+		}
+		if got := m.rawBodyOf(t, "PATCH /api/v1/notebooks/nb1"); got != want {
+			t.Errorf("--color %s: body = %s, want %s", in, got, want)
+		}
+	}
+}
+
+// TestNotebooksBadColorFailsBeforeAnyRequest covers a value outside the palette
+// on create and update.
+func TestNotebooksBadColorFailsBeforeAnyRequest(t *testing.T) {
+	for _, args := range [][]string{
+		{"notebooks", "create", "--name", "Ideas", "--color", "#000000"},
+		{"notebooks", "update", "nb1", "--color", "#000000"},
+	} {
+		m := newAPIMock(t, map[string]mockReply{})
+		_, err := runCLI(t, m, args...)
+		if err == nil || !strings.Contains(err.Error(), "slate") {
+			t.Errorf("%v: err = %v", args, err)
+		}
+		if calls := m.calls(); len(calls) != 0 {
+			t.Errorf("%v: a bad color still sent %v", args, calls)
+		}
+	}
+}

@@ -473,7 +473,7 @@ func mapMetadataError(err error) error {
 		case "payload_too_large":
 			return errors.New("the metadata was refused: the request is over the server's 1 MiB limit (stored metadata is capped at 16 KB)")
 		case "stack_not_found":
-			return errors.New("no stack has that name — see 'harbor stacks list'")
+			return errors.New(stackNotFoundMessage)
 		}
 	}
 	return err

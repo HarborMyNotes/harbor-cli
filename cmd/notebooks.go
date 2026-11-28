@@ -80,13 +80,11 @@ var notebooksCreateCmd = &cobra.Command{
 	Long:  "Create a notebook.\n\n" + metadataHelp,
 	Example: `  harbor notebooks create --name "Work" --stack Projects
   harbor notebooks create --name "Secrets" --default-encrypt
+  harbor notebooks create --name "Ideas" --color purple
   harbor notebooks create --name "Portfolio" --meta gallery=true`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// The flags are checked before the credentials so a typo answers the typo.
 		meta, err := readMetaChange(cmd, createMetaFlags)
-		if err != nil {
-			return err
-		}
-		c, _, err := loadClientFromConfig()
 		if err != nil {
 			return err
 		}
@@ -97,8 +95,15 @@ var notebooksCreateCmd = &cobra.Command{
 		body := map[string]any{"name": name}
 		addStringIfChanged(cmd, body, "stack", "stack")
 		addBoolIfChanged(cmd, body, "default-encrypt", "default_encrypt")
+		if err := addColorIfChanged(cmd, body); err != nil {
+			return err
+		}
 		if meta != nil {
 			body["metadata"] = meta.object
+		}
+		c, _, err := loadClientFromConfig()
+		if err != nil {
+			return err
 		}
 		data, err := c.CreateNotebook(body)
 		if err != nil {
@@ -129,15 +134,14 @@ turn it off in the same command, e.g. --make-default --default-encrypt=false.
 ` + metadataHelp,
 	Example: `  harbor notebooks update 5b1f... --name "Work — Active"
   harbor notebooks update 5b1f... --stack Archive --public=false
+  harbor notebooks update 5b1f... --color teal
+  harbor notebooks update 5b1f... --color none
   harbor notebooks update 5b1f... --make-default
   harbor notebooks update 5b1f... --make-default --default-encrypt=false
   harbor notebooks update 5b1f... --meta gallery=true --unset-meta draft`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// The flags are checked before the credentials so a typo answers the typo.
 		meta, err := readMetaChange(cmd, recordMetaFlags)
-		if err != nil {
-			return err
-		}
-		c, _, err := loadClientFromConfig()
 		if err != nil {
 			return err
 		}
@@ -149,10 +153,17 @@ turn it off in the same command, e.g. --make-default --default-encrypt=false.
 		if boolFlag(cmd, "make-default") {
 			body["is_default"] = true
 		}
+		if err := addColorIfChanged(cmd, body); err != nil {
+			return err
+		}
+		if len(body) == 0 && meta == nil {
+			return errors.New("nothing to update — pass at least one field flag")
+		}
+		c, _, err := loadClientFromConfig()
+		if err != nil {
+			return err
+		}
 		if len(body) == 0 {
-			if meta == nil {
-				return errors.New("nothing to update — pass at least one field flag")
-			}
 			// Metadata alone goes only to its own route, so the notebook is not
 			// edited and its updated time does not move.
 			data, err := applyMetaChange(c, client.NotebookMetadataPath(args[0]), meta)
@@ -292,13 +303,14 @@ func guardDefaultNotebookEncrypt(c *client.Client, id string, body map[string]an
 // displayNotebooks renders a notebook collection as a table.
 func displayNotebooks(data []byte) {
 	items := client.CollectionItems(data)
-	headers := []string{"ID", "NAME", "STACK", "DEFAULT", "ENCRYPT", "PUBLIC", "USN", "UPDATED"}
+	headers := []string{"ID", "NAME", "COLOR", "STACK", "DEFAULT", "ENCRYPT", "PUBLIC", "USN", "UPDATED"}
 	rows := make([][]string, 0, len(items))
 	for _, raw := range items {
 		nb := parseJSON(raw)
 		rows = append(rows, []string{
 			str(nb, "id"),
 			str(nb, "name"),
+			colorName(str(nb, "color")),
 			str(nb, "stack"),
 			defaultStar(boolean(nb, "is_default")),
 			boolMark(boolean(nb, "default_encrypt")),
@@ -322,6 +334,7 @@ func displayNotebook(data []byte) {
 	pairs := [][2]string{
 		{"ID", bold(str(nb, "id"))},
 		{"Name", str(nb, "name")},
+		{"Color", colorName(str(nb, "color"))},
 		{"Stack", str(nb, "stack")},
 		{"Default", defaultStar(boolean(nb, "is_default"))},
 		{"Encrypt new notes", boolMark(boolean(nb, "default_encrypt"))},
@@ -356,10 +369,12 @@ func init() {
 	notebooksCreateCmd.Flags().String("name", "", "Notebook name (required)")
 	notebooksCreateCmd.Flags().String("stack", "", "Stack (grouping label)")
 	notebooksCreateCmd.Flags().Bool("default-encrypt", false, "Encrypt new notes in this notebook by default")
+	addColorFlag(notebooksCreateCmd)
 	addMetaWriteFlags(notebooksCreateCmd, createMetaFlags)
 
 	notebooksUpdateCmd.Flags().String("name", "", "New name")
 	notebooksUpdateCmd.Flags().String("stack", "", "New stack")
+	addColorFlag(notebooksUpdateCmd)
 	notebooksUpdateCmd.Flags().Bool("default-encrypt", false, "Encrypt new notes by default (never allowed on the default notebook)")
 	notebooksUpdateCmd.Flags().Bool("public", false, "Make the notebook public")
 	notebooksUpdateCmd.Flags().Bool("make-default", false, "Promote this notebook to the account default (refused if it encrypts by default)")

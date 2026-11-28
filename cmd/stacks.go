@@ -4,6 +4,9 @@
 package cmd
 
 import (
+	"errors"
+	"fmt"
+
 	"github.com/HarborMyNotes/harbor-cli/client"
 	"github.com/spf13/cobra"
 )
@@ -14,7 +17,7 @@ import (
 var stacksCmd = &cobra.Command{
 	Use:     "stacks",
 	Aliases: []string{"stack"},
-	Short:   "List stacks and manage their metadata",
+	Short:   "List stacks and manage their color and metadata",
 	GroupID: groupOrg,
 	Long: `A stack is a named group of notebooks. A notebook joins a stack through its
 stack label: 'harbor notebooks update <id> --stack NAME'.`,
@@ -64,6 +67,54 @@ deleting it discards it.`,
 	},
 }
 
+// stacksUpdateCmd changes a stack's color.
+var stacksUpdateCmd = &cobra.Command{
+	Use:   "update <name>",
+	Short: "Change a stack's color",
+	Args:  cobra.ExactArgs(1),
+	Long: `Change a stack's color. A stack is named exactly, case included.
+
+The color is the stack's own; its notebooks keep theirs. A stack that exists only
+through its notebooks' labels is saved as a stack once it has a color, so it
+stays in 'harbor stacks list' after its last notebook leaves.`,
+	Example: `  harbor stacks update Projects --color green
+  harbor stacks update "Client Work" --color none`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		// The flags are checked before the credentials so a typo answers the typo.
+		body := map[string]any{}
+		if err := addColorIfChanged(cmd, body); err != nil {
+			return err
+		}
+		if len(body) == 0 {
+			return errors.New("nothing to update — pass --color")
+		}
+		c, _, err := loadClientFromConfig()
+		if err != nil {
+			return err
+		}
+		data, err := c.UpdateStack(args[0], body)
+		if err != nil {
+			return mapStackError(err)
+		}
+		printResult(data, displayStack)
+		return nil
+	},
+}
+
+// stackNotFoundMessage is the friendly answer to stack_not_found, shared by
+// every command that addresses a stack by name.
+const stackNotFoundMessage = "no stack has that name — see 'harbor stacks list'"
+
+// mapStackError gives a friendly message for an unknown stack name. A plan
+// limit is left alone: the renderer has its own treatment and exit code for it.
+func mapStackError(err error) error {
+	var apiErr *client.APIError
+	if errors.As(err, &apiErr) && apiErr.Code == "stack_not_found" {
+		return errors.New(stackNotFoundMessage)
+	}
+	return err
+}
+
 // ===========================================================================
 // Display
 // ===========================================================================
@@ -71,18 +122,37 @@ deleting it discards it.`,
 // displayStacks renders a stack collection as a table.
 func displayStacks(data []byte) {
 	items := client.CollectionItems(data)
-	headers := []string{"NAME", "NOTEBOOKS"}
+	headers := []string{"NAME", "COLOR", "NOTEBOOKS"}
 	rows := make([][]string, 0, len(items))
 	for _, raw := range items {
 		s := parseJSON(raw)
 		rows = append(rows, []string{
 			str(s, "name"),
+			colorName(str(s, "color")),
 			str(s, "notebook_count"),
 		})
 	}
 	headers, rows = withMetaColumn(items, headers, rows)
 	printTable(headers, rows)
 	printPagingFooter(data)
+}
+
+// displayStack renders one stack's list object as a detail view.
+func displayStack(data []byte) {
+	s := parseJSON(client.UnwrapData(data))
+	if s == nil {
+		fmt.Println(string(data))
+		return
+	}
+	pairs := [][2]string{
+		{"Name", bold(str(s, "name"))},
+		{"Color", colorName(str(s, "color"))},
+		{"Notebooks", str(s, "notebook_count")},
+	}
+	if meta, ok := metadataPair(data); ok {
+		pairs = append(pairs, meta)
+	}
+	printKV(pairs)
 }
 
 // init registers the stack commands. The paging flags are declared here
@@ -96,6 +166,8 @@ func init() {
 
 	addMetaWriteFlags(stacksMetaCmd, metaCmdFlags)
 
-	stacksCmd.AddCommand(stacksListCmd, stacksMetaCmd)
+	addColorFlag(stacksUpdateCmd)
+
+	stacksCmd.AddCommand(stacksListCmd, stacksUpdateCmd, stacksMetaCmd)
 	rootCmd.AddCommand(stacksCmd)
 }

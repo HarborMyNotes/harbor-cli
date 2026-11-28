@@ -68,8 +68,8 @@ Containers for notes; exactly one **default** notebook per account.
 |---|---|---|
 | `harbor notebooks list` | List notebooks | `--stack`, `--include-deleted`, `--meta-eq`, `--meta-has`, paging |
 | `harbor notebooks get <id>` | One notebook | `--include-deleted` |
-| `harbor notebooks create` | Create | `--name` (req), `--stack`, `--default-encrypt`, `--meta`, `--meta-json` |
-| `harbor notebooks update <id>` | Partial update | `--name`, `--stack`, `--public`, `--make-default`, `--default-encrypt`, `--meta`, `--meta-json`, `--unset-meta`, `--clear-meta` |
+| `harbor notebooks create` | Create | `--name` (req), `--stack`, `--color`, `--default-encrypt`, `--meta`, `--meta-json` |
+| `harbor notebooks update <id>` | Partial update | `--name`, `--stack`, `--color`, `--public`, `--make-default`, `--default-encrypt`, `--meta`, `--meta-json`, `--unset-meta`, `--clear-meta` |
 | `harbor notebooks meta <id>` | Read or change its metadata | `--set`, `--unset`, `--replace`, `--clear` |
 | `harbor notebooks delete <id>` | Tombstone | `--notes move_to_default\|trash` |
 
@@ -126,10 +126,11 @@ A stack is a named group of notebooks. A notebook joins one through its label:
 | Command | What it does | Key flags |
 |---|---|---|
 | `harbor stacks list` | List stacks with notebook counts | `--meta-eq`, `--meta-has`, `--order name\|notebook_count`, paging (default: every stack) |
+| `harbor stacks update <name>` | Change a stack's color | `--color` (req) |
 | `harbor stacks meta <name>` | Read or change a stack's metadata | `--set`, `--unset`, `--replace`, `--clear` |
 
-A stack is named exactly, case included. Renaming a stack keeps its metadata;
-deleting it discards it.
+A stack is named exactly, case included. Renaming a stack keeps its color and
+metadata; deleting it discards them.
 
 ---
 
@@ -188,10 +189,16 @@ Hierarchical (nested). A tag's parent is set with `--parent` (or `--top-level`).
 |---|---|---|
 | `harbor tags list` | List tags | `--top-level`, `--parent <id>`, `--include-deleted`, paging |
 | `harbor tags get <id>` | One tag | `--include-deleted` |
-| `harbor tags create` | Create | `--name` (req; no commas), `--parent` |
-| `harbor tags update <id>` | Rename / re-parent | `--name`, `--parent`, `--top-level` |
+| `harbor tags create` | Create | `--name` (req; no commas), `--parent`, `--color` |
+| `harbor tags update <id>` | Rename / re-parent / recolor | `--name`, `--parent`, `--top-level`, `--color` |
 | `harbor tags delete <id>` | Tombstone (untags notes) | `--children reparent_to_grandparent\|orphan` |
 | `harbor tags notes <id>` | Notes carrying a tag | `--notebook`, paging |
+
+**Colors** (tags, notebooks, stacks): `--color` takes one of ten names, in any case: `red`, `orange`, `amber`, `green`,
+`teal`, `harbor-blue`, `indigo`, `purple`, `pink`, `slate`. The hex (`#ef4444`)
+works too (`ef4444` needs no quotes), and `none` clears the color. Leave `--color` out and the color is kept.
+List and get output show the color's name; `--json` shows the stored hex in
+`color` (`""` for none).
 
 ---
 
