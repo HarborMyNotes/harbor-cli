@@ -46,16 +46,17 @@ func colorNames() string {
 // colorFlagUsage is the --color help line, so every command lists the same ten
 // names.
 func colorFlagUsage() string {
-	return "Color: " + colorNames() + ", its hex (e.g. #ef4444), or none to clear"
+	return "Color: " + colorNames() + ", its hex (ef4444 or '#ef4444'), or none to clear"
 }
 
 // parseColor turns a --color value into the hex the API stores, or "" for
 // none. It takes a palette name in any case ("Harbor Blue" and "harbor_blue"
 // mean harbor-blue), a palette hex with or without its "#" (an unquoted "#" can
-// start a shell comment), or "none" / "" to clear.
+// start a shell comment), or "none" to clear. An empty value is refused rather
+// than read as none, so `--color "$UNSET_VAR"` cannot wipe a stored color.
 func parseColor(raw string) (string, error) {
 	v := strings.ToLower(strings.TrimSpace(raw))
-	if v == "" || v == "none" {
+	if v == "none" {
 		return "", nil
 	}
 	name := strings.NewReplacer(" ", "-", "_", "-").Replace(v)
@@ -72,8 +73,8 @@ func parseColor(raw string) (string, error) {
 }
 
 // colorName is how a stored color reads in table output: its palette name,
-// blank for none. A value outside the palette is printed as stored, so a color
-// the server adds later still shows up rather than vanishing.
+// blank for none. A value outside the palette reads as none too, the way every
+// Harbor app paints it; --json still shows the stored value.
 func colorName(stored string) string {
 	v := strings.ToLower(strings.TrimSpace(stored))
 	for _, c := range harborColors {
@@ -81,7 +82,7 @@ func colorName(stored string) string {
 			return c.Name
 		}
 	}
-	return stored
+	return ""
 }
 
 // addColorFlag registers --color on a create or update command.

@@ -31,7 +31,7 @@ func TestHarborColorsMatchTheAPIPalette(t *testing.T) {
 
 // TestParseColorAccepts covers every accepted spelling: a name in any case, a
 // name with a space or underscore, a hex in any case with or without its "#",
-// and none / "" to clear.
+// and none to clear.
 func TestParseColorAccepts(t *testing.T) {
 	cases := map[string]string{
 		"red":         "#ef4444",
@@ -46,8 +46,7 @@ func TestParseColorAccepts(t *testing.T) {
 		"F59E0B":      "#f59e0b",
 		"none":        "",
 		"NONE":        "",
-		"":            "",
-		"   ":         "",
+		" None ":      "",
 	}
 	for in, want := range cases {
 		got, err := parseColor(in)
@@ -61,10 +60,11 @@ func TestParseColorAccepts(t *testing.T) {
 	}
 }
 
-// TestParseColorRejects covers values outside the palette. The error must name
-// every allowed color so the user can pick one without opening the help.
+// TestParseColorRejects covers values outside the palette, and an empty value,
+// which must not clear a color the way none does. The error must name every
+// allowed color so the user can pick one without opening the help.
 func TestParseColorRejects(t *testing.T) {
-	for _, in := range []string{"blue", "harborblue", "#000000", "#ef444", "ef44444", "##ef4444", "redd", "null"} {
+	for _, in := range []string{"", "   ", "blue", "harborblue", "#000000", "#ef444", "ef44444", "##ef4444", "redd", "null"} {
 		_, err := parseColor(in)
 		if err == nil {
 			t.Errorf("parseColor(%q) accepted a value outside the palette", in)
@@ -81,14 +81,14 @@ func TestParseColorRejects(t *testing.T) {
 	}
 }
 
-// TestColorName covers the table spelling: the palette name, blank for none,
-// and an unknown value printed as stored.
+// TestColorName covers the table spelling: the palette name, and blank for
+// none or for a value outside the palette.
 func TestColorName(t *testing.T) {
 	cases := map[string]string{
 		"#ef4444": "red",
 		"#1184F0": "harbor-blue",
 		"":        "",
-		"#123456": "#123456",
+		"#123456": "",
 	}
 	for in, want := range cases {
 		if got := colorName(in); got != want {
@@ -121,6 +121,38 @@ func TestColorFlagHelpListsEveryName(t *testing.T) {
 		}
 		if !strings.Contains(c.flag.Usage, "none") {
 			t.Errorf("%s --color help does not say how to clear: %s", c.name, c.flag.Usage)
+		}
+	}
+}
+
+// TestColorFlagIsCheckedBeforeLogin proves a bad --color, or nothing to update,
+// is reported even with no saved session, rather than "not logged in". The
+// HOME is empty and there is no HARBOR_TOKEN, so reaching the credentials check
+// would fail with a different error.
+func TestColorFlagIsCheckedBeforeLogin(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("HARBOR_TOKEN", "")
+	t.Setenv("HARBOR_API_URL", "http://127.0.0.1:1/api/v1")
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"tags", "create", "--name", "Urgent", "--color", "blue"}, "harbor-blue"},
+		{[]string{"tags", "update", "t1", "--color", "blue"}, "harbor-blue"},
+		{[]string{"tags", "update", "t1"}, "nothing to update"},
+		{[]string{"notebooks", "create", "--name", "Ideas", "--color", "blue"}, "harbor-blue"},
+		{[]string{"notebooks", "update", "nb1", "--color", "blue"}, "harbor-blue"},
+		{[]string{"notebooks", "update", "nb1"}, "nothing to update"},
+		{[]string{"stacks", "update", "Projects", "--color", "blue"}, "harbor-blue"},
+		{[]string{"stacks", "update", "Projects"}, "nothing to update"},
+	} {
+		resetCommandState(t)
+		prepareCommandTree()
+		rootCmd.SetArgs(tc.args)
+		var err error
+		captureStdout(t, func() { err = rootCmd.Execute() })
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%v: err = %v, want it to mention %q", tc.args, err, tc.want)
 		}
 	}
 }

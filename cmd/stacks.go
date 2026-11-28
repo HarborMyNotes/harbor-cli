@@ -101,12 +101,16 @@ stays in 'harbor stacks list' after its last notebook leaves.`,
 	},
 }
 
+// stackNotFoundMessage is the friendly answer to stack_not_found, shared by
+// every command that addresses a stack by name.
+const stackNotFoundMessage = "no stack has that name — see 'harbor stacks list'"
+
 // mapStackError gives a friendly message for an unknown stack name. A plan
 // limit is left alone: the renderer has its own treatment and exit code for it.
 func mapStackError(err error) error {
 	var apiErr *client.APIError
 	if errors.As(err, &apiErr) && apiErr.Code == "stack_not_found" {
-		return errors.New("no stack has that name — see 'harbor stacks list'")
+		return errors.New(stackNotFoundMessage)
 	}
 	return err
 }

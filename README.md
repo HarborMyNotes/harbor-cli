@@ -191,7 +191,7 @@ Run `harbor <command> --help` for full flags and examples on any command.
 Tags, notebooks and stacks can each have a color.
 `--color` takes one of ten names, in any case: `red`, `orange`, `amber`, `green`,
 `teal`, `harbor-blue`, `indigo`, `purple`, `pink`, `slate`. The hex (`#ef4444`)
-works too, and `none` clears the color. Leave `--color` out and the color is kept.
+works too (`ef4444` needs no quotes), and `none` clears the color. Leave `--color` out and the color is kept.
 List and get output show the color's name; `--json` shows the stored hex in
 `color` (`""` for none).
 

@@ -249,8 +249,7 @@ Every update is snapshotted — you can review or undo via `harbor history`
 harbor notebooks list --json
 harbor notebooks create --name "Work" --stack "Projects" --json     # --stack = grouping label
 harbor notebooks update "$NB_ID" --color teal --json                # --color none clears
-harbor tags update "$TAG_ID" --color red --json
-harbor stacks update "Projects" --color green --json
+harbor stacks update "Projects" --color green --json                # a stack's own color
 
 # Tags (hierarchical). Attach by NAME and the tag is created if missing — handy:
 harbor notes tag "$NOTE_ID" --tag-name "Receipts" --json
@@ -258,6 +257,7 @@ harbor notes tag "$NOTE_ID" --tag-id "$TAG_ID" --json               # by existin
 harbor notes untag "$NOTE_ID" --tag-id "$TAG_ID" --json
 harbor notes set-tags "$NOTE_ID" --tags "$T1,$T2" --json            # replace the whole set
 harbor notes set-tags "$NOTE_ID" --tags "" --json                   # clear all tags
+harbor tags update "$TAG_ID" --color red --json                     # color a tag
 
 # List the notes under a notebook or a tag
 harbor notes list --notebook "$NB_ID" --json

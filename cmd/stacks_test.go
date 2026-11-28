@@ -93,21 +93,22 @@ func TestDisplayStacksShowsColorName(t *testing.T) {
 	}
 }
 
-// TestStacksUpdateSendsColor covers set and clear on a name with a space, which
-// must reach the server as one path segment.
+// TestStacksUpdateSendsColor covers set and clear on a name with a space and a
+// "?", which must reach the server as one path segment rather than start a
+// query string.
 func TestStacksUpdateSendsColor(t *testing.T) {
 	for in, want := range map[string]string{
 		"green": `{"color":"#22c55e"}`,
 		"none":  `{"color":""}`,
 	} {
 		m := newAPIMock(t, map[string]mockReply{
-			"PATCH /api/v1/stacks/Client Work": {Status: 200, Body: `{"name":"Client Work","notebook_count":2,"color":"#22c55e","metadata":{}}`},
+			"PATCH /api/v1/stacks/Client Work?": {Status: 200, Body: `{"name":"Client Work?","notebook_count":2,"color":"#22c55e","metadata":{}}`},
 		})
-		out, err := runCLI(t, m, "stacks", "update", "Client Work", "--color", in)
+		out, err := runCLI(t, m, "stacks", "update", "Client Work?", "--color", in)
 		if err != nil {
 			t.Fatalf("stacks update --color %s: %v", in, err)
 		}
-		if got := m.rawBodyOf(t, "PATCH /api/v1/stacks/Client Work"); got != want {
+		if got := m.rawBodyOf(t, "PATCH /api/v1/stacks/Client Work?"); got != want {
 			t.Errorf("--color %s: body = %s, want %s", in, got, want)
 		}
 		if !strings.Contains(out, "Client Work") {

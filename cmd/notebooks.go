@@ -146,13 +146,6 @@ turn it off in the same command, e.g. --make-default --default-encrypt=false.
 			return err
 		}
 		body := map[string]any{}
-		if err := addColorIfChanged(cmd, body); err != nil {
-			return err
-		}
-		c, _, err := loadClientFromConfig()
-		if err != nil {
-			return err
-		}
 		addStringIfChanged(cmd, body, "name", "name")
 		addStringIfChanged(cmd, body, "stack", "stack")
 		addBoolIfChanged(cmd, body, "default-encrypt", "default_encrypt")
@@ -160,10 +153,17 @@ turn it off in the same command, e.g. --make-default --default-encrypt=false.
 		if boolFlag(cmd, "make-default") {
 			body["is_default"] = true
 		}
+		if err := addColorIfChanged(cmd, body); err != nil {
+			return err
+		}
+		if len(body) == 0 && meta == nil {
+			return errors.New("nothing to update — pass at least one field flag")
+		}
+		c, _, err := loadClientFromConfig()
+		if err != nil {
+			return err
+		}
 		if len(body) == 0 {
-			if meta == nil {
-				return errors.New("nothing to update — pass at least one field flag")
-			}
 			// Metadata alone goes only to its own route, so the notebook is not
 			// edited and its updated time does not move.
 			data, err := applyMetaChange(c, client.NotebookMetadataPath(args[0]), meta)

@@ -196,7 +196,7 @@ Hierarchical (nested). A tag's parent is set with `--parent` (or `--top-level`).
 
 **Colors** (tags, notebooks, stacks): `--color` takes one of ten names, in any case: `red`, `orange`, `amber`, `green`,
 `teal`, `harbor-blue`, `indigo`, `purple`, `pink`, `slate`. The hex (`#ef4444`)
-works too, and `none` clears the color. Leave `--color` out and the color is kept.
+works too (`ef4444` needs no quotes), and `none` clears the color. Leave `--color` out and the color is kept.
 List and get output show the color's name; `--json` shows the stored hex in
 `color` (`""` for none).
 
