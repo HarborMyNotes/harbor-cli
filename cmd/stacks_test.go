@@ -73,3 +73,76 @@ func TestStacksMetaUnknownStack(t *testing.T) {
 		t.Errorf("err = %v", err)
 	}
 }
+
+// TestDisplayStacksShowsColorName covers the COLOR column and the detail view
+// `stacks update` prints.
+func TestDisplayStacksShowsColorName(t *testing.T) {
+	out := captureStdout(t, func() {
+		displayStacks([]byte(`{"data":[{"name":"Projects","notebook_count":3,"color":"#22c55e","metadata":{}},{"name":"Plain","notebook_count":1,"color":"","metadata":{}}],"paging":{"total":2}}`))
+	})
+	if !strings.Contains(out, "COLOR") || !strings.Contains(out, "green") {
+		t.Errorf("color column missing:\n%s", out)
+	}
+	out = captureStdout(t, func() {
+		displayStack([]byte(`{"name":"Projects","notebook_count":3,"color":"#f97316","metadata":{"client":"acme"}}`))
+	})
+	for _, want := range []string{"Projects", "orange", "3", "client=acme"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("detail view missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestStacksUpdateSendsColor covers set and clear on a name with a space, which
+// must reach the server as one path segment.
+func TestStacksUpdateSendsColor(t *testing.T) {
+	for in, want := range map[string]string{
+		"green": `{"color":"#22c55e"}`,
+		"none":  `{"color":""}`,
+	} {
+		m := newAPIMock(t, map[string]mockReply{
+			"PATCH /api/v1/stacks/Client Work": {Status: 200, Body: `{"name":"Client Work","notebook_count":2,"color":"#22c55e","metadata":{}}`},
+		})
+		out, err := runCLI(t, m, "stacks", "update", "Client Work", "--color", in)
+		if err != nil {
+			t.Fatalf("stacks update --color %s: %v", in, err)
+		}
+		if got := m.rawBodyOf(t, "PATCH /api/v1/stacks/Client Work"); got != want {
+			t.Errorf("--color %s: body = %s, want %s", in, got, want)
+		}
+		if !strings.Contains(out, "Client Work") {
+			t.Errorf("output:\n%s", out)
+		}
+	}
+}
+
+// TestStacksUpdateNeedsColor covers a missing or bad --color: no request is sent.
+func TestStacksUpdateNeedsColor(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"stacks", "update", "Projects"}, "--color"},
+		{[]string{"stacks", "update", "Projects", "--color", "chartreuse"}, "harbor-blue"},
+	} {
+		m := newAPIMock(t, map[string]mockReply{})
+		_, err := runCLI(t, m, tc.args...)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%v: err = %v", tc.args, err)
+		}
+		if calls := m.calls(); len(calls) != 0 {
+			t.Errorf("%v: sent %v", tc.args, calls)
+		}
+	}
+}
+
+// TestStacksUpdateUnknownStack covers the friendly 404.
+func TestStacksUpdateUnknownStack(t *testing.T) {
+	m := newAPIMock(t, map[string]mockReply{
+		"PATCH /api/v1/stacks/Nope": {Status: 404, Body: apiErrorBody("stack_not_found", "Stack not found.")},
+	})
+	_, err := runCLI(t, m, "stacks", "update", "Nope", "--color", "red")
+	if err == nil || !strings.Contains(err.Error(), "harbor stacks list") {
+		t.Errorf("err = %v", err)
+	}
+}

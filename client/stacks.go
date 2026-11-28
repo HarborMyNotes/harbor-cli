@@ -12,3 +12,10 @@ import "net/url"
 func (c *Client) ListStacks(q url.Values) ([]byte, error) {
 	return c.doGetQuery("/stacks", q)
 }
+
+// UpdateStack changes a stack addressed by its current name and answers the
+// stack's list object. The name is free text, so it is escaped — a space or `?`
+// in a name would otherwise change what the URL means.
+func (c *Client) UpdateStack(name string, body map[string]any) ([]byte, error) {
+	return c.doPatch("/stacks/"+url.PathEscape(name), body)
+}

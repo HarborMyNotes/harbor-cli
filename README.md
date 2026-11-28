@@ -146,8 +146,8 @@ Run `harbor <command> --help` for full flags and examples on any command.
 |---|---|
 | `harbor notebooks list` | List notebooks (`--stack`, `--meta-eq`, `--meta-has`, `--order`, paging). |
 | `harbor notebooks get <id>` | Show one notebook. |
-| `harbor notebooks create --name …` | Create a notebook (`--stack`, `--default-encrypt`, `--meta`). |
-| `harbor notebooks update <id>` | Update; `--make-default` promotes to default; `--meta`, `--unset-meta`, `--meta-json`, `--clear-meta` change metadata. |
+| `harbor notebooks create --name …` | Create a notebook (`--stack`, `--color`, `--default-encrypt`, `--meta`). |
+| `harbor notebooks update <id>` | Update; `--color` sets or clears its color; `--make-default` promotes to default; `--meta`, `--unset-meta`, `--meta-json`, `--clear-meta` change metadata. |
 | `harbor notebooks meta <id>` | Read or change a notebook's metadata (`--set`, `--unset`, `--replace`, `--clear`). |
 | `harbor notebooks delete <id>` | Delete (`--notes move_to_default\|trash`). |
 
@@ -155,6 +155,7 @@ Run `harbor <command> --help` for full flags and examples on any command.
 | Command | Description |
 |---|---|
 | `harbor stacks list` | List stacks with notebook counts (`--meta-eq`, `--meta-has`). |
+| `harbor stacks update <name> --color …` | Set or clear a stack's color. |
 | `harbor stacks meta <name>` | Read or change a stack's metadata (`--set`, `--unset`, `--replace`, `--clear`). |
 
 ### Notes
@@ -181,10 +182,18 @@ Run `harbor <command> --help` for full flags and examples on any command.
 |---|---|
 | `harbor tags list` | List tags (`--parent`, `--top-level`). |
 | `harbor tags get <id>` | Show one tag. |
-| `harbor tags create --name …` | Create a tag (`--parent`). |
-| `harbor tags update <id>` | Rename / re-parent (`--top-level`). |
+| `harbor tags create --name …` | Create a tag (`--parent`, `--color`). |
+| `harbor tags update <id>` | Rename / re-parent / recolor (`--top-level`, `--color`). |
 | `harbor tags delete <id>` | Delete (`--children reparent_to_grandparent\|orphan`). |
 | `harbor tags notes <id>` | List notes carrying a tag. |
+
+### Colors
+Tags, notebooks and stacks can each have a color.
+`--color` takes one of ten names, in any case: `red`, `orange`, `amber`, `green`,
+`teal`, `harbor-blue`, `indigo`, `purple`, `pink`, `slate`. The hex (`#ef4444`)
+works too, and `none` clears the color. Leave `--color` out and the color is kept.
+List and get output show the color's name; `--json` shows the stored hex in
+`color` (`""` for none).
 
 ### Files
 | Command | Description |

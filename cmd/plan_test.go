@@ -440,6 +440,7 @@ func TestNoDomainErrorMapperSwallowsThePlanLimit(t *testing.T) {
 		"search":       mapSearchError,
 		"share":        mapShareError,
 		"shortcuts":    mapShortcutError,
+		"stacks":       mapStackError,
 		"support":      mapSupportError,
 		"sync":         mapSyncError,
 		"tags":         mapTagError,

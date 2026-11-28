@@ -20,7 +20,7 @@ var tagsCmd = &cobra.Command{
 	Aliases: []string{"tag"},
 	Short:   "Manage tags (list, get, create, update, delete)",
 	GroupID: groupOrg,
-	Long:    "Hierarchical, Evernote-style nested tags. A tag's parent is set with --parent (or --top-level for a root tag).",
+	Long:    "Hierarchical, Evernote-style nested tags. A tag's parent is set with --parent (or --top-level for a root tag), and its color with --color.",
 }
 
 // tagsListCmd lists tags, optionally filtered by parent.
@@ -88,12 +88,10 @@ var tagsCreateCmd = &cobra.Command{
 	Use:   "create",
 	Short: "Create a tag",
 	Example: `  harbor tags create --name Receipts
-  harbor tags create --name 2026 --parent 1f0b...`,
+  harbor tags create --name 2026 --parent 1f0b...
+  harbor tags create --name Urgent --color red`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, _, err := loadClientFromConfig()
-		if err != nil {
-			return err
-		}
+		// The flags are checked before the credentials so a typo answers the typo.
 		name := stringFlag(cmd, "name")
 		if name == "" {
 			return errors.New("--name is required")
@@ -101,6 +99,13 @@ var tagsCreateCmd = &cobra.Command{
 		body := map[string]any{"name": name}
 		if p := stringFlag(cmd, "parent"); p != "" {
 			body["parent_id"] = p
+		}
+		if err := addColorIfChanged(cmd, body); err != nil {
+			return err
+		}
+		c, _, err := loadClientFromConfig()
+		if err != nil {
+			return err
 		}
 		data, err := c.CreateTag(body)
 		if err != nil {
@@ -111,18 +116,18 @@ var tagsCreateCmd = &cobra.Command{
 	},
 }
 
-// tagsUpdateCmd renames and/or re-parents a tag.
+// tagsUpdateCmd renames, re-parents and/or recolors a tag.
 var tagsUpdateCmd = &cobra.Command{
 	Use:   "update <id>",
-	Short: "Update a tag (rename and/or re-parent)",
+	Short: "Update a tag (rename, re-parent and/or recolor)",
 	Args:  cobra.ExactArgs(1),
+	Long:  "Update a tag. Only the flags you pass are changed, so a rename keeps the tag's color.",
 	Example: `  harbor tags update 7a3c... --name "Receipts 2026"
-  harbor tags update 7a3c... --top-level`,
+  harbor tags update 7a3c... --top-level
+  harbor tags update 7a3c... --color harbor-blue
+  harbor tags update 7a3c... --color none`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, _, err := loadClientFromConfig()
-		if err != nil {
-			return err
-		}
+		// The flags are checked before the credentials so a typo answers the typo.
 		body := map[string]any{}
 		addStringIfChanged(cmd, body, "name", "name")
 		if boolFlag(cmd, "top-level") {
@@ -130,8 +135,15 @@ var tagsUpdateCmd = &cobra.Command{
 		} else if cmd.Flags().Changed("parent") {
 			body["parent_id"] = stringFlag(cmd, "parent")
 		}
+		if err := addColorIfChanged(cmd, body); err != nil {
+			return err
+		}
 		if len(body) == 0 {
-			return errors.New("nothing to update — pass --name, --parent, or --top-level")
+			return errors.New("nothing to update — pass --name, --parent, --top-level, or --color")
+		}
+		c, _, err := loadClientFromConfig()
+		if err != nil {
+			return err
 		}
 		data, err := c.UpdateTag(args[0], body)
 		if err != nil {
@@ -183,7 +195,7 @@ func mapTagError(err error) error {
 // displayTags renders a tag collection as a table.
 func displayTags(data []byte) {
 	items := client.CollectionItems(data)
-	headers := []string{"ID", "NAME", "PARENT", "USN", "UPDATED"}
+	headers := []string{"ID", "NAME", "COLOR", "PARENT", "USN", "UPDATED"}
 	rows := make([][]string, 0, len(items))
 	for _, raw := range items {
 		tg := parseJSON(raw)
@@ -196,6 +208,7 @@ func displayTags(data []byte) {
 		rows = append(rows, []string{
 			str(tg, "id"),
 			str(tg, "name"),
+			colorName(str(tg, "color")),
 			parent,
 			dim(str(tg, "usn")),
 			epochMS(num(tg, "updated_at")),
@@ -219,6 +232,7 @@ func displayTag(data []byte) {
 	printKV([][2]string{
 		{"ID", bold(str(tg, "id"))},
 		{"Name", str(tg, "name")},
+		{"Color", colorName(str(tg, "color"))},
 		{"Parent", parent},
 		{"USN", str(tg, "usn")},
 		{"Deleted", boolMark(boolean(tg, "deleted"))},
@@ -237,10 +251,12 @@ func init() {
 
 	tagsCreateCmd.Flags().String("name", "", "Tag name (required; no commas)")
 	tagsCreateCmd.Flags().String("parent", "", "Parent tag id (omit for a top-level tag)")
+	addColorFlag(tagsCreateCmd)
 
 	tagsUpdateCmd.Flags().String("name", "", "New name")
 	tagsUpdateCmd.Flags().String("parent", "", "Re-parent under this tag id")
 	tagsUpdateCmd.Flags().Bool("top-level", false, "Make this tag top-level")
+	addColorFlag(tagsUpdateCmd)
 
 	tagsDeleteCmd.Flags().String("children", "", "Child policy: reparent_to_grandparent (default) or orphan")
 

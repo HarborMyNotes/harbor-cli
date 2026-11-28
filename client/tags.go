@@ -26,7 +26,8 @@ func (c *Client) CreateTag(body map[string]any) ([]byte, error) {
 	return c.doPost("/tags", body)
 }
 
-// UpdateTag renames and/or re-parents a tag and returns the bare updated object.
+// UpdateTag renames, re-parents and/or recolors a tag and returns the bare
+// updated object.
 func (c *Client) UpdateTag(id string, body map[string]any) ([]byte, error) {
 	return c.doPatch("/tags/"+id, body)
 }
